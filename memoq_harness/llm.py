@@ -343,12 +343,19 @@ class LLMClient:
     ) -> str:
         """Anthropic Messages API.
 
-        Three structural differences from the OpenAI shape are handled here:
-        the system prompt is a top-level field rather than a message,
-        ``max_tokens`` is mandatory, and there is no ``response_format``. JSON
-        is obtained instead by prefilling the assistant turn with ``{``, which
-        constrains the model far more reliably than asking politely - the
-        prefill is stitched back onto the reply before parsing.
+        Four structural differences from the OpenAI shape are handled here:
+
+        * the system prompt is a top-level field, not a message;
+        * ``max_tokens`` is mandatory - there is no "server decides";
+        * there is no ``response_format``, so JSON is obtained by prefilling
+          the assistant turn with ``{``, which constrains the model far more
+          reliably than asking politely; the prefill is stitched back onto the
+          reply before parsing;
+        * **``temperature`` is not accepted.** ``messages.create()`` has no
+          such parameter in the current SDK, so passing it raises ``TypeError``
+          before the request is ever sent. Sampling is left to the server
+          default. The sidebar slider still governs every OpenAI-compatible
+          preset, where it works normally.
         """
         system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
         turns = [
@@ -370,12 +377,12 @@ class LLMClient:
         last_error: Optional[Exception] = None
         for attempt in range(max(1, self.config.max_retries)):
             try:
+                # Deliberately no temperature here - see the docstring.
                 response = self._client.messages.create(
                     model=self.config.model,
                     system=system or anthropic.NOT_GIVEN,
                     messages=turns,
                     max_tokens=limit,
-                    temperature=self.config.temperature,
                 )
             except Exception as exc:  # noqa: BLE001 - SDK raises many types
                 last_error = exc

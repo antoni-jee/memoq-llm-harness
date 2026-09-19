@@ -457,7 +457,20 @@ def render_sidebar() -> None:
             st.rerun()
 
         with st.expander("Inference settings"):
-            config.temperature = st.slider("Temperature", 0.0, 1.5, config.temperature, 0.05)
+            anthropic_backend = preset.backend == llm.BACKEND_ANTHROPIC
+            config.temperature = st.slider(
+                "Temperature", 0.0, 1.5, config.temperature, 0.05,
+                help=(
+                    "Not sent to the Anthropic Messages API, which takes no "
+                    "temperature parameter - that endpoint uses its own default. "
+                    "Applies to every other preset."
+                    if anthropic_backend else
+                    "Sampling temperature for this endpoint. Low values keep "
+                    "terminology stable across a batch."
+                ),
+            )
+            if anthropic_backend:
+                st.caption(":grey[Temperature is ignored by the Anthropic preset.]")
             config.chunk_size = st.number_input(
                 "Segments per request", 1, 100, config.chunk_size,
                 help="A 100-segment batch is split into requests of this size. "
@@ -465,7 +478,8 @@ def render_sidebar() -> None:
             )
             config.max_tokens = st.number_input(
                 "Max output tokens", 0, 32000, config.max_tokens,
-                help="0 lets the server decide.",
+                help="0 lets the server decide (Anthropic always needs a "
+                     "positive value, so a default is substituted there).",
             )
             config.timeout = st.number_input(
                 "Timeout (seconds)", 10, 3600, int(config.timeout),

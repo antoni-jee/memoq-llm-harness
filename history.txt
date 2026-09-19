@@ -9002,3 +9002,517 @@ code 0)
   before your first real Anthropic batch.
 
 ✻ Cooked for 30m 12s · done 19:31
+
+> /export history.txt                                                           
+  ⎿  Conversation exported to: C:\memoq-harness\history.txt
+
+> I changed the .gitignore file, but it was a bad change. Can you revert it to  
+  your version that you put there before?                                       
+
+● Restoring it. I'll also fix the encoding — the current file is UTF-16 (hence
+  the �� BOM and spaced-out characters), which git handles poorly:
+
+● Write(.gitignore)
+  ⎿  Added 10 lines, removed 4 lines
+       1 -state.json                                                     
+       2 -exports/                                                       
+       3 -.claude/                                                       
+       1  __pycache__/
+       5 -*.pyc                                                          
+       2 +*.py[cod]                                                      
+       3 +.venv/                                                         
+       4 +venv/                                                          
+       5 +                                                               
+       6 +# Project runtime artefacts                                    
+       7 +state.json                                                     
+       8 +state.json.tmp                                                 
+       9 +state.json.corrupt                                             
+      10 +exports/                                                       
+      11 +*.log                                                          
+
+● PowerShell(cd C:\memoq-harness; $b =
+            [System.IO.File]::ReadAllBytes(".gitignore"); Write-Output "bytes:
+            $($b.Length)  BOM: $(if ($b[0] -eq 0xEF -or $b[0] -eq 0xFF)
+            {'yes'}…)
+  ⎿  bytes: 250  BOM: no
+     __pycache__/
+     *.py[cod]
+     … +10 lines (ctrl+o to expand)
+
+● 250 bytes for ~125 characters — the file is still UTF-16LE. The Write tool
+  appears to have preserved the existing encoding. Let me check and force UTF-8:
+
+● PowerShell(cd C:\memoq-harness; $b =
+            [System.IO.File]::ReadAllBytes(".gitignore"); Write-Output "first 12
+            bytes: $(($b[0..11] | ForEach-Object { '{0:X2}' -f $_ }) -join '…)
+  ⎿  first 12 bytes: 5F 00 5F 00 70 00 79 00 63 00 61 00
+
+● Confirmed UTF-16LE (5F 00 5F 00 — each ASCII char padded with a null). Git
+  can't parse that, so every pattern would be silently ignored. Writing it as
+  UTF-8 explicitly:
+
+● PowerShell(cd C:\memoq-harness; python -c "
+            import io…)
+  ⎿  bytes: 125
+     first 12: 5F 5F 70 79 63 61 63 68 65 5F 5F 2F
+     --- content ---
+     … +11 lines (ctrl+o to expand)
+
+● Restored — 125 bytes, plain UTF-8, no BOM, LF endings.
+
+  Two things worth flagging:
+
+  The file was UTF-16LE, not just changed in content. That almost certainly came
+  from a PowerShell redirect (> or Out-File), which defaults to UTF-16 in some
+  configurations. Git reads .gitignore as bytes and would have matched nothing —
+  so every pattern was silently inert, including state.json (456 KB) and
+  exports/. Worth knowing for the other files too if you edit them that way.
+
+  My first attempt with the normal file-write tool preserved the existing UTF-16
+  encoding rather than replacing it, so I had to force UTF-8 explicitly — hence
+  the second pass.
+
+  Your version had one line mine doesn't: .claude/. I dropped it since you asked
+  for my version verbatim, but if you want the Claude Code session directory
+  ignored, that line is worth keeping. Say the word and I'll add it back.
+
+✻ Worked for 45s · done 19:37
+
+※ recap: We've been building the memoQ LLM Harness, a local Streamlit translation tool; all 200 tests pass and the latest feature round is done. I just restored your .gitignore to my version as UTF-8. Next: tell me whether to re-add the `.claude/` line you had.
+
+> We are in the 'develop' branch. Let's fix the Anthropic API preset            
+  temperature crash by making it conditional, preserving it for OpenAI/Ollama   
+  where it works perfectly.                                                     
+                                                                                
+  Please modify memoq_harness/llm.py and app.py:                                
+  1. In memoq_harness/llm.py inside the _chat_anthropic method, safely remove   
+  temperature=self.config.temperature from the messages.create() call.          
+  Anthropic's native SDK can drop it, or we can pass it only if the backend     
+  supports it. To be safe, do NOT pass temperature to the native Anthropic      
+  Messages API call at all, as it's deprecated there.                           
+  2. In app.py inside the sidebar UI under Inference settings, make the         
+  "Temperature" slider conditional or adjust its help caption. It should stay   
+  visible because it works for OpenAI/Ollama/DeepSeek, but ensure llm.py never  
+  passes it to the Anthropic client router to prevent the TypeError.            
+                                                                                
+  Please refactor this cleanly, run the test suite to verify, and ensure no     
+  other presets are broken.                                                     
+● Let me look at the actual failure before changing anything — I want to be sure
+  temperature is the real cause.
+
+● PowerShell(cd C:\memoq-harness; git rev-parse --abbrev-ref HEAD 2>&1 |
+            Select-Object -First 3; Write-Output "--- anthropic create signature
+            ---"; python -c "
+            import inspec…)
+  ⎿  git : The term 'git' is not recognized as the name of a cmdlet, functi
+     on, script file, or operable program. Check the s
+     pelling of the name, or if a path was included, verify that the path i
+     … +15 lines (ctrl+o to expand)
+
+● The user is right and my assumption was wrong — in anthropic 1.7.0,
+  messages.create() genuinely does not accept temperature. Let me see the full
+  signature:
+
+● PowerShell(cd C:\memoq-harness; python -c "
+            import inspect…)
+  ⎿  ALL params: ['self', 'max_tokens', 'messages', 'model', 'cache_control
+     ', 'container', 'inference_geo', 'metadata', 'output_config', 'service
+     _tier', 'stop_sequences', 'stream', 'system', 'thinking', 'tool_choice
+     … +9 lines (ctrl+o to expand)
+
+● Confirmed: temperature was removed from the Messages API in this SDK. Let me
+  see the current code:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Now the fix — removing temperature from the Anthropic call path:
+
+● Update(memoq_harness\llm.py)
+  ⎿  Added 13 lines, removed 6 lines
+      343      ) -> str:
+      344          """Anthropic Messages API.
+      345  
+      346 -        Three structural differences from the OpenAI shape are
+          - handled here:                                                
+      347 -        the system prompt is a top-level field rather than a m
+          -essage,                                                       
+      348 -        ``max_tokens`` is mandatory, and there is no ``respons
+          -e_format``. JSON                                              
+      349 -        is obtained instead by prefilling the assistant turn w
+          -ith ``{``, which                                              
+      350 -        constrains the model far more reliably than asking pol
+          -itely - the                                                   
+      351 -        prefill is stitched back onto the reply before parsing
+          -.                                                             
+      346 +        Four structural differences from the OpenAI shape are 
+          +handled here:                                                 
+      347 +                                                              
+      348 +        * the system prompt is a top-level field, not a messag
+          +e;                                                            
+      349 +        * ``max_tokens`` is mandatory - there is no "server de
+          +cides";                                                       
+      350 +        * there is no ``response_format``, so JSON is obtained
+          + by prefilling                                                
+      351 +          the assistant turn with ``{``, which constrains the 
+          +model far more                                                
+      352 +          reliably than asking politely; the prefill is stitch
+          +ed back onto the                                              
+      353 +          reply before parsing;                               
+      354 +        * **``temperature`` is not accepted.** ``messages.crea
+          +te()`` has no                                                 
+      355 +          such parameter in the current SDK, so passing it rai
+          +ses ``TypeError``                                             
+      356 +          before the request is ever sent. Sampling is left to
+          + the server                                                   
+      357 +          default. The sidebar slider still governs every Open
+          +AI-compatible                                                 
+      358 +          preset, where it works normally.                    
+      359          """
+      360          system = "\n\n".join(m["content"] for m in messages if
+            m["role"] == "system")
+      361          turns = [
+
+● Update(memoq_harness\llm.py)
+  ⎿  Added 1 line, removed 1 line
+      377          last_error: Optional[Exception] = None
+      378          for attempt in range(max(1, self.config.max_retries)):
+      379              try:
+      380 +                # Deliberately no temperature here - see the d
+          +ocstring.                                                     
+      381                  response = self._client.messages.create(
+      382                      model=self.config.model,
+      383                      system=system or anthropic.NOT_GIVEN,
+      384                      messages=turns,
+      385                      max_tokens=limit,
+      385 -                    temperature=self.config.temperature,      
+      386                  )
+      387              except Exception as exc:  # noqa: BLE001 - SDK rai
+           ses many types
+      388                  last_error = exc
+
+● PowerShell(cd C:\memoq-harness; python -c "
+            import anthropic…)
+  ⎿  NOT_GIVEN exists: True
+     NOT_GIVEN = NOT_GIVEN
+
+● Good — that one's still valid. Now the sidebar slider, kept visible but honest
+  about its scope:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(app.py)
+  ⎿  Added 16 lines, removed 2 lines
+      457              st.rerun()
+      458  
+      459          with st.expander("Inference settings"):
+      460 -            config.temperature = st.slider("Temperature", 0.0,
+          - 1.5, config.temperature, 0.05)                               
+      460 +            anthropic_backend = preset.backend == llm.BACKEND_
+          +ANTHROPIC                                                     
+      461 +            config.temperature = st.slider(                   
+      462 +                "Temperature", 0.0, 1.5, config.temperature, 0
+          +.05,                                                          
+      463 +                help=(                                        
+      464 +                    "Not sent to the Anthropic Messages API, w
+          +hich takes no "                                               
+      465 +                    "temperature parameter - that endpoint use
+          +s its own default. "                                          
+      466 +                    "Applies to every other preset."          
+      467 +                    if anthropic_backend else                 
+      468 +                    "Sampling temperature for this endpoint. L
+          +ow values keep "                                              
+      469 +                    "terminology stable across a batch."      
+      470 +                ),                                            
+      471 +            )                                                 
+      472 +            if anthropic_backend:                             
+      473 +                st.caption(":grey[Temperature is ignored by th
+          +e Anthropic preset.]")                                        
+      474              config.chunk_size = st.number_input(
+      475                  "Segments per request", 1, 100, config.chunk_s
+           ize,
+      476                  help="A 100-segment batch is split into reques
+           ts of this size. "
+     ...
+      478              )
+      479              config.max_tokens = st.number_input(
+      480                  "Max output tokens", 0, 32000, config.max_toke
+           ns,
+      468 -                help="0 lets the server decide.",             
+      481 +                help="0 lets the server decide (Anthropic alwa
+          +ys needs a "                                                  
+      482 +                     "positive value, so a default is substitu
+          +ted there).",                                                 
+      483              )
+      484              config.timeout = st.number_input(
+      485                  "Timeout (seconds)", 10, 3600, int(config.time
+           out),
+
+● Now a regression test that would have caught this — checking against the SDK's
+  real signature rather than a stub:
+
+● Update(tests\test_core.py)
+  ⎿  Added 69 lines
+      1070          self.assertEqual(out, '{"a": 1}')
+      1071          self.assertGreater(captured["max_tokens"], 0)
+      1072  
+      1073 +    def test_temperature_is_never_sent_to_anthropic(self):   
+      1074 +        """messages.create() has no temperature parameter; pa
+           +ssing it TypeErrors."""                                      
+      1075 +        captured = {}                                        
+      1076 +                                                             
+      1077 +        class FakeMessages:                                  
+      1078 +            def create(self, **kwargs):                      
+      1079 +                captured.update(kwargs)                      
+      1080 +                return type("R", (), {"content": [           
+      1081 +                    type("B", (), {"type": "text", "text": "o
+           +k"})()]})()                                                  
+      1082 +                                                             
+      1083 +        client = llm.LLMClient.__new__(llm.LLMClient)        
+      1084 +        client.config = llm.ClientConfig(                    
+      1085 +            backend=llm.BACKEND_ANTHROPIC, temperature=0.9)  
+      1086 +        client._supports_json_mode = None                    
+      1087 +        client._client = type("C", (), {"messages": FakeMessa
+           +ges()})()                                                    
+      1088 +                                                             
+      1089 +        client._chat([{"role": "user", "content": "hi"}], for
+           +ce_json=False)                                               
+      1090 +        self.assertNotIn("temperature", captured)            
+      1091 +                                                             
+      1092 +    def test_anthropic_kwargs_match_the_installed_sdk(self): 
+      1093 +        """Guards against SDK parameter drift - how the crash
+           + got in."""                                                  
+      1094 +        try:                                                 
+      1095 +            import inspect                                   
+      1096 +                                                             
+      1097 +            from anthropic.resources.messages import Messages
+      1098 +        except ImportError:                                  
+      1099 +            self.skipTest("anthropic not installed")         
+      1100 +                                                             
+      1101 +        accepted = set(inspect.signature(Messages.create).par
+           +ameters)                                                     
+      1102 +        captured = {}                                        
+      1103 +                                                             
+      1104 +        class FakeMessages:                                  
+      1105 +            def create(self, **kwargs):                      
+      1106 +                captured.update(kwargs)                      
+      1107 +                return type("R", (), {"content": [           
+      1108 +                    type("B", (), {"type": "text", "text": "o
+           +k"})()]})()                                                  
+      1109 +                                                             
+      1110 +        client = llm.LLMClient.__new__(llm.LLMClient)        
+      1111 +        client.config = llm.ClientConfig(backend=llm.BACKEND_
+           +ANTHROPIC)                                                   
+      1112 +        client._supports_json_mode = None                    
+      1113 +        client._client = type("C", (), {"messages": FakeMessa
+           +ges()})()                                                    
+      1114 +                                                             
+      1115 +        client._chat([{"role": "system", "content": "S"},    
+      1116 +                      {"role": "user", "content": "U"}], forc
+           +e_json=True)                                                 
+      1117 +                                                             
+      1118 +        unsupported = set(captured) - accepted               
+      1119 +        self.assertEqual(unsupported, set(),                 
+      1120 +                         "these kwargs are not in the install
+           +ed SDK: %s" % unsupported)                                   
+      1121 +                                                             
+      1122 +    def test_temperature_still_reaches_openai_backends(self):
+      1123 +        """The slider must keep working everywhere it is supp
+           +orted."""                                                    
+      1124 +        captured = {}                                        
+      1125 +                                                             
+      1126 +        class FakeCompletions:                               
+      1127 +            def create(self, **kwargs):                      
+      1128 +                captured.update(kwargs)                      
+      1129 +                return type("R", (), {"choices": [type("C", (
+           +), {                                                         
+      1130 +                    "message": type("M", (), {"content": "ok"
+           +})()})()]})()                                                
+      1131 +                                                             
+      1132 +        client = llm.LLMClient.__new__(llm.LLMClient)        
+      1133 +        client.config = llm.ClientConfig(                    
+      1134 +            backend=llm.BACKEND_OPENAI, temperature=0.37)    
+      1135 +        client._supports_json_mode = None                    
+      1136 +        client._client = type("C", (), {                     
+      1137 +            "chat": type("Ch", (), {"completions": FakeComple
+           +tions()})()})()                                              
+      1138 +                                                             
+      1139 +        client._chat([{"role": "user", "content": "hi"}], for
+           +ce_json=False)                                               
+      1140 +        self.assertEqual(captured["temperature"], 0.37)      
+      1141 +                                                             
+      1142      def test_max_tokens_is_always_positive(self):
+      1143          """Anthropic rejects the request without it; there is
+             no server default."""
+      1144          captured = {}
+
+● PowerShell(cd C:\memoq-harness; python -m pyflakes app.py memoq_harness tests
+            run_tests.py tools; if ($?) { Write-Output "LINT CLEAN" };
+            $env:HARNESS_LIVE_MODEL="qwen3:4b-…)
+  ⎿  LINT CLEAN
+
+     Ran 203 tests in 37.158s
+     OK
+  ⎿  (timeout 10m)
+
+● All 203 pass. Let me prove the fix addresses the actual crash — TypeError
+  fires before any network call, so I can verify with a real client and a dummy
+  key:
+
+● Write(_tempcheck.py)
+  ⎿  Wrote 55 lines to _tempcheck.py
+       1 """Confirm the real SDK rejects temperature, and our call path n
+         o longer sends it."""
+       2 import sys
+       3 sys.path.insert(0, '.')
+       4 import anthropic
+       6 
+       7 client = anthropic.Anthropic(api_key="dummy-not-used")
+       8 
+       9 print("1. Real SDK, WITH temperature (the reported crash):")
+      10 try:
+     … +50 lines (ctrl+o to expand)
+
+● PowerShell(cd C:\memoq-harness; $env:PYTHONIOENCODING="utf-8"; python
+            _tempcheck.py; Remove-Item .\_tempcheck.py -Force)
+  ⎿  1. Real SDK, WITH temperature (the reported crash):
+        TypeError -> Messages.create() got an unexpected keyword argument '
+     temperature'
+     … +9 lines (ctrl+o to expand)
+  ⎿  (timeout 5m)
+
+● Reproduced and fixed, confirmed against the real SDK:
+
+  1. With temperature → TypeError: Messages.create() got an unexpected keyword 
+     argument 'temperature' — exactly your crash.
+  2. Without it → the request builds and dispatches, failing only on the dummy
+     key's 401.
+  3. Our client now reaches the network and returns a clean LLMError with the
+     auth error, not a TypeError.
+
+  Changes
+
+  memoq_harness/llm.py — temperature removed from the messages.create() call in
+  _chat_anthropic. Sampling falls to the server default there. The OpenAI path
+  (_chat_openai) is untouched, so OpenAI, OpenRouter, DeepSeek and Ollama still
+  receive it.
+
+  app.py — the slider stays visible, with help text that changes by backend and
+  a grey caption when Anthropic is selected. I also corrected the "Max output
+  tokens" help, since 0 doesn't mean "server decides" on Anthropic either — a
+  default is substituted.
+
+  Three tests, 203 passing:
+  - temperature is never in the Anthropic kwargs
+  - temperature still reaches OpenAI-compatible backends at the exact value set
+  - every kwarg we send is introspected against the installed SDK's real
+    signature
+
+  That last one matters most: it's the test that would have caught this. My
+  original implementation was written against the documented Messages API, where
+  temperature is a normal parameter — but this SDK build dropped it from the
+  signature, and my unit test used a **kwargs stub that silently accepted
+  anything. The new test compares against inspect.signature(Messages.create), so
+  any future parameter drift fails the suite instead of surfacing as a runtime
+  crash.
+
+  One correction to your framing, since it affects what to expect: temperature
+  isn't deprecated in Anthropic's API generally — it's absent from this SDK
+  version's messages.create() signature. The practical consequence is the same
+  (don't pass it), but if you later pin a different anthropic version, the guard
+  test will tell you what that build actually accepts.
+
+  Note git isn't on PATH in this shell, so I couldn't confirm you're on develop
+  or stage anything — the edits are in the working tree only.
+
+✻ Crunched for 3m 3s · done 20:02
+
+> export the history as with (export) command but to a file named               
+  history-diff.txt: in that file, leave only the difference between the         
+  existing history.txt and the current export. then, overwrite history.txt with 
+  the current export (full one).                                                
+
+● /export is a command in your CLI, not something I can invoke — I have no tool
+  that produces the conversation transcript. Let me check what I'm working with:
+
+● PowerShell(cd C:\memoq-harness; $f = Get-Item history.txt; "history.txt:
+            {0:N0} bytes, modified {1}" -f $f.Length, $f.LastWriteTime;
+            Write-Output "--- last 12 lines ---";…)
+  ⎿  history.txt: 529 581 bytes, modified 19.09.2026 19:33:35
+     --- last 12 lines ---
+     … +20 lines (ctrl+o to expand)
+
+● I have what I need to set this up, but one step needs you: /export is a
+  client-side command, so only you can generate the current transcript.
+
+  Let me snapshot the existing history.txt as a diff baseline first:
+
+● PowerShell(cd C:\memoq-harness; Copy-Item history.txt .history_baseline.txt
+            -Force; $b = Get-Item .history_baseline.txt; "baseline saved: {0:N0}
+            bytes" -f $b.Length; pytho…)
+  ⎿  baseline saved: 529 581 bytes
+     lines: 9003
+
+● Baseline captured (9,003 lines). Now the script that finishes the job the
+  moment you re-export:
+
+● Write(tools\history_diff.py)  ⎿  Wrote 105 lines to tools\history_diff.py
+       1 """Write history-diff.txt: what the latest /export added to hist
+       2 
+       4     1. python tools\\history_diff.py --snapshot     (before re-e
+         xporting)
+         de Code CLI)
+         ory-diff.txt)
+       8 Step 1 stores the current history.txt as a baseline. Step 2 over
+         writes
+         wo and leaves
+         ne.
+     … +116 lines (ctrl+o to expand)
+
+● I can't complete this alone — /export runs in your CLI, and I have no tool
+  that renders the conversation transcript. Reconstructing it from the raw
+  session .jsonl (4.3 MB) would produce a different format from the real export,
+  making the diff meaningless noise.
+
+  One step from you. Run this and the job is done:
+
+  ! python tools\history_diff.py --snapshot
+  (already done — baseline is saved, 9,003 lines)
+
+  /export history.txt
+
+  Then tell me, and I'll run step 3 to write history-diff.txt and clean up. Or
+  run it yourself:
+
+  ! python tools\history_diff.py
+
+  That ordering gets you both things you asked for: /export history.txt
+  overwrites history.txt with the full current transcript, and the script then
+  extracts only what's new into history-diff.txt.
+
+  Two details worth knowing:
+
+  The diff will be an append, not a merge. Your current history.txt ends at my
+  refactor summary (19:33). Everything since — the .gitignore fix, the Anthropic
+  temperature crash, and this exchange — is new. The script detects pure-append
+  exactly rather than inferring it from diff opcodes, so you get clean new
+  content instead of interleaved hunks. If the export ever rewrites earlier
+  text, it falls back to a real diff and notes in the header how many lines
+  vanished.
+
+  Everything is read and written as explicit UTF-8. Reading history.txt through
+  PowerShell's default ANSI codepage showed â€" where an em-dash belongs and âœ»
+  for the footer glyph — the same double-encoding that bit us on defaults.py
+  and .gitignore. The file itself is fine; the script just never goes near that
+  codepath.
+
+✻ Baked for 1m 13s · done 20:07
+
+> again, in short, what do i do now?                                            
+
+● Run this:
+
+  /export history.txt
+
+  Then tell me it's done, and I'll write history-diff.txt and clean up.
+
+✻ Brewed for 3s · done 20:08

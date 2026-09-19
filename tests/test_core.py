@@ -1070,6 +1070,75 @@ class TestAnthropicBackend(unittest.TestCase):
         self.assertEqual(out, '{"a": 1}')
         self.assertGreater(captured["max_tokens"], 0)
 
+    def test_temperature_is_never_sent_to_anthropic(self):
+        """messages.create() has no temperature parameter; passing it TypeErrors."""
+        captured = {}
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return type("R", (), {"content": [
+                    type("B", (), {"type": "text", "text": "ok"})()]})()
+
+        client = llm.LLMClient.__new__(llm.LLMClient)
+        client.config = llm.ClientConfig(
+            backend=llm.BACKEND_ANTHROPIC, temperature=0.9)
+        client._supports_json_mode = None
+        client._client = type("C", (), {"messages": FakeMessages()})()
+
+        client._chat([{"role": "user", "content": "hi"}], force_json=False)
+        self.assertNotIn("temperature", captured)
+
+    def test_anthropic_kwargs_match_the_installed_sdk(self):
+        """Guards against SDK parameter drift - how the crash got in."""
+        try:
+            import inspect
+
+            from anthropic.resources.messages import Messages
+        except ImportError:
+            self.skipTest("anthropic not installed")
+
+        accepted = set(inspect.signature(Messages.create).parameters)
+        captured = {}
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return type("R", (), {"content": [
+                    type("B", (), {"type": "text", "text": "ok"})()]})()
+
+        client = llm.LLMClient.__new__(llm.LLMClient)
+        client.config = llm.ClientConfig(backend=llm.BACKEND_ANTHROPIC)
+        client._supports_json_mode = None
+        client._client = type("C", (), {"messages": FakeMessages()})()
+
+        client._chat([{"role": "system", "content": "S"},
+                      {"role": "user", "content": "U"}], force_json=True)
+
+        unsupported = set(captured) - accepted
+        self.assertEqual(unsupported, set(),
+                         "these kwargs are not in the installed SDK: %s" % unsupported)
+
+    def test_temperature_still_reaches_openai_backends(self):
+        """The slider must keep working everywhere it is supported."""
+        captured = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return type("R", (), {"choices": [type("C", (), {
+                    "message": type("M", (), {"content": "ok"})()})()]})()
+
+        client = llm.LLMClient.__new__(llm.LLMClient)
+        client.config = llm.ClientConfig(
+            backend=llm.BACKEND_OPENAI, temperature=0.37)
+        client._supports_json_mode = None
+        client._client = type("C", (), {
+            "chat": type("Ch", (), {"completions": FakeCompletions()})()})()
+
+        client._chat([{"role": "user", "content": "hi"}], force_json=False)
+        self.assertEqual(captured["temperature"], 0.37)
+
     def test_max_tokens_is_always_positive(self):
         """Anthropic rejects the request without it; there is no server default."""
         captured = {}
