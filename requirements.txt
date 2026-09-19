@@ -1,0 +1,7 @@
+# memoQ LLM Harness
+# Tested on Python 3.14 (Windows 11 ARM).
+streamlit>=1.45
+openai>=1.40       # OpenAI, OpenRouter, DeepSeek, Ollama (OpenAI-compatible)
+anthropic>=0.40    # native Anthropic Messages API preset
+lxml>=5.0          # optional: the app falls back to xml.etree if it is absent
+pandas>=2.0        # used by Streamlit's dataframe rendering

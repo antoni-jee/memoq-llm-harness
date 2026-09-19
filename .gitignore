@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Project runtime artefacts
+state.json
+state.json.tmp
+state.json.corrupt
+exports/
+*.log

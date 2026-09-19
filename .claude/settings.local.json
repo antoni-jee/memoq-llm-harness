@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem -Force | Select-Object Name, Length; Write-Output \"---PYTHON---\"; python --version; Write-Output \"---PIP---\"; python -m pip --version)",
+      "PowerShell(python -m pip install --disable-pip-version-check streamlit openai lxml pandas 2>&1 | Select-Object -Last 25)",
+      "PowerShell(python -m unittest discover -s tests -t . 2>&1 | Select-Object -Last 60)",
+      "PowerShell(python tests\\\\test_core.py 2>&1 | Select-Object -Last 70)",
+      "PowerShell(python tests\\\\test_core.py 2>&1 | Select-Object -Last 8)",
+      "PowerShell($env:STREAMLIT_BROWSER_GATHER_USAGE_STATS=\"false\"; Start-Process -FilePath \"python\" -ArgumentList \"-m\",\"streamlit\",\"run\",\"app.py\",\"--server.port=8791\",\"--server.headless=true\" -RedirectStandardOutput \"C:\\\\memoq-harness\\\\.smoke_out.log\" -RedirectStandardError \"C:\\\\memoq-harness\\\\.smoke_err.log\" -NoNewWindow; Start-Sleep -Seconds 12; try { $r = Invoke-WebRequest -Uri \"http://localhost:8791/\" -UseBasicParsing -TimeoutSec 20; Write-Output \"HTTP $\\($r.StatusCode\\)\" } catch { Write-Output \"REQUEST FAILED: $_\" })",
+      "PowerShell(Get-Process *)",
+      "PowerShell(Set-Content *)",
+      "PowerShell(python -c \"import inspect; from streamlit.testing.v1.element_tree import TextInput; print\\([n for n,_ in inspect.getmembers\\(TextInput\\) if not n.startswith\\('_'\\)]\\); print\\(inspect.getsource\\(TextInput\\)\\)\" 2>&1 | Select-Object -First 40)",
+      "PowerShell(Remove-Item *)",
+      "PowerShell(python tests\\\\test_core.py 2>&1 | Select-Object -Last 4; Write-Output \"=== stray files ===\"; Get-ChildItem -Force -Name)",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri \"http://localhost:11434/v1/models\" -UseBasicParsing -TimeoutSec 8; Write-Output \"OLLAMA UP\"; $r.Content } catch { Write-Output \"OLLAMA NOT REACHABLE: $\\($_.Exception.Message\\)\" })",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri \"http://localhost:11434/v1/models\" -UseBasicParsing -TimeoutSec 15; Write-Output \"OLLAMA UP\"; $r.Content } catch { Write-Output \"NOT REACHABLE: $\\($_.Exception.Message\\)\" })",
+      "PowerShell(Get-NetTCPConnection *)",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri \"http://10.211.55.2:11434/v1/models\" -UseBasicParsing -TimeoutSec 20; Write-Output \"REACHABLE\"; \\($r.Content | ConvertFrom-Json\\).data | Select-Object -ExpandProperty id } catch { Write-Output \"FAILED: $\\($_.Exception.Message\\)\" })",
+      "PowerShell(cd C:\\\\memoq-harness; $env:HARNESS_LIVE_MODEL=\"qwen3:4b-instruct\"; python tests\\\\test_live.py 2>&1 | Select-Object -Last 45)",
+      "PowerShell(cd C:\\\\memoq-harness; $env:HARNESS_LIVE_MODEL=\"qwen3:4b-instruct\"; python run_tests.py 2>&1 | Select-String -Pattern \"^Ran |^OK|^FAILED|^ERROR:|^FAIL:|unreachable\" | Select-Object -Last 8; Write-Output \"--- lint ---\"; python -m pyflakes app.py memoq_harness tests run_tests.py; if \\($?\\) { Write-Output \"LINT CLEAN\" })",
+      "PowerShell(cd C:\\\\memoq-harness; $env:HARNESS_LIVE_MODEL=\"qwen3:4b-instruct\"; python _fullstack.py 2>&1 | Select-String -NotMatch \"ScriptRunContext|bare mode\")",
+      "PowerShell(cd C:\\\\memoq-harness; $env:HARNESS_LIVE_MODEL=\"qwen3:4b-instruct\"; python run_tests.py 2>&1 | Select-String -Pattern \"^Ran |^OK$|^FAILED\" ; python -m pyflakes app.py memoq_harness tests run_tests.py; if \\($?\\) { Write-Output \"LINT CLEAN\" }; Write-Output \"--- tree ---\"; Get-ChildItem -Recurse -File -Force | Where-Object { $_.FullName -notmatch '__pycache__|\\\\.claude' } | ForEach-Object { \"{0,7}  {1}\" -f $_.Length, $_.FullName.Replace\\(\"C:\\\\memoq-harness\\\\\",\"\"\\) })"
+    ]
+  }
+}
