@@ -177,6 +177,265 @@ class TestTagRetargeting(unittest.TestCase):
         self.assertEqual(target.placeholder_text, "{1}один{2}два")
 
 
+class TestTagVariants(unittest.TestCase):
+    """Both tag ecosystems stay reachable when the MT localises a tag."""
+
+    SRC = 'See <ph id="1">&lt;a href="/en/a"&gt;</ph>it.'
+    TGT = 'См. <ph id="1">&lt;a href="/ru/a"&gt;</ph>это.'
+
+    def test_source_variant_is_kept_under_its_own_number(self):
+        source, target, lookup = tags.isolate_pair(self.SRC, self.TGT)
+        # Canonical {1} is the target's localised XML...
+        self.assertIn("/ru/a", lookup.tags[1])
+        # ...and the source's own version survives as a second number.
+        variant = lookup.variants[1]
+        self.assertIn("/en/a", lookup.tags[variant])
+        self.assertNotEqual(variant, 1)
+        # The prompt text still uses one consistent number on both sides.
+        self.assertEqual(source.placeholder_text, "See {1}it.")
+        self.assertEqual(target.placeholder_text, "См. {1}это.")
+
+    def test_identical_tags_record_no_variant(self):
+        _, _, lookup = tags.isolate_pair(
+            'A <ph id="1">X</ph>', 'Б <ph id="1">X</ph>')
+        self.assertEqual(lookup.variants, {})
+        self.assertEqual(len(lookup.tags), 1)
+
+    def test_segment_side_tags_expose_both_ecosystems(self):
+        doc = mqxliff.MqxliffDocument(
+            SAMPLE_WITH_LOCALISED_LINK.encode("utf-8"), "x.mqxliff")
+        doc.parse_segments()
+        seg = doc.translatable_segments()[0]
+
+        src = dict(seg.side_tags(tags.TAG_SOURCE_SOURCE))
+        tgt = dict(seg.side_tags(tags.TAG_SOURCE_TARGET))
+        self.assertTrue(any("/en/" in x for x in src.values()))
+        self.assertTrue(any("/ru/" in x for x in tgt.values()))
+        # Distinct XML means distinct numbers - injecting one cannot yield the
+        # other by accident.
+        self.assertFalse(set(src) & set(tgt))
+        self.assertEqual(len(seg.injectable_tags()), len(src) + len(tgt))
+
+    def test_shared_tag_appears_in_both_tabs_under_one_number(self):
+        doc = load_doc()
+        seg = next(s for s in doc.segments if s.unit_id == "1")
+        src = dict(seg.side_tags(tags.TAG_SOURCE_SOURCE))
+        tgt = dict(seg.side_tags(tags.TAG_SOURCE_TARGET))
+        self.assertEqual(set(src), set(tgt))  # same tags both sides
+        self.assertEqual(len(seg.injectable_tags()), len(tgt))
+
+
+SAMPLE_WITH_LOCALISED_LINK = """<?xml version="1.0" encoding="utf-8"?>
+<xliff version="1.2" xmlns="urn:oasis:names:tc:xliff:document:1.2" \
+xmlns:mq="http://www.memoq.com/memoq/xliff">
+ <file original="a.docx" source-language="en-US" target-language="ru-RU" \
+datatype="x-docx"><body>
+  <trans-unit id="1" mq:status="NotStarted" mq:locked="false">
+   <source>See <ph id="1">&lt;a href="/en/a"&gt;</ph>it.</source>
+   <target>См. <ph id="1">&lt;a href="/ru/a"&gt;</ph>это.</target>
+  </trans-unit>
+ </body></file>
+</xliff>
+"""
+
+
+class TestPrefillBypass(unittest.TestCase):
+    """Newer Claude builds reject a prefilled assistant turn with a 400."""
+
+    def test_model_detection(self):
+        for model in ("claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5",
+                      "claude-5-something", "anthropic/claude-4-6"):
+            self.assertTrue(llm._rejects_prefill(model), model)
+        for model in ("claude-3-5-sonnet-latest", "claude-3-opus", "gpt-4o"):
+            self.assertFalse(llm._rejects_prefill(model), model)
+
+    def _run(self, model):
+        captured = {}
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return type("R", (), {"content": [
+                    type("B", (), {"type": "text", "text": '{"segments": []}'})()]})()
+
+        client = llm.LLMClient.__new__(llm.LLMClient)
+        client.config = llm.ClientConfig(
+            backend=llm.BACKEND_ANTHROPIC, model=model)
+        client._supports_json_mode = None
+        client._client = type("C", (), {"messages": FakeMessages()})()
+        out = client._chat([{"role": "system", "content": "SYS"},
+                            {"role": "user", "content": "U"}], force_json=True)
+        return captured, out
+
+    def test_new_models_get_no_prefill_but_a_text_constraint(self):
+        captured, out = self._run("claude-sonnet-5")
+        roles = [m["role"] for m in captured["messages"]]
+        self.assertNotIn("assistant", roles)
+        self.assertIn("CRITICAL: Return ONLY a valid, raw JSON object",
+                      captured["system"])
+        self.assertIn("triple backticks", captured["system"])
+        # Nothing is stitched on, so the reply comes back verbatim.
+        self.assertEqual(out, '{"segments": []}')
+
+    def test_older_models_keep_the_prefill(self):
+        captured, out = self._run("claude-3-5-sonnet-latest")
+        self.assertEqual(captured["messages"][-1],
+                         {"role": "assistant", "content": "{"})
+        self.assertNotIn("CRITICAL: Return ONLY", captured["system"])
+        self.assertTrue(out.startswith("{"))
+
+    def test_constraint_is_skipped_when_json_is_not_forced(self):
+        captured, _ = self._run("claude-sonnet-5")
+        self.assertIn("CRITICAL", captured["system"])
+
+        client = llm.LLMClient.__new__(llm.LLMClient)
+        client.config = llm.ClientConfig(
+            backend=llm.BACKEND_ANTHROPIC, model="claude-sonnet-5")
+        client._supports_json_mode = None
+        seen = {}
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                seen.update(kwargs)
+                return type("R", (), {"content": [
+                    type("B", (), {"type": "text", "text": "ok"})()]})()
+
+        client._client = type("C", (), {"messages": FakeMessages()})()
+        client._chat([{"role": "system", "content": "SYS"},
+                      {"role": "user", "content": "U"}], force_json=False)
+        self.assertEqual(seen["system"], "SYS")
+
+
+class TestProposalMerge(unittest.TestCase):
+    def setUp(self):
+        self.state = state.ProjectState(os.path.join(tempfile.mkdtemp(), "s.json"))
+
+    def test_rules_land_under_a_marked_heading(self):
+        applied = self.state.merge_proposals(["Не переводить имена функций"], "", 0)
+        self.assertEqual(applied, ["Не переводить имена функций"])
+        self.assertIn(state.ProjectState.AUTO_RULES_HEADING, self.state.hard_rules_text)
+        self.assertIn("- Не переводить имена функций", self.state.hard_rules_text)
+
+    def test_duplicates_are_ignored(self):
+        self.state.merge_proposals(["Правило A"], "", 0)
+        applied = self.state.merge_proposals(["Правило A"], "", 1)
+        self.assertEqual(applied, [])
+        self.assertEqual(self.state.hard_rules_text.count("Правило A"), 1)
+
+    def test_existing_rule_text_is_not_re_added(self):
+        first_line = defaults.DEFAULT_HARD_RULES.splitlines()[0]
+        self.assertEqual(self.state.merge_proposals([first_line], "", 0), [])
+
+    def test_vibe_note_is_appended_once(self):
+        self.state.merge_proposals([], "Тон более технический", 0)
+        self.state.merge_proposals([], "Тон более технический", 1)
+        self.assertEqual(self.state.vibe.count("Тон более технический"), 1)
+
+    def test_every_change_is_logged(self):
+        self.state.merge_proposals(["Правило Б"], "Новый тон", 2)
+        kinds = [e["kind"] for e in self.state.rule_log]
+        self.assertEqual(sorted(kinds), ["rules", "vibe"])
+        self.assertTrue(all(e["batch"] == "3" for e in self.state.rule_log))
+
+    def test_revert_removes_only_the_auto_block(self):
+        original = self.state.hard_rules_text
+        self.state.merge_proposals(["Правило В"], "", 0)
+        self.state.revert_auto_rules()
+        self.assertNotIn("Правило В", self.state.hard_rules_text)
+        self.assertIn(original.splitlines()[0], self.state.hard_rules_text)
+        self.assertEqual(self.state.rule_log, [])
+
+    def test_round_trips_through_state_json(self):
+        self.state.merge_proposals(["Правило Г"], "", 0)
+        self.state.global_directive = "Императив"
+        self.state.save()
+        reloaded = state.ProjectState.load(self.state.path)
+        self.assertIn("Правило Г", reloaded.hard_rules_text)
+        self.assertEqual(reloaded.global_directive, "Императив")
+        self.assertEqual(len(reloaded.rule_log), 1)
+
+
+class TestProposalParsing(unittest.TestCase):
+    def test_rules_and_vibe_are_harvested(self):
+        result = llm.BatchResult()
+        llm._collect_proposals(json.dumps({
+            "segments": [], "proposed_rules": ["A", "B"], "proposed_vibe": "V",
+        }), result)
+        self.assertEqual(result.proposed_rules, ["A", "B"])
+        self.assertEqual(result.proposed_vibe, "V")
+
+    def test_a_bare_string_is_accepted(self):
+        result = llm.BatchResult()
+        llm._collect_proposals('{"proposed_rules": "single"}', result)
+        self.assertEqual(result.proposed_rules, ["single"])
+
+    def test_absent_keys_are_fine(self):
+        result = llm.BatchResult()
+        llm._collect_proposals('{"segments": []}', result)
+        self.assertEqual(result.proposed_rules, [])
+        self.assertEqual(result.proposed_vibe, "")
+
+    def test_garbage_does_not_raise(self):
+        result = llm.BatchResult()
+        llm._collect_proposals("not json at all", result)
+        self.assertEqual(result.proposed_rules, [])
+
+    def test_raw_text_joins_multiple_requests(self):
+        result = llm.BatchResult(raw_responses=["one", "two"])
+        joined = result.raw_text()
+        self.assertIn("request 1 of 2", joined)
+        self.assertIn("two", joined)
+        self.assertEqual(llm.BatchResult(raw_responses=["solo"]).raw_text(), "solo")
+
+
+class TestAnalysisCritique(unittest.TestCase):
+    def test_prompt_demands_a_validation_pass(self):
+        text = prompts.ANALYSIS_SYSTEM
+        self.assertIn("VALIDATE THE HUMAN'S EDITS", text)
+        self.assertIn(prompts.OPERATOR_WARNING_HEADING, text)
+        self.assertIn("dropped, duplicated, renumbered or invented", text)
+        self.assertIn("never infer a style rule from what is plainly a slip", text)
+        self.assertIn("ignore rows you flagged", text)
+
+    def test_payload_carries_rules_and_expected_tags(self):
+        correction = state.Correction("12", "src", "mt", "human")
+        payload = json.loads(prompts.build_analysis_payload(
+            [correction], "ПРАВИЛА", {"12": [1, 2]}))
+        self.assertEqual(payload["editorial_rules_in_force"], "ПРАВИЛА")
+        self.assertEqual(payload["edits"][0]["expected_tags"], [1, 2])
+
+    def test_payload_omits_absent_extras(self):
+        payload = json.loads(prompts.build_analysis_payload(
+            [state.Correction("12", "s", "m", "h")]))
+        self.assertNotIn("editorial_rules_in_force", payload)
+        self.assertNotIn("expected_tags", payload["edits"][0])
+
+    def test_split_analysis_separates_warnings_from_brief(self):
+        text = ("%s\n- Row 12 dropped {2}.\n\nTRANSLATION BRIEF\n- Shorter."
+                % prompts.OPERATOR_WARNING_HEADING)
+        warnings, brief = prompts.split_analysis(text)
+        self.assertIn("Row 12 dropped", warnings)
+        self.assertNotIn("Shorter", warnings)
+        self.assertIn("Shorter", brief)
+
+    def test_split_analysis_with_no_warnings(self):
+        warnings, brief = prompts.split_analysis("- Just a brief.")
+        self.assertEqual(warnings, "")
+        self.assertEqual(brief, "- Just a brief.")
+
+
+class TestGlobalDirective(unittest.TestCase):
+    def test_directive_is_framed_as_batch_wide(self):
+        prompt = prompts.build_system_prompt(
+            "", "", "", extra_instructions="Используйте императив.")
+        self.assertIn("OPERATOR DIRECTIVE FOR THIS BATCH", prompt)
+        self.assertIn("Используйте императив.", prompt)
+
+    def test_absent_directive_adds_nothing(self):
+        self.assertNotIn("OPERATOR DIRECTIVE",
+                         prompts.build_system_prompt("", "", ""))
+
+
 class TestSegmentFiltering(unittest.TestCase):
     def setUp(self):
         self.doc = load_doc()

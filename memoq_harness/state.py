@@ -233,6 +233,15 @@ class ProjectState:
         """"auto" picks a stage per batch; any stage key pins it."""
 
         self.tag_source: str = tagmod.TAG_SOURCE_TARGET
+        self.global_directive: str = ""
+        """Operator's batch-wide instruction, fed into the next run."""
+
+        self.auto_merge_proposals: bool = True
+        """Whether model-proposed rules/vibe are merged automatically."""
+
+        self.rule_log: List[Dict[str, str]] = []
+        """Audit trail of every automatic rule/vibe change."""
+
         self.segments: Dict[str, SegmentRecord] = {}
         self.order: List[str] = []
         self.corrections: List[Correction] = []
@@ -278,6 +287,9 @@ class ProjectState:
 
         state.prompt_stage = data.get("prompt_stage", "auto")
         state.tag_source = data.get("tag_source", tagmod.TAG_SOURCE_TARGET)
+        state.global_directive = data.get("global_directive", "")
+        state.auto_merge_proposals = bool(data.get("auto_merge_proposals", True))
+        state.rule_log = list(data.get("rule_log", []))
         # v3 -> v4: stage templates. Unknown keys are ignored and missing ones
         # fall back to the shipped default, so adding a stage later is safe.
         stored = data.get("prompt_templates") or {}
@@ -323,6 +335,9 @@ class ProjectState:
             "prompt_templates": self.prompt_templates,
             "prompt_stage": self.prompt_stage,
             "tag_source": self.tag_source,
+            "global_directive": self.global_directive,
+            "auto_merge_proposals": self.auto_merge_proposals,
+            "rule_log": self.rule_log,
             "termbase": [asdict(t) for t in self.termbase],
             "corrections": [asdict(c) for c in self.corrections],
             "order": self.order,
@@ -504,6 +519,71 @@ class ProjectState:
 
     def reset_vibe(self) -> None:
         self.vibe = defaults.DEFAULT_VIBE
+
+    # -------------------------------------------- model-proposed rule merge
+
+    AUTO_RULES_HEADING = "Правила, добавленные автоматически по ходу перевода:"
+
+    def merge_proposals(
+        self,
+        rules: Sequence[str],
+        vibe_note: str = "",
+        batch_index: int = 0,
+    ) -> List[str]:
+        """Fold model-proposed rules and vibe into the live blocks.
+
+        Appended under a clearly marked heading rather than woven into the
+        operator's own prose, so machine-authored rules stay visually separable
+        and can be deleted in one go. Every change is recorded in
+        :attr:`rule_log`: this mutates the document's governing rules without a
+        human in the loop, so it has to be auditable and reversible.
+
+        Duplicates are dropped by exact text, and anything already present
+        anywhere in the rulebook is skipped.
+        """
+        applied: List[str] = []
+        existing = self.hard_rules_text
+
+        fresh = []
+        for rule in rules:
+            text = " ".join(str(rule).split()).strip(" -—\t")
+            if not text or text in existing or text in fresh:
+                continue
+            fresh.append(text)
+
+        if fresh:
+            block = self.hard_rules_text.rstrip("\n")
+            if self.AUTO_RULES_HEADING not in block:
+                block += "\n\n" + self.AUTO_RULES_HEADING
+            block += "\n" + "\n".join("- %s" % r for r in fresh)
+            self.hard_rules_text = block + "\n"
+            applied.extend(fresh)
+            self.rule_log.append({
+                "at": _now(),
+                "batch": str(batch_index + 1),
+                "kind": "rules",
+                "detail": " | ".join(fresh),
+            })
+
+        note = " ".join(vibe_note.split()).strip()
+        if note and note not in self.vibe:
+            self.vibe = self.vibe.rstrip("\n") + "\n" + note + "\n"
+            applied.append(note)
+            self.rule_log.append({
+                "at": _now(),
+                "batch": str(batch_index + 1),
+                "kind": "vibe",
+                "detail": note,
+            })
+
+        return applied
+
+    def revert_auto_rules(self) -> None:
+        """Strip the automatically appended rule block and clear its log."""
+        if self.AUTO_RULES_HEADING in self.hard_rules_text:
+            head, _, _ = self.hard_rules_text.partition(self.AUTO_RULES_HEADING)
+            self.hard_rules_text = head.rstrip("\n") + "\n"
+        self.rule_log = []
 
     # ------------------------------------------------------- prompt stages
 

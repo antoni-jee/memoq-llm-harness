@@ -147,7 +147,8 @@ def load_document(raw: bytes, filename: str) -> None:
 
     # Drop grid widget state from the previous document/filter, or rows would
     # inherit text belonging to whatever segment last held the same key.
-    for key in [k for k in st.session_state if k.startswith(("txt_", "note_"))]:
+    for key in [k for k in st.session_state
+                if k.startswith(("txt_", "note_", "txtrev_"))]:
         del st.session_state[key]
 
     st.session_state.document = doc
@@ -200,12 +201,29 @@ def segments_by_key() -> Dict[str, mqxliff.Segment]:
 # ------------------------------------------------------------- grid actions
 
 
+def text_key_for(record_key: str) -> str:
+    """Widget key for a row's editing box, carrying a revision counter.
+
+    Streamlit forbids assigning to a widget's ``session_state`` key once the
+    widget has been created in the same run, so the supported way to change a
+    box's contents from a button handler is to make it a *new* widget. Bumping
+    the revision does that; the fresh widget seeds itself from the record.
+    """
+    rev = st.session_state.get("txtrev_%s" % record_key, 0)
+    return "txt_%s_%d" % (record_key, rev)
+
+
+def bump_text_widget(record_key: str) -> None:
+    st.session_state["txtrev_%s" % record_key] = (
+        st.session_state.get("txtrev_%s" % record_key, 0) + 1)
+
+
 def capture_grid(batch_index: int) -> None:
     """Copy the grid's widget values into the project state."""
     proj = project()
     edits, comments = {}, {}
     for record in proj.batch_records(batch_index):
-        text_key = "txt_%s" % record.key
+        text_key = text_key_for(record.key)
         note_key = "note_%s" % record.key
         if text_key in st.session_state:
             edits[record.key] = st.session_state[text_key]
@@ -215,21 +233,25 @@ def capture_grid(batch_index: int) -> None:
 
 
 def sync_widgets(batch_index: int) -> None:
-    """Push state values back into the widgets after a programmatic change."""
+    """Push state values back into the widgets after a programmatic change.
+
+    Safe because it runs from a handler *before* this run's row widgets are
+    created; anything later must go through :func:`bump_text_widget`.
+    """
     for record in project().batch_records(batch_index):
-        st.session_state["txt_%s" % record.key] = record.user_final
+        st.session_state[text_key_for(record.key)] = record.user_final
         st.session_state["note_%s" % record.key] = record.user_comment
 
 
-def process_batch(batch_index: int) -> None:
-    """Send the current batch to the model and store its suggestions."""
-    proj = project()
-    records = proj.batch_records(batch_index)
-    if not records:
-        notify("warning", "This batch is empty.")
-        return
+def build_prompt_for(records, batch_index: int) -> str:
+    """Assemble the system prompt for a set of records in the current batch.
 
-    # Only the terms that actually occur in this batch are worth the tokens.
+    Shared by the whole-batch run and the single-row retry so a retried segment
+    is judged against exactly the same rules, termbase slice, corrections and
+    operator directive as its batch - only the segment list differs.
+    """
+    proj = project()
+    # Only the terms that actually occur are worth the tokens.
     terms = proj.relevant_terms([r.source_text for r in records])
     corrections = proj.feedback_block(upto_batch=batch_index)
     stage_key = proj.active_stage(batch_index)
@@ -240,6 +262,7 @@ def process_batch(batch_index: int) -> None:
         corrections_block=corrections,
         source_lang=st.session_state.source_lang,
         target_lang=st.session_state.target_lang,
+        extra_instructions=proj.global_directive,
         template=proj.template_for(stage_key),
         template_values={
             "{{HARD_RULES}}": proj.hard_rules_text,
@@ -255,6 +278,67 @@ def process_batch(batch_index: int) -> None:
     )
     st.session_state.last_prompt = system_prompt
     st.session_state.last_stage = stage_key
+    return system_prompt
+
+
+def tag_report_for(key: str, text: str) -> str:
+    """Tag-integrity summary for one suggestion, or "" when it is clean."""
+    segment = segments_by_key().get(key)
+    if segment is None:
+        return ""
+    _, report = mqxliff.tagmod.restore(
+        text, segment.lookup, expected=segment.expected_numbers
+    )
+    return "" if report.ok else report.summary()
+
+
+def retry_segment(key: str) -> None:
+    """Re-run one row without touching the rest of the batch."""
+    proj = project()
+    batch_index = proj.current_batch
+    capture_grid(batch_index)
+    record = proj.segments.get(key)
+    if record is None:
+        notify("error", "That segment is no longer in the project.")
+        return
+
+    system_prompt = build_prompt_for([record], batch_index)
+    try:
+        client = llm.LLMClient(st.session_state.config)
+        with st.spinner("Retrying segment %s..." % record.segment_id):
+            text, raw = client.translate_one(record, system_prompt)
+    except llm.LLMError as exc:
+        notify("error", "Retry failed: %s" % exc)
+        return
+    except Exception as exc:  # noqa: BLE001 - one row must not kill the session
+        notify("error", "Unexpected error on retry: %s" % exc)
+        st.session_state.traceback = traceback.format_exc()
+        return
+
+    st.session_state.last_raw = raw
+    if not text or not text.strip():
+        notify("warning",
+               "Segment %s came back empty again; its previous text is kept."
+               % record.segment_id)
+        return
+
+    # Patch this row only. record_suggestions() would also be safe, but going
+    # through it for one key makes the single-row intent explicit.
+    proj.record_suggestions({key: text}, {key: tag_report_for(key, text)})
+    proj.save()
+    bump_text_widget(key)
+    notify("success", "Segment %s re-translated." % record.segment_id)
+
+
+def process_batch(batch_index: int) -> None:
+    """Send the current batch to the model and store its suggestions."""
+    proj = project()
+    records = proj.batch_records(batch_index)
+    if not records:
+        notify("warning", "This batch is empty.")
+        return
+
+    system_prompt = build_prompt_for(records, batch_index)
 
     try:
         client = llm.LLMClient(st.session_state.config)
@@ -281,19 +365,25 @@ def process_batch(batch_index: int) -> None:
     progress.empty()
 
     # Validate tag integrity before the text ever reaches the grid.
-    by_key = segments_by_key()
     tag_reports: Dict[str, str] = {}
     for key, text in result.suggestions.items():
-        segment = by_key.get(key)
-        if segment is None:
-            continue
-        _, report = mqxliff.tagmod.restore(
-            text, segment.lookup, expected=segment.source.expected_numbers
-        )
-        if not report.ok:
-            tag_reports[key] = report.summary()
+        summary = tag_report_for(key, text)
+        if summary:
+            tag_reports[key] = summary
 
     count = proj.record_suggestions(result.suggestions, tag_reports)
+    st.session_state.last_raw = result.raw_text()
+
+    # Fold in any rule/vibe the model proposed, so the next batch inherits it.
+    merged: List[str] = []
+    if proj.auto_merge_proposals:
+        merged = proj.merge_proposals(
+            result.proposed_rules, result.proposed_vibe, batch_index)
+        if merged:
+            # The rules block is a plain text_area keyed by value, so it picks
+            # the new text up on the next render without a key reset.
+            st.session_state.rules_dirty = True
+
     proj.save()
     sync_widgets(batch_index)
 
@@ -304,6 +394,8 @@ def process_batch(batch_index: int) -> None:
         message += " %d row(s) have tag warnings." % len(tag_reports)
     if result.missing:
         message += " %d segment(s) came back empty and kept their MT." % len(result.missing)
+    if merged:
+        message += " Merged %d model-proposed rule/vibe change(s)." % len(merged)
     if result.errors:
         message += "\n\nErrors: " + "; ".join(result.errors[:3])
     notify("warning" if (result.errors or result.missing) else "success", message)
@@ -323,16 +415,32 @@ def run_analysis() -> None:
     if not proj.corrections:
         notify("warning", "No corrections recorded yet - apply a batch first.")
         return
+    # Give the analyser the expected tag set per row so it can actually check
+    # the human's edits rather than assume they are correct.
+    by_id = {s.unit_id: s for s in (document().translatable_segments()
+                                    if document() else [])}
+    expected = {
+        c.segment_id: by_id[c.segment_id].expected_numbers
+        for c in proj.corrections if c.segment_id in by_id
+    }
+
     try:
         client = llm.LLMClient(st.session_state.config)
         with st.spinner("Analysing your corrections..."):
-            text = client.analyze_corrections(proj.corrections)
+            text = client.analyze_corrections(
+                proj.corrections,
+                hard_rules_text=proj.hard_rules_text,
+                expected_tags=expected,
+            )
     except llm.LLMError as exc:
         notify("error", "Analysis failed: %s" % exc)
         return
     proj.analysis[str(proj.current_batch)] = text
     proj.save()
-    notify("success", "Analysis updated.")
+    warnings, _ = prompts.split_analysis(text)
+    notify("warning" if warnings else "success",
+           "Analysis updated - the model flagged issues in your edits."
+           if warnings else "Analysis updated.")
 
 
 def export_document(mark_confirmed: bool, only_changed: bool) -> None:
@@ -717,6 +825,25 @@ def render_left_panel() -> None:
     st.caption("%s characters, ~%s tokens"
                % (f"{len(rules):,}", f"{prompts.estimate_tokens(rules):,}"))
 
+    proj.auto_merge_proposals = st.checkbox(
+        "Auto-merge rules the model proposes", value=proj.auto_merge_proposals,
+        help="Appends model-proposed rules under a marked heading and updates "
+             "the vibe, so the next batch inherits them. Every change is logged "
+             "and can be reverted.",
+    )
+    if proj.rule_log:
+        with st.expander("Automatic rule changes (%d)" % len(proj.rule_log)):
+            for entry in reversed(proj.rule_log[-20:]):
+                st.markdown("- `%s` batch %s **%s** - %s"
+                            % (entry.get("at", ""), entry.get("batch", "?"),
+                               entry.get("kind", ""), entry.get("detail", "")))
+            if st.button("Revert automatic rules", key="revert_auto",
+                         width='stretch'):
+                proj.revert_auto_rules()
+                proj.save()
+                notify("success", "Automatically added rules removed.")
+                st.rerun()
+
     st.divider()
 
     # -- Section 2: the article's stylistic direction ------------------------
@@ -794,7 +921,12 @@ def render_left_panel() -> None:
         list(proj.analysis.values())[-1] if proj.analysis else ""
     )
     if analysis:
-        st.markdown(analysis)
+        warnings, brief = prompts.split_analysis(analysis)
+        if warnings:
+            # The analyser found something wrong with the *human's* edits.
+            # Give it its own block so it cannot be skimmed past.
+            st.error("**%s**\n\n%s" % (prompts.OPERATOR_WARNING_HEADING, warnings))
+        st.markdown(brief or analysis)
     else:
         st.info("Apply a batch, then run the analysis to see what your edits imply.")
 
@@ -908,6 +1040,19 @@ def render_grid() -> None:
     st.session_state.page = page
     visible = records[page * page_size : (page + 1) * page_size]
 
+    # -- Batch-wide directive, fed into the next run -----------------------
+    directive = st.text_area(
+        "Global Batch Directive / Operator Comment",
+        value=proj.global_directive,
+        height="content",
+        placeholder="Optional. Applies to every segment in this batch, e.g. "
+                    "\"this section is a tutorial - use the imperative\". "
+                    "Sent with the per-segment notes on the next run.",
+    )
+    if directive != proj.global_directive:
+        proj.global_directive = directive
+        proj.save()
+
     # -- Action buttons ----------------------------------------------------
     actions = st.columns([2, 2, 3])
     if actions[0].button("Process Current Batch", type="primary", width='stretch'):
@@ -932,6 +1077,25 @@ def render_grid() -> None:
     for record in visible:
         _render_row(record, by_key.get(record.key))
 
+    _render_raw_inspector()
+
+
+def _render_raw_inspector() -> None:
+    """Un-parsed model output for the current batch, for debugging."""
+    st.divider()
+    raw = st.session_state.get("last_raw") or ""
+    with st.expander("Raw LLM Response Stream Inspector"):
+        if not raw:
+            st.caption("Nothing yet - process a batch or retry a segment.")
+            return
+        st.caption("%s characters, exactly as the model returned them."
+                   % f"{len(raw):,}")
+        st.code(raw, language="json")
+        st.download_button(
+            "Download raw response", raw,
+            file_name="raw_response.txt", mime="text/plain", width='stretch',
+        )
+
 
 def _render_row(record: state_mod.SegmentRecord, segment: Optional[mqxliff.Segment]) -> None:
     cols = st.columns([1, 4, 4, 5, 3])
@@ -943,9 +1107,13 @@ def _render_row(record: state_mod.SegmentRecord, segment: Optional[mqxliff.Segme
         if record.tag_report:
             st.caption(":red[tags]")
         if segment is not None and segment.lookup.tags:
-            st.popover("{ }", help="Show full raw XML tags").markdown(
-                _raw_tag_table(segment)
-            )
+            with st.popover("{ }", help="Show full raw XML tags"):
+                _render_tag_tabs(segment)
+        if st.button("Retry", key="retry_%s" % record.key,
+                     help="Re-run just this segment against the model",
+                     width='stretch'):
+            retry_segment(record.key)
+            st.rerun()
 
     cols[1].markdown(_display(record.source_text))
     cols[2].markdown(_display(record.mt_target) or ":grey[(empty)]")
@@ -954,13 +1122,15 @@ def _render_row(record: state_mod.SegmentRecord, segment: Optional[mqxliff.Segme
         # Seed through session_state rather than ``value=``: passing both makes
         # Streamlit warn, and sync_widgets() needs to be able to overwrite the
         # field after the model returns.
-        text_key = "txt_%s" % record.key
+        text_key = text_key_for(record.key)
         st.session_state.setdefault(text_key, record.user_final)
         st.text_area(
             "Your text", key=text_key,
-            height=100, label_visibility="collapsed",
+            height="content", label_visibility="collapsed",
             placeholder="Process the batch to get a suggestion, or type your own.",
         )
+        if segment is not None:
+            _render_tag_buttons(record, segment, text_key)
         if record.tag_report:
             st.caption(":red[Tag issue: %s]" % record.tag_report)
         elif record.llm_suggestion and record.llm_suggestion != record.user_final:
@@ -970,11 +1140,49 @@ def _render_row(record: state_mod.SegmentRecord, segment: Optional[mqxliff.Segme
     st.session_state.setdefault(note_key, record.user_comment)
     cols[4].text_area(
         "Note", key=note_key,
-        height=100, label_visibility="collapsed",
+        height="content", label_visibility="collapsed",
         placeholder="Why you changed it - fed back to the model.",
     )
 
     _render_diff(record)
+
+
+def _render_tag_buttons(
+    record: state_mod.SegmentRecord,
+    segment: mqxliff.Segment,
+    text_key: str,
+) -> None:
+    """Clickable placeholder buttons under the editing box.
+
+    Streamlit exposes no caret position for a ``text_area`` - there is no API
+    that reports where the operator's cursor is, and a component iframe cannot
+    write back into another widget's state. So insertion happens server-side at
+    a remembered point: the end of the text by default, which is where a
+    reattached tag belongs anyway, and the operator drags it into place.
+    """
+    injectable = segment.injectable_tags()
+    if not injectable:
+        return
+
+    row = st.columns(min(len(injectable), 8) + 1)
+    for index, (number, _xml) in enumerate(injectable[:8]):
+        label = segment.lookup.format_placeholder(number)
+        if row[index].button(
+            label, key="inj_%s_%d" % (record.key, number),
+            help="Insert %s at the end of this row's text" % label,
+        ):
+            current = st.session_state.get(text_key, "") or ""
+            separator = "" if (not current or current.endswith((" ", "\n"))) else " "
+            updated = current + separator + label
+            # Write through the record and re-key the widget: the box already
+            # exists this run, so its state slot is locked.
+            project().capture_edits({record.key: updated})
+            project().save()
+            bump_text_widget(record.key)
+            st.rerun()
+
+    if len(injectable) > 8:
+        row[-1].caption("+%d more" % (len(injectable) - 8))
 
 
 def _render_diff(record: state_mod.SegmentRecord) -> None:
@@ -996,17 +1204,33 @@ def _render_diff(record: state_mod.SegmentRecord) -> None:
     st.caption("MT to suggestion: %s" % change.summary())
 
 
-def _raw_tag_table(segment: mqxliff.Segment) -> str:
-    """Markdown listing of the real XML behind each placeholder."""
-    origin = ("memoQ target (localised)"
-              if segment.tag_source == mqxliff.tagmod.TAG_SOURCE_TARGET
-              else "source")
-    lines = ["**Raw inline tags** - taken from the %s\n" % origin]
-    for number, xml in segment.raw_tags():
-        lines.append("`{%d}`\n```xml\n%s\n```" % (number, xml))
-    if not segment.lookup.tags:
-        lines.append("_This segment has no inline tags._")
-    return "\n".join(lines)
+def _render_tag_tabs(segment: mqxliff.Segment) -> None:
+    """Both tag ecosystems, side by side, with their global numbers."""
+    canonical = ("Current target" if segment.tag_source == mqxliff.tagmod.TAG_SOURCE_TARGET
+                 else "Source")
+    st.caption("Canonical side: **%s** - its XML is what gets written back." % canonical)
+
+    source_tab, target_tab = st.tabs(["Tags from Source", "Tags from Current Target"])
+    for tab, side in ((source_tab, mqxliff.tagmod.TAG_SOURCE_SOURCE),
+                      (target_tab, mqxliff.tagmod.TAG_SOURCE_TARGET)):
+        with tab:
+            entries = segment.side_tags(side)
+            if not entries:
+                st.caption("_This side has no inline tags._")
+                continue
+            for number, xml in entries:
+                st.markdown("`%s`" % segment.lookup.format_placeholder(number))
+                st.code(xml, language="xml")
+
+    shared = set(dict(segment.side_tags(mqxliff.tagmod.TAG_SOURCE_SOURCE))) & set(
+        dict(segment.side_tags(mqxliff.tagmod.TAG_SOURCE_TARGET)))
+    if shared:
+        st.caption(
+            "Numbers appearing in both tabs are one physical tag, not two - "
+            "%s. Distinct numbers mean the sides genuinely differ and both "
+            "variants are injectable."
+            % ", ".join(segment.lookup.format_placeholder(n) for n in sorted(shared))
+        )
 
 
 def _display(text: str) -> str:

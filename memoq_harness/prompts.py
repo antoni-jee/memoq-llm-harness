@@ -39,7 +39,17 @@ OUTPUT_CONTRACT = """OUTPUT FORMAT:
 Return a single JSON object, nothing else. No prose, no markdown fence.
 Shape: {"segments": [{"id": "<segment id exactly as given>", "target": "<your final target text>"}]}
 Include every segment you were given, once each, in the order given.
-If a segment needs no change, still return it with the text you consider final."""
+If a segment needs no change, still return it with the text you consider final.
+
+OPTIONAL - PROPOSING RULES:
+If this batch reveals a genuinely new editorial rule or a shift in the article's
+style that the next batch should inherit, you may add either of these top-level
+keys to the same JSON object:
+  "proposed_rules": ["one short, concrete, testable rule per string"]
+  "proposed_vibe":  "a short note refining this article's stylistic direction"
+Use them sparingly and only for something durable and repeatable. Do not restate
+a rule you were already given, do not propose anything you are unsure of, and
+never use these keys to comment on an individual segment."""
 
 
 #: Tokens the operator may place in a stage template. Anything the harness does
@@ -163,7 +173,13 @@ def build_system_prompt(
         )
 
     if extra_instructions.strip():
-        parts.append("ADDITIONAL INSTRUCTIONS:\n%s" % extra_instructions.strip())
+        parts.append(
+            "OPERATOR DIRECTIVE FOR THIS BATCH.\n"
+            "The reviewer wrote this about the batch you are about to handle. "
+            "It applies to every segment in it and outranks the style notes; "
+            "only the per-segment corrections above take precedence.\n\n%s"
+            % extra_instructions.strip()
+        )
 
     parts.append(TAG_RULES)
     parts.append(OUTPUT_CONTRACT)
@@ -186,21 +202,68 @@ def build_user_payload(records: Sequence[SegmentRecord]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+OPERATOR_WARNING_HEADING = "⚠️ OPERATOR CORRECTION WARNINGS"
+
 ANALYSIS_SYSTEM = """You analyse a translation reviewer's edits to infer their \
-preferences.
+preferences. You are a critical second pair of eyes, not a rubber stamp.
 
 You receive pairs of (machine suggestion, reviewer's final text) from a single \
-document, plus any notes the reviewer wrote.
+document, plus any notes the reviewer wrote, the inline-tag placeholders each \
+row is expected to contain, and the editorial rules in force.
 
-Produce a short, concrete brief for the translator who handles the next batch. \
-Write 3-6 bullets. Each bullet must name a specific, repeatable pattern - \
-terminology choices, register, sentence length, punctuation, formatting \
-conventions. Quote short examples. Say nothing about segments that were left \
-unchanged, and do not pad with generic translation advice. If the edits show no \
-consistent pattern, say so plainly in one line."""
+Run TWO passes, in this order.
+
+PASS 1 - VALIDATE THE HUMAN'S EDITS.
+The reviewer is a human working at speed and can introduce defects. Do not \
+treat an edit as correct merely because a human made it, and never infer a \
+style rule from what is plainly a slip. Check every edited row for:
+  1. Inline tag damage - a numbered placeholder such as {1} that the edit \
+dropped, duplicated, renumbered or invented, judged against the expected set \
+given for that row.
+  2. Typos and syntax breaks, especially inside technical terms, code \
+identifiers, function names and UI labels.
+  3. Violations of the editorial rules quoted to you - for example a \
+typographic quote where the rules mandate straight quotes, or a letter the \
+rules forbid.
+  4. Word-order or agreement errors that look accidental rather than chosen.
+
+If you find NOTHING wrong, omit the warning section entirely.
+
+If you find ANY issue, begin your reply with exactly this heading and nothing \
+before it:
+
+%s
+
+Under it, one bullet per affected row: the segment id, what looks wrong, and \
+the minimal correction you would suggest. Be specific and quote the offending \
+fragment. Be direct but constructive - the reviewer is the authority on style, \
+you are only flagging what looks like an accident rather than a decision. If \
+you are unsure whether something is a slip or a deliberate choice, say so \
+rather than asserting it is an error.
+
+PASS 2 - EXTRACT THE STYLE BRIEF.
+Then, under a heading "TRANSLATION BRIEF", write a short concrete brief for the \
+translator handling the next batch: 3-6 bullets, each naming a specific, \
+repeatable pattern - terminology, register, sentence length, punctuation, \
+formatting. Quote short examples. Derive these ONLY from edits that passed \
+pass 1; ignore rows you flagged as defective so their errors never harden into \
+rules. Say nothing about segments left unchanged and do not pad with generic \
+translation advice. If the clean edits show no consistent pattern, say so \
+plainly in one line.""" % OPERATOR_WARNING_HEADING
 
 
-def build_analysis_payload(corrections: Sequence[Correction]) -> str:
+def build_analysis_payload(
+    corrections: Sequence[Correction],
+    hard_rules_text: str = "",
+    expected_tags: Optional[Dict[str, List[int]]] = None,
+) -> str:
+    """Serialise the edits for the analyser.
+
+    The expected placeholder set and the rulebook are included so pass 1 has
+    something concrete to validate against; without them the analyser can only
+    guess whether a missing ``{2}`` was deliberate.
+    """
+    expected_tags = expected_tags or {}
     payload = [
         {
             "id": c.segment_id,
@@ -208,10 +271,33 @@ def build_analysis_payload(corrections: Sequence[Correction]) -> str:
             "machine": c.llm_suggestion,
             "reviewer": c.human_final,
             **({"note": c.comment} if c.comment else {}),
+            **({"expected_tags": expected_tags[c.segment_id]}
+               if c.segment_id in expected_tags else {}),
         }
         for c in corrections
     ]
-    return json.dumps({"edits": payload}, ensure_ascii=False, indent=2)
+    body: Dict[str, object] = {"edits": payload}
+    if hard_rules_text.strip():
+        body["editorial_rules_in_force"] = hard_rules_text.strip()
+    return json.dumps(body, ensure_ascii=False, indent=2)
+
+
+def split_analysis(text: str) -> Tuple[str, str]:
+    """Separate the warning section from the style brief.
+
+    Returns ``(warnings, brief)``; either may be empty. Keeping them apart lets
+    the UI give the warnings their own high-visibility block instead of burying
+    them in a wall of markdown.
+    """
+    if OPERATOR_WARNING_HEADING not in text:
+        return "", text.strip()
+    _, _, rest = text.partition(OPERATOR_WARNING_HEADING)
+    for marker in ("TRANSLATION BRIEF", "## TRANSLATION BRIEF",
+                   "**TRANSLATION BRIEF**"):
+        if marker in rest:
+            warnings, _, brief = rest.partition(marker)
+            return warnings.strip(), brief.strip()
+    return rest.strip(), ""
 
 
 def estimate_tokens(text: str) -> int:

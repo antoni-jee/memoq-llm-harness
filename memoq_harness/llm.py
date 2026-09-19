@@ -146,6 +146,23 @@ DEFAULT_PRESET = "Local Engine (Ollama)"
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
+#: Appended to the Anthropic system prompt when assistant prefill is unavailable.
+JSON_ONLY_CONSTRAINT = (
+    "\n\nCRITICAL: Return ONLY a valid, raw JSON object. Do not include "
+    "markdown wraps, triple backticks, introduction, or trailing "
+    "conversational text."
+)
+
+#: Model-name fragments whose builds reject a prefilled assistant turn with a
+#: 400. Observed in production on the newer Claude releases; older models keep
+#: the prefill, which constrains JSON far more tightly than wording does.
+PREFILL_INCOMPATIBLE = ("4-5", "4-6", "sonnet-5", "claude-5", "opus-5", "haiku-5")
+
+
+def _rejects_prefill(model: str) -> bool:
+    lowered = (model or "").lower()
+    return any(fragment in lowered for fragment in PREFILL_INCOMPATIBLE)
+
 
 @dataclass
 class ClientConfig:
@@ -184,6 +201,25 @@ class BatchResult:
     errors: List[str] = field(default_factory=list)
     requests: int = 0
     elapsed: float = 0.0
+    raw_responses: List[str] = field(default_factory=list)
+    """Un-parsed model output, one entry per request, for the inspector."""
+
+    proposed_rules: List[str] = field(default_factory=list)
+    """New editorial rules the model offered, if any."""
+
+    proposed_vibe: str = ""
+    """A refinement to the article's stylistic direction, if offered."""
+
+    def raw_text(self) -> str:
+        """Every raw response joined with a separator per request."""
+        if not self.raw_responses:
+            return ""
+        if len(self.raw_responses) == 1:
+            return self.raw_responses[0]
+        return "\n\n".join(
+            "----- request %d of %d -----\n%s" % (i + 1, len(self.raw_responses), raw)
+            for i, raw in enumerate(self.raw_responses)
+        )
 
     @property
     def ok(self) -> bool:
@@ -269,8 +305,10 @@ class LLMClient:
             if progress:
                 progress(index, len(chunks), "Translating %d segments" % len(chunk))
             try:
-                parsed = self._translate_chunk(chunk, system_prompt)
+                parsed, raw = self._translate_chunk(chunk, system_prompt)
                 result.suggestions.update(parsed)
+                result.raw_responses.append(raw)
+                _collect_proposals(raw, result)
             except LLMError as exc:
                 result.errors.append("Chunk %d/%d: %s" % (index + 1, len(chunks), exc))
             result.requests += 1
@@ -282,7 +320,9 @@ class LLMClient:
                 progress(len(chunks), len(chunks) + 1, "Retrying %d skipped" % len(missing))
             for chunk in [missing[i : i + 5] for i in range(0, len(missing), 5)]:
                 try:
-                    result.suggestions.update(self._translate_chunk(chunk, system_prompt))
+                    parsed, raw = self._translate_chunk(chunk, system_prompt)
+                    result.suggestions.update(parsed)
+                    result.raw_responses.append(raw)
                 except LLMError as exc:
                     result.errors.append("Retry: %s" % exc)
                 result.requests += 1
@@ -293,7 +333,7 @@ class LLMClient:
 
     def _translate_chunk(
         self, records: Sequence[SegmentRecord], system_prompt: str
-    ) -> Dict[str, str]:
+    ) -> Tuple[Dict[str, str], str]:
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompts.build_user_payload(records)},
@@ -310,18 +350,64 @@ class LLMClient:
             target = item.get("target")
             if key in valid and isinstance(target, str):
                 out[key] = target
-        return out
+        return out, raw
 
-    def analyze_corrections(self, corrections: Sequence[Correction], limit: int = 40) -> str:
-        """Summarise what the reviewer's edits reveal about their preferences."""
+    def translate_one(
+        self,
+        record: SegmentRecord,
+        system_prompt: str,
+    ) -> Tuple[Optional[str], str]:
+        """Re-run inference for a single segment.
+
+        Used by the per-row Retry button when one row comes back empty, times
+        out or trips a content filter. It is deliberately a separate path from
+        :meth:`translate_batch`: the caller patches only this row, so the other
+        segments in the batch keep the output the operator has already reviewed.
+
+        Returns ``(text_or_None, raw_response)``. The raw text is handed back
+        even on a parse failure so the inspector can show what arrived.
+        """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompts.build_user_payload([record])},
+        ]
+        raw = self._chat(messages, force_json=True)
+        data = extract_json(raw)
+        if data is None:
+            return None, raw
+
+        for item in _iter_segments(data):
+            target = item.get("target")
+            if isinstance(target, str) and target.strip():
+                # A single-segment response is unambiguous, so accept the one
+                # target that came back even if the model echoed a different id.
+                if str(item.get("id", "")).strip() in ("", record.key):
+                    return target, raw
+                return target, raw
+        return None, raw
+
+    def analyze_corrections(
+        self,
+        corrections: Sequence[Correction],
+        limit: int = 40,
+        hard_rules_text: str = "",
+        expected_tags: Optional[Dict[str, List[int]]] = None,
+    ) -> str:
+        """Critique the reviewer's edits, then summarise their preferences.
+
+        The rulebook and the expected tag sets are passed through so the
+        analyser can actually check the human's work rather than assume it is
+        correct - see ``prompts.ANALYSIS_SYSTEM``.
+        """
         if not corrections:
             return ""
         recent = list(corrections)[-limit:]
         messages = [
             {"role": "system", "content": prompts.ANALYSIS_SYSTEM},
-            {"role": "user", "content": prompts.build_analysis_payload(recent)},
+            {"role": "user", "content": prompts.build_analysis_payload(
+                recent, hard_rules_text, expected_tags)},
         ]
-        return self._chat(messages, force_json=False, max_tokens=900).strip()
+        return self._chat(messages, force_json=False, max_tokens=1600).strip()
 
     # ----------------------------------------------------------------- plumbing
 
@@ -366,9 +452,12 @@ class LLMClient:
         if not turns:
             turns = [{"role": "user", "content": system or "Hello"}]
 
-        prefill = force_json
+        prefill = force_json and not _rejects_prefill(self.config.model)
         if prefill:
             turns = turns + [{"role": "assistant", "content": "{"}]
+        elif force_json:
+            # No prefill available: constrain the format in words instead.
+            system = (system + JSON_ONLY_CONSTRAINT) if system else JSON_ONLY_CONSTRAINT.strip()
 
         # Anthropic requires a positive max_tokens; there is no "server decides".
         limit = self.config.max_tokens if max_tokens is None else max_tokens
@@ -458,6 +547,30 @@ class LLMClient:
 
 
 # ------------------------------------------------------------------ helpers
+
+
+def _collect_proposals(raw: str, result: BatchResult) -> None:
+    """Harvest ``proposed_rules`` / ``proposed_vibe`` from a raw response.
+
+    Tolerant by design: a model that omits the keys, or emits them as a bare
+    string instead of a list, must not break a batch that otherwise succeeded.
+    """
+    data = extract_json(raw)
+    if not isinstance(data, dict):
+        return
+
+    rules = data.get("proposed_rules")
+    if isinstance(rules, str):
+        rules = [rules]
+    if isinstance(rules, list):
+        for rule in rules:
+            text = str(rule).strip()
+            if text and text not in result.proposed_rules:
+                result.proposed_rules.append(text)
+
+    vibe = data.get("proposed_vibe")
+    if isinstance(vibe, str) and vibe.strip():
+        result.proposed_vibe = vibe.strip()
 
 
 def _iter_segments(data: object):

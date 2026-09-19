@@ -110,6 +110,29 @@ The Anthropic preset defaults to `claude-3-5-sonnet-latest` as specified.
 Newer and more capable models — `claude-opus-5`, `claude-sonnet-5` — are listed
 first in the model dropdown and can be selected without editing any code.
 
+Two Anthropic-specific quirks are handled automatically:
+
+* **No `temperature`.** `messages.create()` has no such parameter in the
+  installed SDK; passing it raises `TypeError` before the request is sent. The
+  sidebar slider still governs every other preset. A test introspects the real
+  SDK signature so future parameter drift fails the suite rather than crashing
+  at runtime.
+* **Prefill bypass.** Newer Claude builds (`sonnet-5`, `opus-5`, `4-5`, `4-6`,
+  `claude-5`) reject a prefilled assistant turn with a 400. For those models
+  the prefill is dropped and an explicit "raw JSON only" constraint is appended
+  to the system prompt instead. Older models keep the prefill, which constrains
+  the format far more tightly than wording does.
+
+### The analysis is bidirectional
+
+"Analyse my corrections" does not assume your edits are correct. The analyser
+receives the rulebook and each row's expected placeholder set, and runs a
+validation pass *before* extracting style: it looks for dropped or duplicated
+tags, typos in technical terms, and violations of your own hard rules. Anything
+it finds is reported under a **⚠️ OPERATOR CORRECTION WARNINGS** block rendered
+separately from the brief, and flagged rows are excluded from the style
+extraction so a slip never hardens into a rule.
+
 ### Inline tags
 
 memoQ inline tags (`<bpt>`, `<ept>`, `<ph>`, `<it>`, `<x/>`, `<g>`, `<mrk>`) are
@@ -129,9 +152,19 @@ Details that matter:
 * **Source and target share one numbering.** Numbering each side independently
   would mean `{1}` in the source and `{1}` in the target could be different
   tags, and a model told to "keep the tags" would silently swap them.
-* **The raw XML is inspectable.** Every grid row with tags has a `{ }` popover
-  listing exactly what hides behind each placeholder, so the operator never has
-  to open memoQ to check.
+* **The raw XML is inspectable, both sides.** Every grid row with tags has a
+  `{ }` popover with two tabs — *Tags from Source* and *Tags from Current
+  Target* — showing exactly what hides behind each placeholder.
+* **Every distinct tag has exactly one global number.** Where the two sides
+  carry the same tag it shares a number and appears in both tabs; where the MT
+  localised it, each variant gets its own number and **both stay injectable**.
+  Previously the source's version of a localised tag was discarded outright
+  and could not be recovered.
+* **Tag buttons under each row** insert a placeholder into the editing box.
+  Streamlit exposes no caret position for a `text_area` — there is no API that
+  reports where the cursor is, and a component iframe cannot write into another
+  widget's state — so insertion appends at the end, which is where a reattached
+  tag belongs anyway.
 * **Literal `{1}` in the text is handled.** If a segment's own text already
   contains something that looks like a placeholder, that segment switches to an
   alternate scheme so restoration cannot mis-target.
@@ -250,6 +283,43 @@ Anything else — including the operator's own bracketed notes like
 `[НОМЕР СТАТЬИ]` — is passed through untouched. Material placed by a token is
 not emitted a second time further down, so writing `{{HARD_RULES}}` into a
 template puts the rulebook exactly where you want it rather than twice.
+
+### Per-row retry
+
+Each grid row has a **Retry** button. It isolates that one segment, rebuilds
+the prompt with the same rules, termbase slice, corrections and operator
+directive the batch used, runs a single-row inference pass, and patches only
+that row's suggestion and diff. The other rows keep the output you have already
+reviewed. Useful when one segment comes back empty, times out, or trips a
+content filter.
+
+### Global batch directive
+
+Above the grid, **Global Batch Directive / Operator Comment** is an optional
+instruction that applies to the whole batch. It is injected into the prompt as
+a distinct layer ranked above the style notes and below the per-segment
+corrections, and it persists to `state.json`.
+
+### Raw response inspector
+
+**Raw LLM Response Stream Inspector** at the bottom of the workspace shows the
+complete un-parsed text the model returned for the current batch (or the last
+retry), with a download button. When a batch parses badly, this is where you
+look first.
+
+### Model-proposed rules
+
+The output contract invites the model to add optional `proposed_rules` and
+`proposed_vibe` keys when a batch reveals something durable. With **Auto-merge
+rules the model proposes** enabled (default), these are appended to the live
+blocks so the next batch inherits them.
+
+Because this mutates the document's governing rules with no human in the loop,
+it is deliberately constrained: new rules land under a marked heading rather
+than being woven into your prose, duplicates and anything already present are
+dropped, every change is recorded in an audit log with batch number and
+timestamp, and **Revert automatic rules** removes the whole machine-authored
+block in one click.
 
 ### Text normalization: none
 

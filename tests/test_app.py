@@ -9,6 +9,7 @@ Run with:  python tests/test_app.py
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -40,11 +41,31 @@ def fake_translate_batch(self, records, system_prompt, progress=None):
         result.suggestions[record.key] = "MT %s" % record.source_text
     result.requests = 1
     result.elapsed = 0.01
+    result.raw_responses = [json.dumps(
+        {"segments": [{"id": r.key, "target": result.suggestions[r.key]}
+                      for r in records]},
+        ensure_ascii=False)]
     return result
 
 
-def fake_analyze(self, corrections, limit=40):
+def fake_analyze(self, corrections, limit=40, hard_rules_text="", expected_tags=None):
+    LAST_ANALYSIS_ARGS.clear()
+    LAST_ANALYSIS_ARGS.update(
+        {"rules": hard_rules_text, "expected": expected_tags or {}})
     return "- The reviewer prefers shorter sentences."
+
+
+def fake_analyze_with_warning(self, corrections, limit=40, hard_rules_text="",
+                              expected_tags=None):
+    from memoq_harness import prompts
+    return (
+        "%s\n- Row 12: the edit dropped tag {2}.\n\n"
+        "TRANSLATION BRIEF\n- The reviewer prefers shorter sentences."
+        % prompts.OPERATOR_WARNING_HEADING
+    )
+
+
+LAST_ANALYSIS_ARGS: dict = {}
 
 
 class AppTestCase(unittest.TestCase):
@@ -93,6 +114,19 @@ class AppTestCase(unittest.TestCase):
         self.assertEqual(app.exception, [], [str(e) for e in app.exception])
         self.assertIsNotNone(app.session_state.document)
         return app
+
+    @staticmethod
+    def tkey(app: AppTest, record_key: str) -> str:
+        """Current widget key for a row's editing box.
+
+        The key carries a revision counter so button handlers can reset the
+        box, so tests must resolve it rather than hard-code ``txt_<key>``.
+        """
+        rev = app.session_state.get("txtrev_%s" % record_key, 0)
+        return "txt_%s_%d" % (record_key, rev)
+
+    def row_text(self, app: AppTest, record_key: str):
+        return app.text_area(key=self.tkey(app, record_key))
 
     @staticmethod
     def button(scope, label: str):
@@ -262,7 +296,7 @@ class AppTestCase(unittest.TestCase):
         self.assertTrue(first.llm_suggestion.startswith("MT "))
         self.assertEqual(first.user_final, first.llm_suggestion)
         self.assertEqual(first.status, "processed")
-        self.assertEqual(app.session_state["txt_%s" % first.key], first.llm_suggestion)
+        self.assertEqual(app.session_state[self.tkey(app, first.key)], first.llm_suggestion)
 
     def test_apply_turns_edits_into_corrections(self):
         app = self.load_doc(self.run_app())
@@ -270,7 +304,7 @@ class AppTestCase(unittest.TestCase):
 
         proj = app.session_state.project
         first = proj.batch_records(0)[0]
-        app.text_area(key="txt_%s" % first.key).set_value("Meine eigene Fassung").run()
+        self.row_text(app, first.key).set_value("Meine eigene Fassung").run()
         app.text_area(key="note_%s" % first.key).set_value("zu woertlich").run()
         self.button(app, "Apply Changes & Calculate Diffs").click().run()
 
@@ -291,7 +325,7 @@ class AppTestCase(unittest.TestCase):
         app = self.load_doc(self.run_app())
         self.button(app, "Process Current Batch").click().run()
         first = app.session_state.project.batch_records(0)[0]
-        app.text_area(key="txt_%s" % first.key).set_value("Handkorrektur").run()
+        self.row_text(app, first.key).set_value("Handkorrektur").run()
 
         self.button(app, "Next").click().run()
         proj = app.session_state.project
@@ -303,7 +337,7 @@ class AppTestCase(unittest.TestCase):
         app = self.load_doc(self.run_app())
         self.button(app, "Process Current Batch").click().run()
         first = app.session_state.project.batch_records(0)[0]
-        app.text_area(key="txt_%s" % first.key).set_value("Handkorrektur").run()
+        self.row_text(app, first.key).set_value("Handkorrektur").run()
         self.button(app, "Next").click().run()
 
         self.button(app, "Process Current Batch").click().run()
@@ -350,7 +384,7 @@ class AppTestCase(unittest.TestCase):
         app = self.load_doc(self.run_app())
         self.button(app, "Process Current Batch").click().run()
         first = app.session_state.project.batch_records(0)[0]
-        app.text_area(key="txt_%s" % first.key).set_value("Meins").run()
+        self.row_text(app, first.key).set_value("Meins").run()
         self.button(app, "Apply Changes & Calculate Diffs").click().run()
         self.button(app, "Process Current Batch").click().run()
         self.assertEqual(app.session_state.project.segments[first.key].user_final, "Meins")
@@ -359,7 +393,7 @@ class AppTestCase(unittest.TestCase):
         app = self.load_doc(self.run_app())
         self.button(app, "Process Current Batch").click().run()
         first = app.session_state.project.batch_records(0)[0]
-        app.text_area(key="txt_%s" % first.key).set_value("Anders").run()
+        self.row_text(app, first.key).set_value("Anders").run()
         self.button(app, "Apply Changes & Calculate Diffs").click().run()
         self.button(app, "Analyse my corrections").click().run()
         self.assertTrue(app.session_state.project.analysis)
@@ -509,6 +543,164 @@ class AppTestCase(unittest.TestCase):
         # The stub returns "MT " + source, so every row differs from its MT.
         captions = [c.value for c in app.caption]
         self.assertTrue(any("MT to suggestion" in c for c in captions), captions[:8])
+
+    # ------------------------------------------- feature pass: items 1-7
+
+    def test_grid_text_areas_auto_size_to_content(self):
+        """No fixed pixel heights in the grid - no nested scrollbars.
+
+        Height is applied client-side and is absent from the TextArea proto,
+        so AppTest cannot observe it; assert on the row renderer's source.
+        """
+        import inspect
+        import re
+
+        import app as app_module
+        body = inspect.getsource(app_module._render_row)
+        body += inspect.getsource(app_module._render_tag_buttons)
+
+        self.assertIn('height="content"', body)
+        fixed = re.findall(r"height\s*=\s*\d+", body)
+        self.assertEqual(fixed, [], "fixed pixel heights left in the grid: %s" % fixed)
+
+    def test_tag_injection_button_appends_placeholder(self):
+        app = self.load_doc(self.run_app())
+        # Segment id 1 in the fixture carries {1} and {2}.
+        record = next(r for r in app.session_state.project.batch_records(0)
+                      if r.segment_id == "1")
+        self.row_text(app, record.key).set_value("Готовый текст").run()
+
+        app.button(key="inj_%s_1" % record.key).click().run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        # The box is deliberately re-keyed on insert, so resolve it afresh.
+        self.assertEqual(app.session_state[self.tkey(app, record.key)],
+                         "Готовый текст {1}")
+        self.assertEqual(self.row_text(app, record.key).value, "Готовый текст {1}")
+        # And it is captured into the project, not just the widget.
+        self.assertEqual(
+            app.session_state.project.segments[record.key].user_final,
+            "Готовый текст {1}")
+
+    def test_injection_button_absent_for_untagged_rows(self):
+        app = self.load_doc(self.run_app())
+        # Segment 8 ("Tom & Jerry ...") is in batch 0 and carries no tags.
+        record = next(r for r in app.session_state.project.batch_records(0)
+                      if r.segment_id == "8")
+        keys = [b.key for b in app.button if b.key]
+        self.assertFalse([k for k in keys if k.startswith("inj_%s" % record.key)])
+
+    def test_retry_button_exists_for_every_row(self):
+        app = self.load_doc(self.run_app())
+        for record in app.session_state.project.batch_records(0):
+            self.assertIsNotNone(app.button(key="retry_%s" % record.key))
+
+    def test_retry_patches_only_its_own_row(self):
+        app = self.load_doc(self.run_app())
+        self.button(app, "Process Current Batch").click().run()
+        proj = app.session_state.project
+        records = proj.batch_records(0)
+        target, neighbour = records[0], records[1]
+        before = neighbour.llm_suggestion
+        self.assertTrue(before)
+
+        llm.LLMClient.translate_one = lambda self, record, prompt: (
+            "ПЕРЕВОД ПОСЛЕ ПОВТОРА", '{"segments":[{"id":"x","target":"..."}]}')
+        try:
+            app.button(key="retry_%s" % target.key).click().run()
+        finally:
+            del llm.LLMClient.translate_one
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+
+        proj = app.session_state.project
+        self.assertEqual(proj.segments[target.key].llm_suggestion,
+                         "ПЕРЕВОД ПОСЛЕ ПОВТОРА")
+        self.assertEqual(proj.segments[neighbour.key].llm_suggestion, before)
+
+    def test_retry_reports_an_empty_response_without_clobbering(self):
+        app = self.load_doc(self.run_app())
+        self.button(app, "Process Current Batch").click().run()
+        record = app.session_state.project.batch_records(0)[0]
+        before = record.llm_suggestion
+
+        llm.LLMClient.translate_one = lambda self, r, p: (None, "not json")
+        try:
+            app.button(key="retry_%s" % record.key).click().run()
+        finally:
+            del llm.LLMClient.translate_one
+
+        self.assertEqual(
+            app.session_state.project.segments[record.key].llm_suggestion, before)
+        self.assertTrue(any("empty again" in w.value for w in app.warning))
+
+    def test_global_directive_persists_and_reaches_the_prompt(self):
+        app = self.load_doc(self.run_app())
+        box = next(t for t in app.text_area
+                   if t.label.startswith("Global Batch Directive"))
+        box.set_value("Это руководство - используйте императив.").run()
+        self.assertEqual(
+            state_mod.ProjectState.load(self.state_path).global_directive,
+            "Это руководство - используйте императив.")
+
+        self.button(app, "Process Current Batch").click().run()
+        self.assertIn("OPERATOR DIRECTIVE", LAST_PROMPT[0])
+        self.assertIn("Это руководство", LAST_PROMPT[0])
+
+    def test_raw_inspector_shows_the_model_output(self):
+        app = self.load_doc(self.run_app())
+        self.button(app, "Process Current Batch").click().run()
+        raw = app.session_state.last_raw
+        self.assertTrue(raw)
+        self.assertTrue(any("Raw LLM Response Stream Inspector" in e.label
+                            for e in app.expander))
+
+    def test_proposed_rules_are_merged_and_logged(self):
+        app = self.load_doc(self.run_app())
+        proj = app.session_state.project
+        before = proj.hard_rules_text
+
+        applied = proj.merge_proposals(
+            ["Не переводить имена функций"], "Тон стал более техническим", 0)
+        self.assertEqual(len(applied), 2)
+        self.assertIn("Не переводить имена функций", proj.hard_rules_text)
+        self.assertIn("Тон стал более техническим", proj.vibe)
+        self.assertNotEqual(proj.hard_rules_text, before)
+        self.assertEqual(len(proj.rule_log), 2)
+
+        proj.revert_auto_rules()
+        self.assertNotIn("Не переводить имена функций", proj.hard_rules_text)
+        self.assertEqual(proj.rule_log, [])
+
+    def test_analysis_receives_rules_and_expected_tags(self):
+        app = self.load_doc(self.run_app())
+        self.button(app, "Process Current Batch").click().run()
+        record = app.session_state.project.batch_records(0)[0]
+        self.row_text(app, record.key).set_value("Правка").run()
+        self.button(app, "Apply Changes & Calculate Diffs").click().run()
+        self.button(app, "Analyse my corrections").click().run()
+
+        self.assertTrue(LAST_ANALYSIS_ARGS["rules"])
+        self.assertIn(record.segment_id, LAST_ANALYSIS_ARGS["expected"])
+
+    def test_operator_warnings_get_their_own_block(self):
+        app = self.load_doc(self.run_app())
+        self.button(app, "Process Current Batch").click().run()
+        record = app.session_state.project.batch_records(0)[0]
+        self.row_text(app, record.key).set_value("Правка").run()
+        self.button(app, "Apply Changes & Calculate Diffs").click().run()
+
+        original = llm.LLMClient.analyze_corrections
+        llm.LLMClient.analyze_corrections = fake_analyze_with_warning
+        try:
+            self.button(app, "Analyse my corrections").click().run()
+        finally:
+            llm.LLMClient.analyze_corrections = original
+
+        errors = [e.value for e in app.error]
+        self.assertTrue(any("OPERATOR CORRECTION WARNINGS" in e for e in errors),
+                        errors)
+        self.assertTrue(any("dropped tag" in e for e in errors))
+        # The brief still renders, separately from the warning.
+        self.assertTrue(any("shorter sentences" in m.value for m in app.markdown))
 
     def test_reset_clears_the_project(self):
         app = self.load_doc(self.run_app())

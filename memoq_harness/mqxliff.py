@@ -111,6 +111,34 @@ class Segment:
         """``(number, XML)`` pairs for the operator's raw-tag inspector."""
         return sorted(self.lookup.tags.items())
 
+    def side_tags(self, side: str) -> List[Tuple[int, str]]:
+        """Injectable ``(number, XML)`` pairs for one side of the segment.
+
+        Every distinct tag has exactly one global number, so a number always
+        means one physical tag. Where both sides carry the same tag they share
+        that number and it appears in both tabs - listing it twice would offer
+        two placeholders for one tag, and injecting the wrong one would corrupt
+        the row. Where the sides genuinely differ, each variant has its own
+        number and both are injectable.
+        """
+        own = self.source.tags if side == tagmod.TAG_SOURCE_SOURCE else self.target.tags
+        variants = self.lookup.variants
+        canonical = (self.target.tags if self.tag_source == tagmod.TAG_SOURCE_TARGET
+                     else self.source.tags)
+
+        out: List[Tuple[int, str]] = []
+        for number, xml in sorted(own.items()):
+            if canonical.get(number) == xml or number not in variants:
+                out.append((number, xml))
+            else:
+                # This side's XML lives under its variant number.
+                out.append((variants[number], xml))
+        return out
+
+    def injectable_tags(self) -> List[Tuple[int, str]]:
+        """All distinct tags, lowest number first, for the injection buttons."""
+        return sorted(self.lookup.tags.items())
+
 
 class MqxliffError(RuntimeError):
     """Raised when a file cannot be read as memoQ bilingual XLIFF."""

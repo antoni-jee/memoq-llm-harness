@@ -68,6 +68,15 @@ class TaggedText:
     scheme: str = "brace"
     """Which placeholder scheme was used for this segment."""
 
+    variants: Dict[int, int] = field(default_factory=dict)
+    """Canonical number -> the number holding the *other* side's XML.
+
+    Populated on the ``lookup`` returned by :func:`isolate_pair` when the two
+    sides disagree about a tag's contents, e.g. a link the MT localised. Both
+    variants stay injectable; only the canonical one is written back by
+    default.
+    """
+
     @property
     def placeholder_pattern(self) -> re.Pattern:
         return re.compile(_scheme_by_name(self.scheme)[2])
@@ -204,6 +213,20 @@ def isolate_pair(
     primary_tags = {i + 1: xml for i, xml in enumerate(primary_list)}
     secondary_tags = {n: secondary_list[j] for j, n in secondary_numbers.items()}
 
+    # Where the two sides disagree about a tag's contents - the localised-link
+    # case - keep the secondary side's XML too, under a number of its own.
+    # Without this the source variant is unreachable: it is neither written
+    # back nor offered for injection, so an operator who actually wanted the
+    # English href had no way to get at it.
+    variants: Dict[int, int] = {}
+    for j, number in sorted(secondary_numbers.items()):
+        secondary_xml = secondary_list[j]
+        if lookup.get(number) == secondary_xml:
+            continue
+        variant_number = (max(lookup) + 1) if lookup else 1
+        lookup[variant_number] = secondary_xml
+        variants[number] = variant_number
+
     if use_target:
         target_tags, source_tags = primary_tags, secondary_tags
         target_numbers = list(range(1, len(primary_list) + 1))
@@ -219,7 +242,7 @@ def isolate_pair(
     return (
         TaggedText(source_text, source_tags, scheme_name),
         TaggedText(target_text, target_tags, scheme_name),
-        TaggedText("", lookup, scheme_name),
+        TaggedText("", lookup, scheme_name, variants),
     )
 
 
