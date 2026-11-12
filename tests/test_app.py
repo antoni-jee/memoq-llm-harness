@@ -284,6 +284,75 @@ class AppTestCase(unittest.TestCase):
         checkbox.set_value(False).run()
         self.assertEqual(len(app.session_state.project.segments), 10)
 
+    def test_filter_toggle_preserves_applied_human_edit(self):
+        """Hiding a row through the filter, then restoring it, must not discard
+        the human's saved text, comment, or edited flag.
+
+        The confirmed fixture row id 3 is grid-editable only while
+        "Skip confirmed rows" is off, which is what makes the scenario valid.
+        """
+        final = "Meine eigene Fassung 3"
+        comment = "manuell geaendert"
+        app = self.load_doc(self.run_app())
+
+        def skip_confirmed_checkbox():
+            return next(c for c in app.sidebar.checkbox
+                        if c.label == "Skip confirmed rows")
+
+        # 2. Reveal the confirmed row so it is grid-editable.
+        skip_confirmed_checkbox().set_value(False).run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+
+        # 3. Locate the confirmed segment by identity, not by batch position.
+        proj = app.session_state.project
+        target = next(
+            r for b in range(proj.batch_count)
+            for r in proj.batch_records(b)
+            if str(r.segment_id) == "3")
+        key = target.key
+
+        # 4. Enter a distinct manual translation and a non-empty comment.
+        self.row_text(app, key).set_value(final).run()
+        app.text_area(key="note_%s" % key).set_value(comment).run()
+
+        # 5. Apply and assert the work is saved.
+        self.button(app, "Apply Changes & Calculate Diffs").click().run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        saved = app.session_state.project.segments[key]
+        with self.subTest(phase="after-apply", field="user_final"):
+            self.assertEqual(saved.user_final, final)
+        with self.subTest(phase="after-apply", field="user_comment"):
+            self.assertEqual(saved.user_comment, comment)
+        with self.subTest(phase="after-apply", field="edited_by_human"):
+            self.assertTrue(saved.edited_by_human)
+
+        # 6. Hide the row via the filter.
+        skip_confirmed_checkbox().set_value(True).run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        # Filtering excludes the row from processing (the active batches); it
+        # must not require deletion from the persistent segment store.
+        hidden = app.session_state.project
+        active_keys = {
+            r.key for b in range(hidden.batch_count)
+            for r in hidden.batch_records(b)}
+        self.assertNotIn(key, active_keys)
+
+        # 7. Restore the filter so the row is included again.
+        skip_confirmed_checkbox().set_value(False).run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+
+        # 8. The saved human work must survive the hide/restore round trip.
+        restored = app.session_state.project.segments.get(key)
+        self.assertIsNotNone(restored)
+        with self.subTest(phase="after-restore", field="user_final"):
+            self.assertEqual(restored.user_final, final)
+        with self.subTest(phase="after-restore", field="user_comment"):
+            self.assertEqual(restored.user_comment, comment)
+        with self.subTest(phase="after-restore", field="edited_by_human"):
+            self.assertTrue(restored.edited_by_human)
+        with self.subTest(phase="after-restore", field="editor-text"):
+            self.assertEqual(self.row_text(app, key).value, final)
+
     # ----------------------------------------------------- the batch cycle
 
     def test_process_batch_fills_the_grid(self):

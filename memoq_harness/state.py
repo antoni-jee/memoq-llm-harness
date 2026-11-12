@@ -356,12 +356,24 @@ class ProjectState:
 
     # ---------------------------------------------------------------- binding
 
-    def bind_segments(self, segments: Sequence, source_file: str, source_path: str = "") -> None:
+    def bind_segments(
+        self,
+        segments: Sequence,
+        source_file: str,
+        source_path: str = "",
+        present_keys: Optional[set] = None,
+    ) -> None:
         """Populate/refresh records for the translatable segments of a document.
 
-        Existing human work is preserved: when a segment key is already known
-        and its source text is unchanged, the stored suggestion/edit survives a
-        reload of the same file.
+        ``segments`` is the *active* selection under the current filter; it
+        drives ``order`` and therefore batching and export. Existing human work
+        is preserved: when a segment key is already known and its source text is
+        unchanged, the stored suggestion/edit survives a reload of the same file.
+
+        A row the filter currently hides is not discarded: ``present_keys`` is
+        the identity of every segment in the full document (hidden rows
+        included), so only a key the document no longer contains is pruned.
+        Filtering changes processing scope without losing saved work.
         """
         self.source_file = source_file
         self.source_path = source_path
@@ -387,8 +399,14 @@ class ProjectState:
                 mt_target=segment.target_text,
             )
 
-        # Drop records for segments no longer present (e.g. filter changed).
-        live = set(self.order)
+        # A filtered-out row stays saved (merely hidden from processing); only a
+        # segment genuinely absent from the document is dropped. When the full
+        # document key set is unknown (present_keys is None) fall back to the
+        # active order, the historical behaviour.
+        if present_keys is not None:
+            live = set(present_keys)
+        else:
+            live = set(self.order)
         for stale in [k for k in self.segments if k not in live]:
             del self.segments[stale]
 

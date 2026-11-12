@@ -142,7 +142,13 @@ def load_document(raw: bytes, filename: str) -> None:
         proj.tag_source = project().tag_source
         st.session_state.project = proj
 
-    proj.bind_segments(doc.translatable_segments(), filename)
+    # Pass the full-document key set separately from the filtered selection, so
+    # a row hidden by the filter keeps its saved work instead of being pruned.
+    proj.bind_segments(
+        doc.translatable_segments(),
+        filename,
+        present_keys={s.key for s in doc.segments},
+    )
     proj.save()
 
     # Drop grid widget state from the previous document/filter, or rows would

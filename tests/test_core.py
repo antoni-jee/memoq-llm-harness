@@ -656,6 +656,76 @@ class TestState(unittest.TestCase):
         self.state.bind_segments(self.doc.translatable_segments(), "sample.mqxliff")
         self.assertEqual(self.state.segments[keys[0]].user_final, "behalten")
 
+    def test_filtering_hides_row_but_preserves_saved_work(self):
+        """A row the filter hides keeps its saved text, comment and edited flag;
+        it is excluded from active batches but not discarded from the store.
+
+        Confirmed fixture row id 3 is editable only when "Skip confirmed rows"
+        is off, which is what makes the hide/restore cycle valid.
+        """
+        all_keys = {s.key for s in self.doc.segments}  # full-document identity
+        key3 = next(s.key for s in self.doc.segments if s.unit_id == "3")
+        self.assertIn(key3, all_keys)
+
+        # Reveal the confirmed row so it becomes an active, editable row.
+        self.doc.parse_segments(mqxliff.SegmentFilter(skip_confirmed=False))
+        self.state.bind_segments(
+            self.doc.translatable_segments(), "sample.mqxliff", present_keys=all_keys)
+        self.state.capture_edits({key3: "meine Fassung 3"}, {key3: "kommentar"})
+        record = self.state.segments[key3]
+        self.assertEqual(record.user_final, "meine Fassung 3")
+        self.assertEqual(record.user_comment, "kommentar")
+        self.assertTrue(record.edited_by_human)
+        self.assertIn(key3, self.state.order)
+
+        # Hide it: re-bind the default (translatable) set, which excludes the
+        # confirmed row, while telling bind_segments the document still has it.
+        self.doc.parse_segments()
+        self.state.bind_segments(
+            self.doc.translatable_segments(), "sample.mqxliff", present_keys=all_keys)
+
+        active = [k for b in range(self.state.batch_count)
+                  for k in self.state.batch_keys(b)]
+        self.assertNotIn(key3, self.state.order)
+        self.assertNotIn(key3, active)
+        preserved = self.state.segments[key3]
+        self.assertEqual(preserved.user_final, "meine Fassung 3")
+        self.assertEqual(preserved.user_comment, "kommentar")
+        self.assertTrue(preserved.edited_by_human)
+
+        # Restoring the filter re-includes the row with its work intact.
+        self.doc.parse_segments(mqxliff.SegmentFilter(skip_confirmed=False))
+        self.state.bind_segments(
+            self.doc.translatable_segments(), "sample.mqxliff", present_keys=all_keys)
+        self.assertIn(key3, self.state.order)
+        self.assertEqual(self.state.segments[key3].user_final, "meine Fassung 3")
+        self.assertTrue(self.state.segments[key3].edited_by_human)
+
+    def test_genuinely_absent_segment_is_pruned(self):
+        """A key the full document no longer contains is pruned even though it
+        held saved work; a merely filtered-out key is not.
+
+        This pins the behaviour the filter fix depends on: pruning by the
+        full-document identity, not by the active (filtered) order.
+        """
+        all_keys = {s.key for s in self.doc.segments}
+        key3 = next(s.key for s in self.doc.segments if s.unit_id == "3")
+
+        self.doc.parse_segments(mqxliff.SegmentFilter(skip_confirmed=False))
+        self.state.bind_segments(
+            self.doc.translatable_segments(), "sample.mqxliff", present_keys=all_keys)
+        self.state.capture_edits({key3: "behalten"})
+        self.assertIn(key3, self.state.segments)
+
+        # id 3 is now genuinely absent: the full-document key set no longer
+        # contains it, and neither does the active selection.
+        still_present = all_keys - {key3}
+        self.state.bind_segments(
+            [s for s in self.doc.translatable_segments() if s.unit_id != "3"],
+            "sample.mqxliff", present_keys=still_present)
+        self.assertNotIn(key3, self.state.segments)
+        self.assertNotIn(key3, self.state.order)
+
     def test_effective_text_precedence(self):
         record = state.SegmentRecord(
             key="k", segment_id="1", ordinal=0, batch_index=0, mt_target="mt"
