@@ -666,6 +666,38 @@ class TestState(unittest.TestCase):
         record.user_final = "human"
         self.assertEqual(record.effective_text(), "human")
 
+    def test_unapplied_manual_edit_survives_rerun(self):
+        """Generate -> manual edit -> new suggestion, WITHOUT Apply.
+
+        The captured human revision must survive in user_final; the fresh
+        suggestion goes to llm_suggestion. This is the unapplied-edit path
+        (no calculate_diffs in between).
+        """
+        keys = self.state.batch_keys(0)
+        self.state.record_suggestions({keys[0]: "erster Vorschlag"})
+        self.state.capture_edits({keys[0]: "meine Fassung"})
+        self.state.record_suggestions({keys[0]: "zweiter Vorschlag"})
+        record = self.state.segments[keys[0]]
+        self.assertEqual(record.user_final, "meine Fassung")
+        self.assertEqual(record.llm_suggestion, "zweiter Vorschlag")
+        self.assertTrue(record.edited_by_human)
+
+    def test_comment_does_not_freeze_target_text(self):
+        """Same text plus a reviewer comment, then a new suggestion.
+
+        A comment alone must not freeze user_final: it should take the new
+        suggestion while the comment is preserved.
+        """
+        keys = self.state.batch_keys(0)
+        self.state.record_suggestions({keys[0]: "erster Vorschlag"})
+        self.state.capture_edits({keys[0]: "erster Vorschlag"},
+                                 {keys[0]: "zu woertlich"})
+        self.state.record_suggestions({keys[0]: "zweiter Vorschlag"})
+        record = self.state.segments[keys[0]]
+        self.assertEqual(record.user_final, "zweiter Vorschlag")
+        self.assertEqual(record.user_comment, "zu woertlich")
+        self.assertFalse(record.edited_by_human)
+
 
 MEMOQ_HEADER = "English,English,English,English,English,Russian,Russian"
 

@@ -449,12 +449,23 @@ class ProjectState:
         return count
 
     def capture_edits(self, edits: Dict[str, str], comments: Optional[Dict[str, str]] = None) -> None:
-        """Pull the grid's current values into the state records."""
+        """Pull the grid's current values into the state records.
+
+        A captured revision that is non-empty and differs from the baseline
+        (the model's suggestion, or memoQ's MT when that is empty) is marked as
+        human-edited so a later ``record_suggestions`` pass cannot overwrite it.
+        This mirrors ``calculate_diffs``: a comment on otherwise-unchanged text
+        is not an edit, and an empty field clears no flag.
+        """
         comments = comments or {}
         for key, text in edits.items():
             record = self.segments.get(key)
             if record is None:
                 continue
+            final = (text or "").strip()
+            baseline = (record.llm_suggestion or "").strip() or (record.mt_target or "").strip()
+            if final and final != baseline:
+                record.edited_by_human = True
             record.user_final = text
             record.user_comment = comments.get(key, record.user_comment)
 

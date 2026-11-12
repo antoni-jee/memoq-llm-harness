@@ -603,12 +603,13 @@ class AppTestCase(unittest.TestCase):
         before = neighbour.llm_suggestion
         self.assertTrue(before)
 
+        original = llm.LLMClient.translate_one
         llm.LLMClient.translate_one = lambda self, record, prompt: (
             "ПЕРЕВОД ПОСЛЕ ПОВТОРА", '{"segments":[{"id":"x","target":"..."}]}')
         try:
             app.button(key="retry_%s" % target.key).click().run()
         finally:
-            del llm.LLMClient.translate_one
+            llm.LLMClient.translate_one = original
         self.assertEqual(app.exception, [], [str(e) for e in app.exception])
 
         proj = app.session_state.project
@@ -622,15 +623,105 @@ class AppTestCase(unittest.TestCase):
         record = app.session_state.project.batch_records(0)[0]
         before = record.llm_suggestion
 
+        original = llm.LLMClient.translate_one
         llm.LLMClient.translate_one = lambda self, r, p: (None, "not json")
         try:
             app.button(key="retry_%s" % record.key).click().run()
         finally:
-            del llm.LLMClient.translate_one
+            llm.LLMClient.translate_one = original
 
         self.assertEqual(
             app.session_state.project.segments[record.key].llm_suggestion, before)
         self.assertTrue(any("empty again" in w.value for w in app.warning))
+
+    def test_retry_preserves_manual_edit(self):
+        """Process -> manual edit -> Retry, WITHOUT Apply.
+
+        The manual revision must survive in state and the visible editor; the
+        fresh suggestion goes to llm_suggestion; a neighbouring row is untouched.
+        """
+        app = self.load_doc(self.run_app())
+        self.button(app, "Process Current Batch").click().run()
+
+        proj = app.session_state.project
+        target, neighbour = proj.batch_records(0)[0], proj.batch_records(0)[1]
+        before_neighbour = (proj.segments[neighbour.key].llm_suggestion,
+                            proj.segments[neighbour.key].user_final)
+
+        self.row_text(app, target.key).set_value("meine Fassung").run()
+
+        original = llm.LLMClient.translate_one
+        llm.LLMClient.translate_one = (
+            lambda self, record, prompt: ("ПОВТОРНЫЙ ВАРЬЯНТ",
+            '{"segments":[{"id":"x","target":"..."}]}'))
+        try:
+            app.button(key="retry_%s" % target.key).click().run()
+        finally:
+            llm.LLMClient.translate_one = original
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+
+        proj = app.session_state.project
+        self.assertEqual(proj.segments[target.key].user_final, "meine Fassung")
+        self.assertEqual(app.session_state[self.tkey(app, target.key)],
+                         "meine Fassung")
+        self.assertEqual(proj.segments[target.key].llm_suggestion,
+                         "ПОВТОРНЫЙ ВАРЬЯНТ")
+        after_neighbour = (proj.segments[neighbour.key].llm_suggestion,
+                           proj.segments[neighbour.key].user_final)
+        self.assertEqual(after_neighbour, before_neighbour)
+
+    def test_reprocess_preserves_manual_edit(self):
+        """Process -> manual edit -> Process again, WITHOUT Apply.
+
+        The edited row keeps its manual text in state and the editor and its
+        llm_suggestion refreshes; an untouched row receives a refreshed
+        suggestion. First and second inferences use clearly distinct mocks.
+        """
+        app = self.load_doc(self.run_app())
+
+        calls = {"n": 0}
+
+        def counting_batch(self, records, prompt, progress=None):
+            calls["n"] += 1
+            prefix = "MT1" if calls["n"] == 1 else "MT2"
+            result = llm.BatchResult()
+            for record in records:
+                result.suggestions[record.key] = "%s %s" % (
+                    prefix, record.source_text)
+            result.requests = 1
+            result.elapsed = 0.01
+            result.raw_responses = [json.dumps(
+                {"segments": [{"id": r.key, "target": result.suggestions[r.key]}
+                              for r in records]}, ensure_ascii=False)]
+            return result
+
+        original = llm.LLMClient.translate_batch
+        llm.LLMClient.translate_batch = counting_batch
+        try:
+            self.button(app, "Process Current Batch").click().run()
+            proj = app.session_state.project
+            target, neighbour = proj.batch_records(0)[0], proj.batch_records(0)[1]
+            self.assertTrue(
+                proj.segments[target.key].llm_suggestion.startswith("MT1 "))
+
+            self.row_text(app, target.key).set_value("meine Fassung").run()
+            self.button(app, "Process Current Batch").click().run()
+        finally:
+            llm.LLMClient.translate_batch = original
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+
+        proj = app.session_state.project
+        self.assertEqual(proj.segments[target.key].user_final, "meine Fassung")
+        self.assertEqual(app.session_state[self.tkey(app, target.key)],
+                         "meine Fassung")
+        self.assertTrue(
+            proj.segments[target.key].llm_suggestion.startswith("MT2 "))
+        self.assertTrue(proj.segments[target.key].edited_by_human)
+        self.assertTrue(
+            proj.segments[neighbour.key].llm_suggestion.startswith("MT2 "))
+        self.assertTrue(
+            proj.segments[neighbour.key].user_final.startswith("MT2 "))
+        self.assertFalse(proj.segments[neighbour.key].edited_by_human)
 
     def test_global_directive_persists_and_reaches_the_prompt(self):
         app = self.load_doc(self.run_app())
