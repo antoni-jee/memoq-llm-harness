@@ -427,6 +427,66 @@ class AppTestCase(unittest.TestCase):
         app = self.run_app()
         self.assertTrue(self.button(app.sidebar, "Export Valid MQXLIFF").disabled)
 
+    def test_applied_edit_survives_restart_reload_and_export(self):
+        """Captured edit -> restart -> reload the same file -> export.
+
+        A second AppTest over the same sandbox app_dir is a fresh Streamlit
+        session (new session_state, bootstrap runs again) that shares only the
+        persisted state.json - the closest offline stand-in for a restart.
+        """
+        app = self.load_doc(self.run_app())
+        self.button(app, "Process Current Batch").click().run()
+        target = app.session_state.project.batch_records(0)[0]
+        suggestion = target.llm_suggestion
+        self.assertTrue(suggestion.startswith("MT "))
+        # Keep the suggestion's tag placeholders; change only the prose.
+        manual = "MANUELL " + suggestion[len("MT "):]
+
+        self.row_text(app, target.key).set_value(manual).run()
+        self.button(app, "Apply Changes & Calculate Diffs").click().run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+
+        # 2. The revision reached the sandboxed state file on disk.
+        with open(self.state_path, "r", encoding="utf-8") as handle:
+            saved = json.load(handle)["segments"][target.key]
+        self.assertEqual(saved["user_final"], manual)
+        self.assertTrue(saved["edited_by_human"])
+
+        # 3-5. Restart: new session, same state file; no document in memory.
+        restarted = self.run_app()
+        self.assertIsNone(restarted.session_state.document)
+        self.assertFalse(restarted.session_state.doc_bytes)
+        record = restarted.session_state.project.segments[target.key]
+        self.assertEqual(record.user_final, manual)
+        self.assertTrue(
+            self.button(restarted.sidebar, "Export Valid MQXLIFF").disabled)
+
+        # 6-7. Reload the identical fixture under the same filename.
+        restarted = self.load_doc(restarted)
+        record = restarted.session_state.project.segments[target.key]
+        self.assertEqual(record.user_final, manual)
+        self.assertTrue(record.edited_by_human)
+        self.assertEqual(self.row_text(restarted, target.key).value, manual)
+
+        # 8. Export and check the corresponding segment in the written file.
+        self.button(restarted.sidebar, "Export Valid MQXLIFF").click().run()
+        self.assertEqual(restarted.exception, [],
+                         [str(e) for e in restarted.exception])
+        self.assertTrue(
+            any("verified parseable" in m.value for m in restarted.success))
+        exported = restarted.session_state.last_export
+        self.assertEqual(os.path.dirname(exported),
+                         os.path.join(self.app_dir, "exports"))
+
+        from memoq_harness import mqxliff  # noqa: PLC0415
+        doc = mqxliff.MqxliffDocument.from_path(exported)
+        doc.parse_segments()
+        segment = next(s for s in doc.segments if s.key == target.key)
+        self.assertEqual(segment.unit_id, target.segment_id)
+        self.assertTrue(segment.target_text.startswith("MANUELL "),
+                        segment.target_text)
+        self.assertIn("Save", segment.target_text)
+
     # ------------------------------------------------- new in this revision
 
     def test_anthropic_preset_is_offered_and_switches_backend(self):
