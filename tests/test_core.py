@@ -491,6 +491,417 @@ class TestSegmentFiltering(unittest.TestCase):
             mqxliff.MqxliffDocument(b"<html><body>no</body></html>", "x.mqxliff")
 
 
+# Synthetic units for the fingerprint tests: (id, source, target, unit attrs).
+# Inline tags are written unprefixed and "MQ:" stands for the memoQ prefix;
+# _fp_xml() rewrites both so prefix choice can be varied per test.
+FP_UNITS = [
+    ("1",
+     'Click <bpt id="1" ctype="bold">&lt;b&gt;</bpt>Save'
+     '<ept id="1">&lt;/b&gt;</ept> now.',
+     'Klicken Sie <bpt id="1" ctype="bold">&lt;b&gt;</bpt>Speichern'
+     '<ept id="1">&lt;/b&gt;</ept>.',
+     'MQ:status="NotStarted" MQ:locked="false"'),
+    ("2", "Plain second row.", "Zweite Zeile.", 'MQ:status="NotStarted"'),
+    # Confirmed, so the default filter hides it.
+    ("3", "Hidden confirmed row.", "Bestaetigte Zeile.",
+     'MQ:status="Confirmed" MQ:confirmed="true"'),
+]
+
+
+def _fp_xml(units=FP_UNITS, src="en-US", tgt="de-DE", xliff_prefix="",
+            mq_prefix="mq", reverse_file_attrs=False) -> bytes:
+    import re as re_mod  # noqa: PLC0415
+
+    def inline(xml: str) -> str:
+        if not xliff_prefix:
+            return xml
+        return re_mod.sub(r"<(/?)(bpt|ept|ph|it|g)\b",
+                          r"<\1%s:\2" % xliff_prefix, xml)
+
+    p = (xliff_prefix + ":") if xliff_prefix else ""
+    xmlns = (' xmlns:%s="%s"' % (xliff_prefix, mqxliff.XLIFF_NS)
+             if xliff_prefix else ' xmlns="%s"' % mqxliff.XLIFF_NS)
+    file_attrs = ['original="doc.docx"', 'source-language="%s"' % src,
+                  'target-language="%s"' % tgt, 'datatype="x-docx"']
+    if reverse_file_attrs:
+        file_attrs.reverse()
+    body = "\n".join(
+        '<%strans-unit id="%s" %s><%ssource>%s</%ssource>'
+        '<%starget>%s</%starget></%strans-unit>'
+        % (p, uid, attrs.replace("MQ:", mq_prefix + ":"), p, inline(source), p,
+           p, inline(target), p, p)
+        for (uid, source, target, attrs) in units)
+    xml = ('<?xml version="1.0" encoding="utf-8"?>\n'
+           '<%sxliff version="1.2"%s xmlns:%s="%s">\n'
+           '<%sfile %s><%sbody>\n%s\n</%sbody></%sfile></%sxliff>\n'
+           % (p, xmlns, mq_prefix, mqxliff.MQ_NS, p, " ".join(file_attrs), p,
+              body, p, p, p))
+    return xml.encode("utf-8")
+
+
+def _fp(raw: bytes, filename: str = "doc.mqxliff") -> str:
+    return mqxliff.MqxliffDocument(raw, filename).source_fingerprint()
+
+
+def _fp_units(index: int, **changes):
+    """FP_UNITS with one unit's fields replaced."""
+    units = list(FP_UNITS)
+    uid, source, target, attrs = units[index]
+    units[index] = (changes.get("uid", uid), changes.get("source", source),
+                    changes.get("target", target), changes.get("attrs", attrs))
+    return units
+
+
+class TestSourceFingerprint(unittest.TestCase):
+    """Source-content identity of a document; see source_fingerprint()."""
+
+    def setUp(self):
+        self.base = _fp(_fp_xml())
+
+    def test_is_a_sha256_hex_digest(self):
+        self.assertRegex(self.base, r"^[0-9a-f]{64}$")
+
+    def test_same_document_same_fingerprint(self):
+        raw = _fp_xml()
+        self.assertEqual(_fp(raw), _fp(raw))
+        # Filename is not part of the identity.
+        self.assertEqual(_fp(raw, "a.mqxliff"), _fp(raw, "other/b.mqxliff"))
+        # Neither is the path a file was loaded from.
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "one", "doc.mqxliff")
+            second = os.path.join(tmp, "two", "renamed.mqxliff")
+            for path in (first, second):
+                os.makedirs(os.path.dirname(path))
+                with open(path, "wb") as handle:
+                    handle.write(raw)
+            self.assertEqual(
+                mqxliff.MqxliffDocument.from_path(first).source_fingerprint(),
+                mqxliff.MqxliffDocument.from_path(second).source_fingerprint())
+        self.assertEqual(_fp(raw), self.base)
+
+    def test_shipped_fixture_is_stable_across_loads(self):
+        first = mqxliff.MqxliffDocument.from_path(FIXTURE).source_fingerprint()
+        second = load_doc().source_fingerprint()
+        self.assertEqual(first, second)
+
+    def test_target_only_changes_keep_fingerprint(self):
+        cases = {
+            "text": _fp_units(1, target="Ganz andere Uebersetzung."),
+            "tags": _fp_units(0, target='<bpt id="1" ctype="italic">&lt;i&gt;'
+                                        '</bpt>Anders<ept id="1">&lt;/i&gt;</ept>'),
+            "empty": _fp_units(2, target=""),
+        }
+        for name, units in cases.items():
+            with self.subTest(change=name):
+                self.assertEqual(_fp(_fp_xml(units)), self.base)
+
+    def test_status_and_locking_changes_keep_fingerprint(self):
+        cases = {
+            "status": _fp_units(1, attrs='MQ:status="ManuallyConfirmed"'),
+            "locked": _fp_units(0, attrs='MQ:status="NotStarted" MQ:locked="true"'),
+            "unconfirmed": _fp_units(2, attrs='MQ:status="NotStarted"'),
+            "no-attrs": _fp_units(1, attrs=""),
+        }
+        for name, units in cases.items():
+            with self.subTest(change=name):
+                self.assertEqual(_fp(_fp_xml(units)), self.base)
+
+    def test_filter_changes_keep_fingerprint_and_cover_hidden_segments(self):
+        doc = mqxliff.MqxliffDocument(_fp_xml(), "doc.mqxliff")
+        unparsed = doc.source_fingerprint()
+        doc.parse_segments()
+        reasons = {s.unit_id: s.skip_reason for s in doc.segments}
+        self.assertEqual(reasons["3"], "confirmed")  # really hidden
+        default_filter = doc.source_fingerprint()
+        doc.parse_segments(mqxliff.SegmentFilter(
+            skip_confirmed=False, skip_locked=False,
+            require_nonempty_source=False))
+        relaxed = doc.source_fingerprint()
+        self.assertEqual(unparsed, self.base)
+        self.assertEqual(default_filter, self.base)
+        self.assertEqual(relaxed, self.base)
+        # A hidden segment still contributes its source content.
+        changed = _fp(_fp_xml(_fp_units(2, source="Edited hidden row.")))
+        self.assertNotEqual(changed, self.base)
+
+    def test_tag_placeholder_mode_keeps_fingerprint(self):
+        doc = mqxliff.MqxliffDocument(_fp_xml(), "doc.mqxliff")
+        doc.parse_segments(tag_source=tags.TAG_SOURCE_TARGET)
+        by_target = doc.source_fingerprint()
+        doc.parse_segments(tag_source=tags.TAG_SOURCE_SOURCE)
+        by_source = doc.source_fingerprint()
+        self.assertEqual(by_target, self.base)
+        self.assertEqual(by_source, self.base)
+
+    def test_source_text_and_tag_structure_changes_change_fingerprint(self):
+        cases = {
+            "text": _fp_units(1, source="Plain second row!"),
+            "whitespace": _fp_units(1, source="Plain  second row."),
+            "tag-attr-value": _fp_units(0, source=FP_UNITS[0][1].replace(
+                'ctype="bold"', 'ctype="italic"')),
+            "tag-content": _fp_units(0, source=FP_UNITS[0][1].replace(
+                "&lt;b&gt;", "&lt;strong&gt;")),
+            "tag-moved": _fp_units(
+                0, source='Click Save<bpt id="1" ctype="bold">&lt;b&gt;</bpt>'
+                          '<ept id="1">&lt;/b&gt;</ept> now.'),
+            "tag-removed": _fp_units(0, source="Click Save now."),
+            "tag-added": _fp_units(1, source='Plain <ph id="9">&lt;br/&gt;</ph>'
+                                             'second row.'),
+            # Same visible text, but the text moves into the tag.
+            "text-into-tag": _fp_units(
+                0, source='Click <bpt id="1" ctype="bold">&lt;b&gt;Save</bpt>'
+                          '<ept id="1">&lt;/b&gt;</ept> now.'),
+        }
+        seen = {self.base}
+        for name, units in cases.items():
+            with self.subTest(change=name):
+                value = _fp(_fp_xml(units))
+                self.assertNotIn(value, seen)
+                seen.add(value)
+
+    def test_segment_identity_and_order_changes_change_fingerprint(self):
+        swapped = [FP_UNITS[1], FP_UNITS[0], FP_UNITS[2]]
+        cases = {
+            "id": _fp_units(1, uid="20"),
+            "order": swapped,
+            "removed": FP_UNITS[:2],
+            "added": FP_UNITS + [("4", "Extra row.", "", "")],
+            # Same ids and sources, but the ids now sit on different texts.
+            "ids-swapped": [("2",) + FP_UNITS[0][1:], ("1",) + FP_UNITS[1][1:],
+                            FP_UNITS[2]],
+        }
+        for name, units in cases.items():
+            with self.subTest(change=name):
+                self.assertNotEqual(_fp(_fp_xml(units)), self.base)
+
+    def test_language_pair_changes_change_fingerprint(self):
+        cases = {
+            "source": _fp_xml(src="en-GB"),
+            "target": _fp_xml(tgt="ru-RU"),
+            "swapped": _fp_xml(src="de-DE", tgt="en-US"),
+        }
+        for name, raw in cases.items():
+            with self.subTest(change=name):
+                self.assertNotEqual(_fp(raw), self.base)
+
+    def test_prefixes_and_attribute_order_do_not_change_fingerprint(self):
+        reordered = [(uid, source.replace('id="1" ctype="bold"',
+                                          'ctype="bold" id="1"'),
+                      target, " ".join(reversed(attrs.split(" "))))
+                     for (uid, source, target, attrs) in FP_UNITS]
+        self.assertNotEqual(_fp_xml(reordered), _fp_xml())
+        cases = {
+            "xliff-prefix": _fp_xml(xliff_prefix="xl"),
+            "mq-prefix": _fp_xml(mq_prefix="memoq"),
+            "both-prefixes": _fp_xml(xliff_prefix="xl", mq_prefix="memoq"),
+            "attribute-order": _fp_xml(reordered, reverse_file_attrs=True),
+        }
+        for name, raw in cases.items():
+            with self.subTest(change=name):
+                self.assertNotEqual(raw, _fp_xml())  # bytes really differ
+                self.assertEqual(_fp(raw), self.base)
+
+    def test_comments_and_processing_instructions_are_ignored(self):
+        tagged = FP_UNITS[0][1]
+        cases = {
+            "comment-between-runs": _fp_units(
+                1, source="Plain <!-- reviewer note -->second row."),
+            "pi-between-runs": _fp_units(1, source="Plain <?harness x?>second row."),
+            "comment-mid-word": _fp_units(1, source="Plain sec<!--x-->ond row."),
+            "comment-and-pi": _fp_units(
+                1, source="<!--a-->Plain <?p q?>second<!--b--> row.<?r s?>"),
+            "comment-before-tag": _fp_units(
+                0, source=tagged.replace("Click <bpt", "Click <!--c--><bpt")),
+            "comment-inside-tag": _fp_units(
+                0, source=tagged.replace("&lt;b&gt;", "&lt;b<!--c-->&gt;")),
+            "pi-after-tag": _fp_units(
+                0, source=tagged.replace("</bpt>Save", "</bpt><?p?>Save")),
+        }
+        for name, units in cases.items():
+            with self.subTest(change=name):
+                raw = _fp_xml(units)
+                self.assertNotEqual(raw, _fp_xml())  # bytes really differ
+                # Equal to the comment-free base, so no surrounding text was lost.
+                self.assertEqual(_fp(raw), self.base)
+        # Control: the text around the comment does matter.
+        lost_tail = _fp(_fp_xml(_fp_units(1, source="Plain <!--x-->")))
+        self.assertNotEqual(lost_tail, self.base)
+
+    def test_multi_file_language_pairs_and_units_all_count(self):
+        base = _fp(_fp_multi([("en-US", "de-DE", ["A1", "A2"]),
+                              ("en-US", "fr-FR", ["B1"])]))
+        cases = {
+            "second-file-language": [("en-US", "de-DE", ["A1", "A2"]),
+                                     ("en-US", "it-IT", ["B1"])],
+            "second-file-unit-source": [("en-US", "de-DE", ["A1", "A2"]),
+                                        ("en-US", "fr-FR", ["B1 changed"])],
+            "files-swapped": [("en-US", "fr-FR", ["B1"]),
+                              ("en-US", "de-DE", ["A1", "A2"])],
+            "file-dropped": [("en-US", "de-DE", ["A1", "A2"])],
+        }
+        for name, files in cases.items():
+            with self.subTest(change=name):
+                self.assertNotEqual(_fp(_fp_multi(files)), base)
+
+    def test_moving_a_unit_across_file_boundary_changes_fingerprint(self):
+        # Global unit order, ids and sources stay identical; only the <file>
+        # that owns unit "A2" changes.
+        for pairs in ((("en-US", "de-DE"), ("en-US", "de-DE")),
+                      (("en-US", "de-DE"), ("en-US", "fr-FR"))):
+            (s1, t1), (s2, t2) = pairs
+            with self.subTest(pairs=pairs):
+                before = _fp_multi([(s1, t1, ["A1", "A2"]), (s2, t2, ["B1"])])
+                after = _fp_multi([(s1, t1, ["A1"]), (s2, t2, ["A2", "B1"])])
+                self.assertEqual(
+                    [s.unit_id for s in _parsed(before)],
+                    [s.unit_id for s in _parsed(after)])
+                self.assertNotEqual(_fp(before), _fp(after))
+
+    def test_units_outside_a_file_are_counted_not_dropped(self):
+        inside = _fp_multi([("en-US", "de-DE", ["A1", "Loose"])])
+        outside = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<xliff version="1.2" xmlns="%s">'
+            '<file original="f0.docx" source-language="en-US" '
+            'target-language="de-DE"><body><trans-unit id="1"><source>A1'
+            '</source><target/></trans-unit></body></file>'
+            '<trans-unit id="2"><source>%s</source><target/></trans-unit>'
+            '</xliff>')
+        loose = (outside % (mqxliff.XLIFF_NS, "Loose")).encode("utf-8")
+        changed = (outside % (mqxliff.XLIFF_NS, "Loose edited")).encode("utf-8")
+        # The parser accepts the stray unit, so the fingerprint must cover it.
+        self.assertEqual(len(_parsed(loose)), 2)
+        self.assertNotEqual(_fp(loose), _fp(inside))
+        self.assertNotEqual(_fp(loose), _fp(changed))
+
+
+def _fp_unit_doc(unit_body: str) -> bytes:
+    """One-unit document whose trans-unit body is given verbatim."""
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<xliff version="1.2" xmlns="%s" xmlns:mq="%s">'
+        '<file original="d.docx" source-language="en-US" target-language="de-DE">'
+        '<body><trans-unit id="1">%s<target>Ziel</target></trans-unit>'
+        '</body></file></xliff>' % (mqxliff.XLIFF_NS, mqxliff.MQ_NS, unit_body)
+    ).encode("utf-8")
+
+
+def _fp_multi(files) -> bytes:
+    """Several <file> elements: (source-lang, target-lang, [unit sources]).
+
+    Unit ids are numbered globally so they stay unique across files.
+    """
+    parts, uid = [], 0
+    for src, tgt, sources in files:
+        units = []
+        for source in sources:
+            uid += 1
+            units.append('<trans-unit id="%d"><source>%s</source>'
+                         '<target/></trans-unit>' % (uid, source))
+        parts.append('<file original="f%d.docx" source-language="%s" '
+                     'target-language="%s"><body>%s</body></file>'
+                     % (len(parts), src, tgt, "".join(units)))
+    return ('<?xml version="1.0" encoding="utf-8"?>\n'
+            '<xliff version="1.2" xmlns="%s">%s</xliff>'
+            % (mqxliff.XLIFF_NS, "".join(parts))).encode("utf-8")
+
+
+def _parsed(raw: bytes):
+    """All segments of a document, every row kept, via the real parser."""
+    doc = mqxliff.MqxliffDocument(raw, "doc.mqxliff")
+    return doc.parse_segments(mqxliff.SegmentFilter(
+        skip_confirmed=False, skip_locked=False, require_nonempty_source=False))
+
+
+class TestSourceFingerprintSourceElements(unittest.TestCase):
+    """How ``<source>`` and ``<seg-source>`` enter the fingerprint.
+
+    Both elements count, separately: neither replaces the other. An absent
+    element (null) differs from an existing empty one ([]). Segmentation
+    markup is source XML content, so adding or changing it changes the
+    fingerprint even when the visible source text is the same.
+    """
+
+    MRK = ('<seg-source><mrk mtype="seg" mid="1">Hello world.</mrk> '
+           '<mrk mtype="seg" mid="2">Bye.</mrk></seg-source>')
+
+    def assertAllDistinct(self, bodies):
+        seen = {}
+        for name, body in bodies.items():
+            with self.subTest(case=name):
+                value = _fp(_fp_unit_doc(body))
+                self.assertNotIn(value, seen.values(),
+                                 "collides with %s" % [k for k, v in seen.items()
+                                                       if v == value])
+                seen[name] = value
+
+    def test_source_only(self):
+        alpha = _fp(_fp_unit_doc("<source>Alpha</source>"))
+        self.assertNotEqual(alpha, _fp(_fp_unit_doc("<source>Beta</source>")))
+        self.assertEqual(alpha, _fp(_fp_unit_doc("<source>Alpha</source>")))
+
+    def test_seg_source_with_segmentation_markup(self):
+        self.assertAllDistinct({
+            "base": "<source>Hello world. Bye.</source>" + self.MRK,
+            "source-changed": "<source>Hello world. Goodbye.</source>" + self.MRK,
+            "mrk-text": "<source>Hello world. Bye.</source>"
+                        + self.MRK.replace("Bye.", "Goodbye."),
+            "mrk-attribute": "<source>Hello world. Bye.</source>"
+                             + self.MRK.replace('mid="2"', 'mid="3"'),
+            # Same visible text, markup removed: a documented change.
+            "markup-removed": "<source>Hello world. Bye.</source>"
+                              "<seg-source>Hello world. Bye.</seg-source>",
+            "seg-source-absent": "<source>Hello world. Bye.</source>",
+        })
+
+    def test_seg_source_with_plain_text_and_no_child_elements(self):
+        self.assertAllDistinct({
+            "base": "<source>Alpha</source><seg-source>Beta</seg-source>",
+            "seg-source-changed": "<source>Alpha</source><seg-source>Gamma</seg-source>",
+            "source-changed": "<source>Delta</source><seg-source>Beta</seg-source>",
+            "source-only-alpha": "<source>Alpha</source>",
+            "source-only-beta": "<source>Beta</source>",
+        })
+
+    def test_empty_seg_source_keeps_source_significant(self):
+        for body in ("<seg-source/>", "<seg-source></seg-source>"):
+            with self.subTest(form=body):
+                empty = _fp(_fp_unit_doc("<source>Alpha</source>" + body))
+                self.assertNotEqual(empty, _fp(_fp_unit_doc("<source>Beta</source>" + body)))
+                self.assertNotEqual(empty, _fp(_fp_unit_doc("<source>Alpha</source>")))
+        # Both spellings of an empty element are the same XML content.
+        self.assertEqual(_fp(_fp_unit_doc("<source>Alpha</source><seg-source/>")),
+                         _fp(_fp_unit_doc("<source>Alpha</source><seg-source></seg-source>")))
+
+    def test_both_present_with_distinguishable_content(self):
+        both = _fp(_fp_unit_doc(
+            "<source>Source side</source><seg-source>Seg side</seg-source>"))
+        with self.subTest(case="source-change-counts"):
+            self.assertNotEqual(both, _fp(_fp_unit_doc(
+                "<source>Source edit</source><seg-source>Seg side</seg-source>")))
+        with self.subTest(case="seg-source-change-counts"):
+            self.assertNotEqual(both, _fp(_fp_unit_doc(
+                "<source>Source side</source><seg-source>Seg edit</seg-source>")))
+        with self.subTest(case="roles-not-interchangeable"):
+            self.assertNotEqual(both, _fp(_fp_unit_doc(
+                "<source>Seg side</source><seg-source>Source side</seg-source>")))
+        with self.subTest(case="element-order-irrelevant"):
+            self.assertEqual(both, _fp(_fp_unit_doc(
+                "<seg-source>Seg side</seg-source><source>Source side</source>")))
+
+    def test_absent_and_empty_elements_are_distinguished(self):
+        self.assertAllDistinct({
+            "neither": "",
+            "empty-source": "<source/>",
+            "empty-seg-source": "<seg-source/>",
+            "both-empty": "<source/><seg-source/>",
+            "source-text": "<source>A</source>",
+            "source-text-empty-seg": "<source>A</source><seg-source/>",
+            "seg-text": "<seg-source>A</seg-source>",
+            "empty-source-seg-text": "<source/><seg-source>A</seg-source>",
+        })
+
+
 class TestExport(unittest.TestCase):
     def test_write_target_and_reparse(self):
         doc = load_doc()
@@ -1121,6 +1532,724 @@ class TestDefaultRuleBlocks(unittest.TestCase):
         self.assertEqual(migrated.vibe, "old vibe")
         # No prose existed in v2, so the rulebook falls back to the default.
         self.assertEqual(migrated.hard_rules_text, defaults.DEFAULT_HARD_RULES)
+
+
+class TestMultiDocumentState(unittest.TestCase):
+    """v5 state: several documents in one file, public attributes = active.
+
+    Document IDs are opaque strings supplied by the caller; state.py does not
+    compute them. A is the shipped fixture, B a synthetic document whose
+    segment keys ("1#0", "2#1") overlap A's.
+    """
+
+    KEY = "1#0"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "state.json")
+        self.doc_a = load_doc()
+        self.doc_b = mqxliff.MqxliffDocument(_fp_xml(), "b.mqxliff")
+        self.doc_b.parse_segments()
+        self.state = state.ProjectState(self.path)
+        self.state.batch_size = 3
+
+    def tearDown(self):
+        import shutil  # noqa: PLC0415
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ----------------------------------------------------------- helpers
+
+    def bind(self, proj, doc, name, path=""):
+        # bind_segments() assigns source_file AND source_path itself, so the
+        # caller must pass the same metadata it gave switch_document().
+        proj.bind_segments(doc.translatable_segments(), name, path,
+                           present_keys={s.key for s in doc.segments})
+
+    def open_a(self, proj=None):
+        proj = proj or self.state
+        proj.switch_document("doc-a", "a.mqxliff", r"C:\work\a.mqxliff")
+        self.bind(proj, self.doc_a, "a.mqxliff", r"C:\work\a.mqxliff")
+        return proj
+
+    def open_b(self, proj=None):
+        proj = proj or self.state
+        proj.switch_document("doc-b", "b.mqxliff", r"C:\work\b.mqxliff")
+        self.bind(proj, self.doc_b, "b.mqxliff", r"C:\work\b.mqxliff")
+        return proj
+
+    def work_on_a(self, proj):
+        """Apply a human edit plus every other kind of document-scoped data."""
+        proj.capture_edits({self.KEY: "A-MANUAL"}, {self.KEY: "A-comment"})
+        proj.calculate_diffs(proj.segments[self.KEY].batch_index)
+        proj.analysis["0"] = "A analysis"
+        proj.global_directive = "A directive"
+        proj.current_batch = 1
+
+    def assert_a_work(self, proj):
+        record = proj.segments[self.KEY]
+        checks = {
+            "user_final": (record.user_final, "A-MANUAL"),
+            "user_comment": (record.user_comment, "A-comment"),
+            "edited_by_human": (record.edited_by_human, True),
+            "status": (record.status, "applied"),
+            "corrections": ([c.human_final for c in proj.corrections], ["A-MANUAL"]),
+            "analysis": (proj.analysis, {"0": "A analysis"}),
+            "global_directive": (proj.global_directive, "A directive"),
+            "current_batch": (proj.current_batch, 1),
+            "source_text": (record.source_text,
+                            self.doc_a.segments[0].source_text),
+        }
+        for field, (actual, expected) in checks.items():
+            with self.subTest(field=field):
+                self.assertEqual(actual, expected)
+
+    def assert_b_isolated(self, proj):
+        record = proj.segments[self.KEY]
+        checks = {
+            "source_text": (record.source_text, "Click {1}Save{2} now."),
+            "mt_target": (record.mt_target, "Klicken Sie {1}Speichern{2}."),
+            "user_final": (record.user_final, ""),
+            "user_comment": (record.user_comment, ""),
+            "edited_by_human": (record.edited_by_human, False),
+            "status": (record.status, "pending"),
+            "corrections": (proj.corrections, []),
+            "analysis": (proj.analysis, {}),
+            "global_directive": (proj.global_directive, ""),
+            "current_batch": (proj.current_batch, 0),
+        }
+        for field, (actual, expected) in checks.items():
+            with self.subTest(field=field):
+                self.assertEqual(actual, expected)
+
+    # ------------------------------------------------------------- tests
+
+    def test_a_b_a_restores_document_scoped_data(self):
+        self.open_a()
+        self.work_on_a(self.state)
+        self.assert_a_work(self.state)
+
+        self.open_b()
+        self.assertEqual(self.state.document_id, "doc-b")
+        self.assertEqual(self.state.source_file, "b.mqxliff")
+        self.assert_b_isolated(self.state)
+
+        self.state.switch_document("doc-a", "a.mqxliff", r"C:\work\a.mqxliff")
+        self.assertEqual(self.state.document_id, "doc-a")
+        self.assert_a_work(self.state)
+        # Re-binding the reopened document keeps the restored work.
+        self.bind(self.state, self.doc_a, "a.mqxliff")
+        self.assert_a_work(self.state)
+
+    def test_new_document_starts_empty_despite_overlapping_keys(self):
+        self.open_a()
+        self.work_on_a(self.state)
+        self.state.switch_document("doc-b", "b.mqxliff")
+        self.assertEqual(self.state.segments, {})
+        self.assertEqual(self.state.order, [])
+        self.bind(self.state, self.doc_b, "b.mqxliff")
+        self.assert_b_isolated(self.state)
+
+    def test_save_load_keeps_both_documents_and_active_reference(self):
+        self.open_a()
+        self.work_on_a(self.state)
+        self.open_b()
+        self.state.capture_edits({self.KEY: "B-MANUAL"}, {self.KEY: "B-comment"})
+        self.state.save()
+
+        reloaded = state.ProjectState.load(self.path)
+        self.assertEqual(reloaded.document_id, "doc-b")
+        self.assertEqual(reloaded.document_ids, ["doc-a", "doc-b"])
+        self.assertEqual(reloaded.source_file, "b.mqxliff")
+        self.assertEqual(reloaded.source_path, r"C:\work\b.mqxliff")
+        self.assertEqual(reloaded.segments[self.KEY].user_final, "B-MANUAL")
+        self.assertEqual(reloaded.segments[self.KEY].user_comment, "B-comment")
+
+        reloaded.switch_document("doc-a", "a.mqxliff")
+        self.assert_a_work(reloaded)
+        with open(self.path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        self.assertEqual(raw["version"], state.STATE_VERSION)
+        self.assertEqual(raw["active_document"], "doc-b")
+        self.assertEqual(sorted(raw["documents"]), ["doc-a", "doc-b"])
+
+    def test_save_includes_changes_made_after_the_last_switch(self):
+        self.open_a()
+        self.state.save()
+        # No switch between these mutations and save().
+        self.work_on_a(self.state)
+        self.state.vibe = "changed after switch"
+        self.state.save()
+        reloaded = state.ProjectState.load(self.path)
+        self.assertEqual(reloaded.document_id, "doc-a")
+        self.assert_a_work(reloaded)
+        self.assertEqual(reloaded.vibe, "changed after switch")
+
+    def test_documents_never_share_mutable_objects(self):
+        self.open_a()
+        self.work_on_a(self.state)
+        a_record = self.state.segments[self.KEY]
+        a_segments, a_order = self.state.segments, self.state.order
+        a_corrections, a_analysis = self.state.corrections, self.state.analysis
+
+        self.open_b()
+        self.assertIsNot(self.state.segments, a_segments)
+        self.assertIsNot(self.state.order, a_order)
+        self.assertIsNot(self.state.corrections, a_corrections)
+        self.assertIsNot(self.state.analysis, a_analysis)
+        self.assertIsNot(self.state.segments[self.KEY], a_record)
+
+        # Mutating stale references to A's old objects must not reach A's
+        # stored snapshot, nor B.
+        a_record.user_final = "STALE"
+        a_order.append("stale-key")
+        a_analysis["9"] = "stale"
+        a_corrections.clear()
+        self.assertEqual(self.state.segments[self.KEY].user_final, "")
+
+        self.state.switch_document("doc-a", "a.mqxliff")
+        self.assert_a_work(self.state)
+        self.assertNotIn("stale-key", self.state.order)
+        restored = self.state.segments[self.KEY]
+        # Each restore builds fresh objects: mutate, leave, return.
+        restored.user_comment = "edited in place"
+        self.state.switch_document("doc-b", "b.mqxliff")
+        self.state.switch_document("doc-a", "a.mqxliff")
+        self.assertIsNot(self.state.segments[self.KEY], restored)
+        self.assertEqual(self.state.segments[self.KEY].user_comment,
+                         "edited in place")
+
+    def test_same_id_switch_keeps_unsaved_in_memory_work(self):
+        self.open_a()
+        self.work_on_a(self.state)
+        record = self.state.segments[self.KEY]
+        self.state.switch_document("doc-a", "renamed.mqxliff", r"D:\moved\renamed.mqxliff")
+        self.assertIs(self.state.segments[self.KEY], record)
+        self.assert_a_work(self.state)
+        self.assertEqual(self.state.source_file, "renamed.mqxliff")
+        self.assertEqual(self.state.source_path, r"D:\moved\renamed.mqxliff")
+        self.assertFalse(os.path.exists(self.path))  # switching never saves
+
+    def test_global_settings_stay_global(self):
+        self.open_a()
+        self.state.vibe = "global vibe"
+        self.state.hard_rules_text = "global rules"
+        self.state.termbase = [state.TermEntry("entropy", "Entropie")]
+        self.state.set_template("mt2", "global template")
+        self.state.prompt_stage = "mt2"
+        self.state.tag_source = tags.TAG_SOURCE_SOURCE
+        self.state.auto_merge_proposals = False
+        self.state.detailed_feedback = False
+        self.state.rule_log.append({"kind": "rule", "text": "logged"})
+        self.open_b()
+
+        def check(proj):
+            expected = {
+                "vibe": "global vibe", "hard_rules_text": "global rules",
+                "termbase": [("entropy", "Entropie")],
+                "template": "global template", "prompt_stage": "mt2",
+                "tag_source": tags.TAG_SOURCE_SOURCE,
+                "auto_merge_proposals": False, "detailed_feedback": False,
+                "rule_log": [{"kind": "rule", "text": "logged"}],
+                "batch_size": 3,
+            }
+            actual = {
+                "vibe": proj.vibe, "hard_rules_text": proj.hard_rules_text,
+                "termbase": [(t.source, t.target) for t in proj.termbase],
+                "template": proj.template_for("mt2"),
+                "prompt_stage": proj.prompt_stage, "tag_source": proj.tag_source,
+                "auto_merge_proposals": proj.auto_merge_proposals,
+                "detailed_feedback": proj.detailed_feedback,
+                "rule_log": proj.rule_log, "batch_size": proj.batch_size,
+            }
+            for field, value in expected.items():
+                with self.subTest(field=field):
+                    self.assertEqual(actual[field], value)
+
+        check(self.state)
+        # A change made while B is active is seen from A as well.
+        self.state.vibe = "changed in B"
+        self.state.switch_document("doc-a", "a.mqxliff")
+        self.assertEqual(self.state.vibe, "changed in B")
+        self.state.vibe = "global vibe"
+        self.state.save()
+        check(state.ProjectState.load(self.path))
+
+    def test_hidden_saved_records_survive_switching_and_save_load(self):
+        relaxed = mqxliff.SegmentFilter(skip_confirmed=False)
+        self.state.switch_document("doc-a", "a.mqxliff")
+        self.doc_a.parse_segments(relaxed)
+        self.bind(self.state, self.doc_a, "a.mqxliff")
+        hidden = next(s.key for s in self.doc_a.segments if s.unit_id == "3")
+        self.state.capture_edits({hidden: "HIDDEN-MANUAL"}, {hidden: "hidden note"})
+        # Back to the default filter: the confirmed row leaves the selection.
+        self.doc_a.parse_segments()
+        self.bind(self.state, self.doc_a, "a.mqxliff")
+        self.assertNotIn(hidden, self.state.order)
+        self.assertIn(hidden, self.state.segments)
+
+        self.open_b()
+        self.state.save()
+        reloaded = state.ProjectState.load(self.path)
+        reloaded.switch_document("doc-a", "a.mqxliff")
+        self.assertNotIn(hidden, reloaded.order)
+        record = reloaded.segments[hidden]
+        self.assertEqual(record.user_final, "HIDDEN-MANUAL")
+        self.assertEqual(record.user_comment, "hidden note")
+        self.assertTrue(record.edited_by_human)
+
+    # ------------------------------------------ explicitly empty active order
+
+    def make_a_all_hidden(self):
+        """A with saved human work, then an empty selection (all rows hidden)."""
+        self.open_a()
+        self.state.capture_edits({self.KEY: "A-MANUAL"}, {self.KEY: "A-comment"})
+        self.state.bind_segments([], "a.mqxliff", r"C:\work\a.mqxliff",
+                                 present_keys={s.key for s in self.doc_a.segments})
+        self.assert_a_hidden(self.state, "after-bind")
+
+    def assert_a_hidden(self, proj, phase):
+        record = proj.segments.get(self.KEY)
+        checks = {
+            "order": (proj.order, []),
+            "batch_count": (proj.batch_count, 0),
+            "batch_keys": (proj.batch_keys(0), []),
+            "record-kept": (record is not None, True),
+        }
+        if record is not None:
+            checks.update({
+                "user_final": (record.user_final, "A-MANUAL"),
+                "user_comment": (record.user_comment, "A-comment"),
+                "edited_by_human": (record.edited_by_human, True),
+            })
+        for field, (actual, expected) in checks.items():
+            with self.subTest(phase=phase, field=field):
+                self.assertEqual(actual, expected)
+
+    def test_explicitly_empty_order_survives_switching(self):
+        self.make_a_all_hidden()
+        self.open_b()
+        self.state.switch_document("doc-a", "a.mqxliff", r"C:\work\a.mqxliff")
+        self.assert_a_hidden(self.state, "A-B-A")
+
+    def test_explicitly_empty_order_survives_save_load_while_active(self):
+        self.make_a_all_hidden()
+        self.state.save()
+        reloaded = state.ProjectState.load(self.path)
+        self.assertEqual(reloaded.document_id, "doc-a")
+        self.assert_a_hidden(reloaded, "A-active-reload")
+
+    def test_explicitly_empty_order_survives_save_load_while_inactive(self):
+        self.make_a_all_hidden()
+        self.open_b()
+        self.state.save()
+        reloaded = state.ProjectState.load(self.path)
+        self.assertEqual(reloaded.document_id, "doc-b")
+        reloaded.switch_document("doc-a", "a.mqxliff", r"C:\work\a.mqxliff")
+        self.assert_a_hidden(reloaded, "B-active-reload-then-A")
+
+    def test_absent_order_is_still_reconstructed_for_old_entries(self):
+        # An entry WITHOUT an "order" key (pre-order files) keeps the legacy
+        # fallback: order is rebuilt from the records' ordinals.
+        self.open_a()
+        expected = list(self.state.order)
+        self.state.save()
+        with open(self.path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        del raw["documents"]["doc-a"]["order"]
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(raw, handle, ensure_ascii=False)
+        reloaded = state.ProjectState.load(self.path)
+        self.assertEqual(reloaded.order[:len(expected)], expected)
+        self.assertEqual(set(reloaded.order), set(reloaded.segments))
+
+    # ------------------------------------- unknown nested fields (v5 files)
+
+    def write_future_fields(self):
+        """Save A (with two corrections) and B, then add unknown nested fields
+        on disk, as a newer version of the harness might have written them."""
+        self.open_a()
+        other = self.state.batch_keys(0)[1]
+        self.state.capture_edits({self.KEY: "A-MANUAL", other: "A-OTHER"},
+                                 {self.KEY: "A-comment"})
+        self.state.calculate_diffs(0)
+        self.assertEqual(len(self.state.corrections), 2)
+        self.open_b()
+        self.state.switch_document("doc-a", "a.mqxliff", r"C:\work\a.mqxliff")
+        self.state.save()
+        with open(self.path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        doc = raw["documents"]["doc-a"]
+        doc["segments"][self.KEY]["future_seg"] = {"nested": [1, "x"]}
+        doc["segments"][other]["future_seg"] = "other-seg"
+        by_final = {c["human_final"]: c for c in doc["corrections"]}
+        by_final["A-MANUAL"]["future_corr"] = "for-A-MANUAL"
+        by_final["A-OTHER"]["future_corr"] = "for-A-OTHER"
+        raw["documents"]["doc-b"]["segments"][self.KEY]["future_seg"] = "b-seg"
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(raw, handle, ensure_ascii=False)
+        return other
+
+    def saved_doc(self, doc_id="doc-a"):
+        with open(self.path, encoding="utf-8") as handle:
+            return json.load(handle)["documents"][doc_id]
+
+    def assert_future_fields(self, other, phase):
+        doc = self.saved_doc()
+        corr = {c["human_final"]: c.get("future_corr") for c in doc["corrections"]}
+        checks = {
+            "seg-key": (doc["segments"][self.KEY].get("future_seg"),
+                        {"nested": [1, "x"]}),
+            "seg-other": (doc["segments"][other].get("future_seg"), "other-seg"),
+            "corr-A-MANUAL": (corr.get("A-MANUAL"), "for-A-MANUAL"),
+            "corr-A-OTHER": (corr.get("A-OTHER"), "for-A-OTHER"),
+            "doc-b-seg": (self.saved_doc("doc-b")["segments"][self.KEY].get("future_seg"),
+                          "b-seg"),
+        }
+        for field, (actual, expected) in checks.items():
+            with self.subTest(phase=phase, field=field):
+                self.assertEqual(actual, expected)
+
+    def test_unknown_nested_fields_survive_load_save(self):
+        other = self.write_future_fields()
+        state.ProjectState.load(self.path).save()
+        self.assert_future_fields(other, "load-save")
+
+    def test_unknown_nested_fields_survive_switching(self):
+        other = self.write_future_fields()
+        proj = state.ProjectState.load(self.path)
+        proj.switch_document("doc-b", "b.mqxliff")
+        proj.switch_document("doc-a", "a.mqxliff")
+        proj.save()
+        self.assert_future_fields(other, "A-B-A")
+
+    def test_known_field_edits_win_over_stale_copies(self):
+        other = self.write_future_fields()
+        proj = state.ProjectState.load(self.path)
+        proj.segments[self.KEY].user_final = "EDITED-AFTER-LOAD"
+        proj.corrections[0].comment = "edited correction comment"
+        edited_final = proj.corrections[0].human_final
+        proj.save()
+        self.assert_future_fields(other, "after-edit")
+        doc = self.saved_doc()
+        self.assertEqual(doc["segments"][self.KEY]["user_final"], "EDITED-AFTER-LOAD")
+        edited = next(c for c in doc["corrections"] if c["human_final"] == edited_final)
+        self.assertEqual(edited["comment"], "edited correction comment")
+        reloaded = state.ProjectState.load(self.path)
+        self.assertEqual(reloaded.segments[self.KEY].user_final, "EDITED-AFTER-LOAD")
+
+    def test_unknown_correction_fields_follow_their_correction_not_its_index(self):
+        other = self.write_future_fields()
+        proj = state.ProjectState.load(self.path)
+        # Insert a new correction in front and remove the old first one: any
+        # position-based reattachment would now mislabel the survivors.
+        removed = proj.corrections.pop(0)
+        proj.corrections.insert(0, state.Correction(
+            segment_id="new", source="s", llm_suggestion="", human_final="NEW"))
+        proj.save()
+        doc = self.saved_doc()
+        corr = {c["human_final"]: c for c in doc["corrections"]}
+        self.assertNotIn(removed.human_final, corr)
+        self.assertNotIn("future_corr", corr["NEW"])
+        survivor = "A-OTHER" if removed.human_final == "A-MANUAL" else "A-MANUAL"
+        self.assertEqual(corr[survivor]["future_corr"], "for-%s" % survivor)
+        self.assertEqual(doc["segments"][other]["future_seg"], "other-seg")
+
+    def test_unknown_segment_fields_do_not_move_to_a_replaced_record(self):
+        self.write_future_fields()
+        proj = state.ProjectState.load(self.path)
+        # Rebinding after the source text changed replaces the record; the old
+        # record's unknown data must not be attached to the new one.
+        proj.segments[self.KEY].source_text = "stale source"
+        self.bind(proj, self.doc_a, "a.mqxliff", r"C:\work\a.mqxliff")
+        self.assertEqual(proj.segments[self.KEY].user_final, "")
+        proj.save()
+        self.assertNotIn("future_seg", self.saved_doc()["segments"][self.KEY])
+
+    def test_reset_active_document_clears_only_that_document(self):
+        # Unbound work first, so a retained unbound entry exists too.
+        self.bind(self.state, self.doc_a, "a.mqxliff")
+        self.state.capture_edits({self.KEY: "UNBOUND"})
+        self.open_b()
+        self.state.capture_edits({self.KEY: "B-MANUAL"}, {self.KEY: "B-comment"})
+        self.open_a()
+        self.work_on_a(self.state)
+        self.state.vibe = "global vibe"
+
+        self.state.reset_active_document()
+        self.assertEqual(self.state.document_id, "doc-a")
+        self.assertEqual(self.state.source_path, r"C:\work\a.mqxliff")
+        for field, value in {"segments": {}, "order": [], "corrections": [],
+                             "analysis": {}, "global_directive": "",
+                             "current_batch": 0}.items():
+            with self.subTest(field=field):
+                self.assertEqual(getattr(self.state, field), value)
+        self.state.save()
+
+        reloaded = state.ProjectState.load(self.path)
+        self.assertEqual(reloaded.document_id, "doc-a")
+        self.assertEqual(reloaded.segments, {})
+        self.assertEqual(reloaded.vibe, "global vibe")
+        reloaded.switch_document("doc-b", "b.mqxliff")
+        self.assertEqual(reloaded.segments[self.KEY].user_final, "B-MANUAL")
+        self.assertEqual(reloaded.segments[self.KEY].user_comment, "B-comment")
+        with open(self.path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        self.assertEqual(
+            raw["unbound_document"]["segments"][self.KEY]["user_final"], "UNBOUND")
+
+    def test_failed_reset_save_restores_the_active_work(self):
+        self.open_a()
+        self.work_on_a(self.state)
+        original = state.ProjectState.save
+
+        def failing_save(proj):
+            raise OSError("simulated")
+
+        state.ProjectState.save = failing_save
+        try:
+            with self.assertRaises(OSError):
+                self.state.reset_active_document_and_save()
+        finally:
+            state.ProjectState.save = original
+        self.assertEqual(self.state.document_id, "doc-a")
+        self.assert_a_work(self.state)
+
+    def test_reset_refuses_unbound_and_legacy_state(self):
+        with self.assertRaises(ValueError):
+            self.state.reset_active_document()
+        self.state.switch_document(state.LEGACY_DOCUMENT_ID)
+        with self.assertRaises(ValueError):
+            self.state.reset_active_document()
+
+    def test_unbound_work_round_trips_and_is_never_transferred(self):
+        # Existing callers bind without switching; that work still persists.
+        self.bind(self.state, self.doc_a, "a.mqxliff")
+        self.state.capture_edits({self.KEY: "UNBOUND"})
+        self.state.save()
+        reloaded = state.ProjectState.load(self.path)
+        self.assertIsNone(reloaded.document_id)
+        self.assertEqual(reloaded.segments[self.KEY].user_final, "UNBOUND")
+
+        reloaded.switch_document("doc-b", "b.mqxliff")
+        self.assertEqual(reloaded.segments, {})
+        reloaded.save()
+        with open(self.path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        self.assertEqual(
+            raw["unbound_document"]["segments"][self.KEY]["user_final"], "UNBOUND")
+
+    def test_switch_rejects_an_empty_document_id(self):
+        for bad in ("", None):
+            with self.subTest(document_id=bad):
+                with self.assertRaises(ValueError):
+                    self.state.switch_document(bad)
+
+    def test_save_is_atomic_when_serialisation_fails(self):
+        self.open_a()
+        self.work_on_a(self.state)
+        self.state.save()
+        with open(self.path, "rb") as handle:
+            before = handle.read()
+        self.state.analysis["bad"] = object()  # not JSON-serialisable
+        with self.assertRaises(TypeError):
+            self.state.save()
+        with open(self.path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
+
+    def test_corrupt_v5_file_is_preserved_and_does_not_raise(self):
+        self.open_a()
+        self.state.save()
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write('{"version": 5, "documents": {')
+        reloaded = state.ProjectState.load(self.path)
+        self.assertIsNone(reloaded.document_id)
+        self.assertEqual(reloaded.segments, {})
+        with open(self.path + ".corrupt", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), '{"version": 5, "documents": {')
+
+
+class TestLegacyStateMigration(unittest.TestCase):
+    """Pre-v5 single-document files: kept whole, never auto-attached."""
+
+    KEY = "1#0"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "state.json")
+        doc = load_doc()
+        old = state.ProjectState(os.path.join(self.tmp, "scratch.json"))
+        old.batch_size = 3
+        old.bind_segments(doc.translatable_segments(), "sample.mqxliff",
+                          present_keys={s.key for s in doc.segments})
+        old.capture_edits({self.KEY: "LEGACY-MANUAL"}, {self.KEY: "legacy note"})
+        old.calculate_diffs(0)
+        record = old.segments[self.KEY]
+        segments = {k: asdict_record(v) for k, v in old.segments.items()}
+        segments[self.KEY]["future_segment_field"] = "kept"
+        self.legacy = {
+            "version": 4,
+            "source_file": "sample.mqxliff",
+            "source_path": "",
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-02T00:00:00",
+            "batch_size": 3,
+            "current_batch": 1,
+            "vibe": "legacy vibe",
+            "hard_rules_text": "legacy rules",
+            "detailed_feedback": True,
+            "analysis": {"0": "legacy analysis"},
+            "prompt_templates": {},
+            "prompt_stage": "auto",
+            "tag_source": "target",
+            "global_directive": "legacy directive",
+            "auto_merge_proposals": True,
+            "rule_log": [],
+            "termbase": [{"source": "entropy", "target": "Entropie", "note": ""}],
+            "corrections": [{"segment_id": record.segment_id, "source": record.source_text,
+                             "llm_suggestion": "", "human_final": "LEGACY-MANUAL",
+                             "comment": "legacy note", "batch_index": 0}],
+            "order": list(old.order),
+            "segments": segments,
+            "future_top_level_field": {"nested": [1, 2]},
+        }
+        self.raw = json.dumps(self.legacy, ensure_ascii=False, indent=1).encode("utf-8")
+        with open(self.path, "wb") as handle:
+            handle.write(self.raw)
+        self.backup = self.path + ".v4.bak"
+
+    def tearDown(self):
+        import shutil  # noqa: PLC0415
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def file_bytes(self, path=None):
+        with open(path or self.path, "rb") as handle:
+            return handle.read()
+
+    def assert_legacy_view(self, proj):
+        record = proj.segments[self.KEY]
+        checks = {
+            "document_id": (proj.document_id, state.LEGACY_DOCUMENT_ID),
+            "source_file": (proj.source_file, "sample.mqxliff"),
+            "user_final": (record.user_final, "LEGACY-MANUAL"),
+            "user_comment": (record.user_comment, "legacy note"),
+            "edited_by_human": (record.edited_by_human, True),
+            "order": (proj.order, self.legacy["order"]),
+            "corrections": ([c.human_final for c in proj.corrections], ["LEGACY-MANUAL"]),
+            "analysis": (proj.analysis, {"0": "legacy analysis"}),
+            "global_directive": (proj.global_directive, "legacy directive"),
+            "current_batch": (proj.current_batch, 1),
+            "created_at": (proj.created_at, "2026-01-01T00:00:00"),
+        }
+        for field, (actual, expected) in checks.items():
+            with self.subTest(field=field):
+                self.assertEqual(actual, expected)
+
+    def test_loading_keeps_the_old_active_view_without_writing(self):
+        before = os.stat(self.path).st_mtime_ns
+        proj = state.ProjectState.load(self.path)
+        self.assert_legacy_view(proj)
+        self.assertEqual(proj.vibe, "legacy vibe")
+        self.assertEqual(proj.hard_rules_text, "legacy rules")
+        self.assertEqual(self.file_bytes(), self.raw)
+        self.assertEqual(os.stat(self.path).st_mtime_ns, before)
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["state.json"])
+
+    def test_first_save_backs_up_the_legacy_bytes_exactly_once(self):
+        proj = state.ProjectState.load(self.path)
+        proj.save()
+        self.assertEqual(self.file_bytes(self.backup), self.raw)
+        with open(self.path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        self.assertEqual(raw["version"], 5)
+        self.assertEqual(raw["active_document"], state.LEGACY_DOCUMENT_ID)
+        # Every original field survives verbatim inside the legacy entry.
+        entry = raw["documents"][state.LEGACY_DOCUMENT_ID]
+        self.assertEqual(entry["legacy_original"], self.legacy)
+        self.assertEqual(entry["legacy_original"]["future_top_level_field"],
+                         {"nested": [1, 2]})
+        # Later saves of the (now v5) file create no further backups.
+        proj.save()
+        backups = [n for n in os.listdir(self.tmp) if ".bak" in n]
+        self.assertEqual(backups, ["state.json.v4.bak"])
+
+    def test_legacy_work_survives_switching_and_save_load(self):
+        proj = state.ProjectState.load(self.path)
+        proj.switch_document("doc-a", "sample.mqxliff")
+        # Same basename and same source text: still NOT attached automatically.
+        doc = load_doc()
+        proj.bind_segments(doc.translatable_segments(), "sample.mqxliff",
+                           present_keys={s.key for s in doc.segments})
+        record = proj.segments[self.KEY]
+        self.assertEqual(record.user_final, "")
+        self.assertFalse(record.edited_by_human)
+        self.assertEqual(proj.corrections, [])
+        proj.save()
+
+        reloaded = state.ProjectState.load(self.path)
+        self.assertEqual(reloaded.document_id, "doc-a")
+        self.assertIn(state.LEGACY_DOCUMENT_ID, reloaded.document_ids)
+        reloaded.switch_document(state.LEGACY_DOCUMENT_ID, "sample.mqxliff")
+        self.assert_legacy_view(reloaded)
+        reloaded.save()
+        with open(self.path, encoding="utf-8") as handle:
+            entry = json.load(handle)["documents"][state.LEGACY_DOCUMENT_ID]
+        self.assertEqual(entry["legacy_original"], self.legacy)
+
+    def test_identical_existing_backup_is_reused(self):
+        with open(self.backup, "wb") as handle:
+            handle.write(self.raw)
+        state.ProjectState.load(self.path).save()
+        self.assertEqual(self.file_bytes(self.backup), self.raw)
+        self.assertFalse(os.path.exists(self.backup + ".1"))
+
+    def test_different_existing_backup_is_kept_and_a_new_one_created(self):
+        with open(self.backup, "wb") as handle:
+            handle.write(b"an older, different backup")
+        with open(self.backup + ".1", "wb") as handle:
+            handle.write(b"another different backup")
+        state.ProjectState.load(self.path).save()
+        self.assertEqual(self.file_bytes(self.backup), b"an older, different backup")
+        self.assertEqual(self.file_bytes(self.backup + ".1"), b"another different backup")
+        self.assertEqual(self.file_bytes(self.backup + ".2"), self.raw)
+
+    def test_backup_failure_leaves_the_legacy_file_untouched(self):
+        proj = state.ProjectState.load(self.path)
+        original = state._write_backup
+
+        def failing(path, data):
+            raise PermissionError("simulated: backup location not writable")
+
+        state._write_backup = failing
+        try:
+            with self.assertRaises(state.StateBackupError):
+                proj.save()
+        finally:
+            state._write_backup = original
+        self.assertEqual(self.file_bytes(), self.raw)
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
+        self.assertFalse(os.path.exists(self.backup))
+
+    def test_unverified_backup_blocks_the_overwrite(self):
+        proj = state.ProjectState.load(self.path)
+        original = state._write_backup
+        state._write_backup = lambda path, data: False
+        try:
+            with self.assertRaises(state.StateBackupError):
+                proj.save()
+        finally:
+            state._write_backup = original
+        self.assertEqual(self.file_bytes(), self.raw)
+
+    def test_fresh_state_saved_over_a_legacy_file_backs_it_up(self):
+        # Today's "Reset project state" saves a brand-new ProjectState here.
+        state.ProjectState(self.path).save()
+        self.assertEqual(self.file_bytes(self.backup), self.raw)
+
+
+def asdict_record(record) -> dict:
+    from dataclasses import asdict  # noqa: PLC0415
+    return asdict(record)
 
 
 BS = chr(92)  # a literal backslash, spelled out so no editor can mangle it

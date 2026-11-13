@@ -17,6 +17,7 @@ that users copy around and paste into issue reports.
 
 from __future__ import annotations
 
+import copy
 import csv
 import functools
 import io
@@ -24,7 +25,7 @@ import json
 import os
 import re
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -32,8 +33,57 @@ from . import defaults
 from . import prompt_templates as templates_mod
 from . import tags as tagmod
 
-STATE_VERSION = 4
+STATE_VERSION = 5
 DEFAULT_BATCH_SIZE = 100
+
+# v5 multi-document layout. Global settings live at the top level; everything
+# below is per document and lives in one snapshot per document ID.
+GLOBAL_FIELDS = (
+    "batch_size", "vibe", "hard_rules_text", "detailed_feedback",
+    "prompt_templates", "prompt_stage", "tag_source", "auto_merge_proposals",
+    "rule_log", "termbase",
+)
+DOCUMENT_FIELDS = (
+    "source_file", "source_path", "created_at", "updated_at", "current_batch",
+    "analysis", "global_directive", "corrections", "order", "segments",
+)
+_STRUCTURE_FIELDS = ("version", "active_document", "documents", "unbound_document")
+
+LEGACY_DOCUMENT_ID = "legacy"
+"""Document ID under which a pre-v5 single-document state is kept.
+
+It is never attached to a real document automatically; the verbatim original
+JSON is kept inside that entry under ``legacy_original``.
+"""
+
+_MAX_BACKUP_ATTEMPTS = 1000
+
+
+class StateBackupError(OSError):
+    """A legacy state file could not be backed up, so it was not overwritten."""
+
+
+def _is_v5_payload(data: object) -> bool:
+    if not isinstance(data, dict) or "documents" not in data:
+        return False
+    try:
+        return int(data.get("version", 1)) >= 5
+    except (TypeError, ValueError):
+        return False
+
+
+def _write_backup(path: str, data: bytes) -> bool:
+    """Create ``path`` exclusively with ``data``, fsync it, and read it back.
+
+    Raises FileExistsError if ``path`` exists (it is never overwritten) and
+    OSError on any I/O failure. Returns whether the read-back matched.
+    """
+    with open(path, "xb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    with open(path, "rb") as handle:
+        return handle.read() == data
 
 # Column positions in memoQ's termbase CSV export. Row 0 is
 # "English,English,English,English,English,Russian,Russian" - five source
@@ -248,6 +298,21 @@ class ProjectState:
         self.analysis: Dict[str, str] = {}
         self.detailed_feedback: bool = True
 
+        # Multi-document storage (v5). The public document-scoped attributes
+        # above are the *active* document; the others live as JSON-shaped
+        # snapshots and are never shared by reference with the active view.
+        self.document_id: Optional[str] = None
+        """Opaque ID of the active document, or None when unbound."""
+        self._documents: Dict[str, dict] = {}
+        self._active_extra: Dict[str, object] = {}
+        """Unknown keys of the active document's entry, carried verbatim."""
+        self._unbound: Optional[dict] = None
+        """Unbound work stashed when a document was opened over it."""
+        self._extra_top: Dict[str, object] = {}
+        """Unknown top-level keys of a v5 file, carried verbatim."""
+        self._nested_extra: Dict[int, tuple] = {}
+        """id(record or correction) -> (that object, its unknown stored fields)."""
+
     # ------------------------------------------------------------ persistence
 
     @classmethod
@@ -268,14 +333,43 @@ class ProjectState:
             return state
 
         state.version = int(data.get("version", 1))
-        state.source_file = data.get("source_file", "")
-        state.source_path = data.get("source_path", "")
-        state.created_at = data.get("created_at", state.created_at)
-        state.updated_at = data.get("updated_at", state.updated_at)
+        state._load_globals(data)
+
+        if _is_v5_payload(data):
+            documents = data.get("documents") or {}
+            state._documents = {
+                str(key): copy.deepcopy(entry)
+                for key, entry in documents.items() if isinstance(entry, dict)
+            }
+            unbound = data.get("unbound_document")
+            unbound = copy.deepcopy(unbound) if isinstance(unbound, dict) else None
+            active = data.get("active_document")
+            if isinstance(active, str) and active in state._documents:
+                state._apply_document(state._documents[active])
+                state.document_id = active
+                state._unbound = unbound
+            else:
+                state._apply_document(unbound or {})
+                state.document_id = None
+            state._extra_top = {
+                key: copy.deepcopy(value) for key, value in data.items()
+                if key not in _STRUCTURE_FIELDS + GLOBAL_FIELDS + DOCUMENT_FIELDS
+            }
+        else:
+            # Pre-v5: one document at the top level. It becomes the active
+            # "legacy" entry, and the original JSON is kept verbatim inside it
+            # so no field - known, unknown or migrated away - is lost. Loading
+            # never rewrites the file; the first save() backs it up first.
+            state._apply_document(data)
+            state._active_extra = {"legacy_original": copy.deepcopy(data)}
+            state.document_id = LEGACY_DOCUMENT_ID
+        return state
+
+    def _load_globals(self, data: dict) -> None:
+        """Global settings; the same keys in every schema version."""
+        state = self
         state.batch_size = int(data.get("batch_size", DEFAULT_BATCH_SIZE)) or DEFAULT_BATCH_SIZE
-        state.current_batch = int(data.get("current_batch", 0))
         state.detailed_feedback = bool(data.get("detailed_feedback", True))
-        state.analysis = dict(data.get("analysis", {}))
 
         # Empty strings are meaningful ("the operator cleared this box"), so
         # only fall back to the defaults when the key is absent entirely.
@@ -287,7 +381,6 @@ class ProjectState:
 
         state.prompt_stage = data.get("prompt_stage", "auto")
         state.tag_source = data.get("tag_source", tagmod.TAG_SOURCE_TARGET)
-        state.global_directive = data.get("global_directive", "")
         state.auto_merge_proposals = bool(data.get("auto_merge_proposals", True))
         state.rule_log = list(data.get("rule_log", []))
         # v3 -> v4: stage templates. Unknown keys are ignored and missing ones
@@ -308,51 +401,254 @@ class ProjectState:
                          if k in ("source", "target", "note")})
             for entry in raw_terms
         ]
-        state.corrections = [Correction(**c) for c in data.get("corrections", [])]
-        state.order = list(data.get("order", []))
-        for key, record in (data.get("segments") or {}).items():
-            allowed = {f: record[f] for f in SegmentRecord.__annotations__ if f in record}
-            allowed.setdefault("key", key)
-            state.segments[key] = SegmentRecord(**allowed)
-        if not state.order:
-            state.order = sorted(state.segments, key=lambda k: state.segments[k].ordinal)
-        return state
 
-    def save(self) -> str:
-        self.updated_at = _now()
-        payload = {
-            "version": STATE_VERSION,
+    def _apply_document(self, entry: dict) -> None:
+        """Make ``entry`` the active document view, building fresh objects.
+
+        Nothing here aliases ``entry``: records, lists and dicts are rebuilt,
+        and unknown keys are deep-copied into ``_active_extra``.
+        """
+        self.source_file = entry.get("source_file", "")
+        self.source_path = entry.get("source_path", "")
+        self.created_at = entry.get("created_at", _now())
+        self.updated_at = entry.get("updated_at", _now())
+        self.current_batch = int(entry.get("current_batch", 0))
+        self.analysis = dict(entry.get("analysis", {}))
+        self.global_directive = entry.get("global_directive", "")
+        # Unknown nested fields (e.g. written by a newer harness) are kept
+        # aside, tied to the exact object built from that stored item. They go
+        # back out only while that same object is still in place, so they can
+        # never drift onto another record or a correction at a shifted index.
+        self._nested_extra = {}
+        self.corrections = [
+            self._build(Correction, item, {}) for item in entry.get("corrections", [])
+        ]
+        self.segments = {}
+        for key, record in (entry.get("segments") or {}).items():
+            self.segments[key] = self._build(SegmentRecord, record, {"key": key})
+        if "order" in entry:
+            # Present, even if empty: an empty selection (every row hidden by
+            # the filter) is valid and must stay empty.
+            self.order = list(entry["order"])
+        else:
+            # Absent (very old files): rebuild it from the records.
+            self.order = sorted(self.segments, key=lambda k: self.segments[k].ordinal)
+        self._active_extra = {
+            key: copy.deepcopy(value) for key, value in entry.items()
+            if key not in DOCUMENT_FIELDS
+        }
+
+    def _document_snapshot(self) -> dict:
+        """Deep, JSON-shaped copy of the active document, unknown keys kept."""
+        snapshot = copy.deepcopy(self._active_extra)
+        snapshot.update(json.loads(json.dumps({
             "source_file": self.source_file,
             "source_path": self.source_path,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "batch_size": self.batch_size,
             "current_batch": self.current_batch,
+            "analysis": self.analysis,
+            "global_directive": self.global_directive,
+            "corrections": [self._dump(c) for c in self.corrections],
+            "order": self.order,
+            "segments": {k: self._dump(v) for k, v in self.segments.items()},
+        }, ensure_ascii=False)))
+        return snapshot
+
+    def _build(self, cls, item: dict, defaults_: dict):
+        """Construct ``cls`` from known fields only; remember the rest."""
+        known = {f.name for f in fields(cls)}
+        kwargs = dict(defaults_)
+        kwargs.update({k: v for k, v in item.items() if k in known})
+        obj = cls(**kwargs)
+        extra = {k: copy.deepcopy(v) for k, v in item.items() if k not in known}
+        if extra:
+            # Holding obj keeps id(obj) from being reused by another object.
+            self._nested_extra[id(obj)] = (obj, extra)
+        return obj
+
+    def _dump(self, obj) -> dict:
+        """Current known fields, over the unknown ones stored for this object."""
+        out: dict = {}
+        held = self._nested_extra.get(id(obj))
+        if held is not None and held[0] is obj:
+            out.update(copy.deepcopy(held[1]))
+        out.update(asdict(obj))  # current known values always win
+        return out
+
+    def _has_document_work(self) -> bool:
+        return bool(self.segments or self.order or self.corrections or self.analysis
+                    or self.global_directive or self.source_file or self.source_path
+                    or self._active_extra)
+
+    # ------------------------------------------------------------- documents
+
+    @property
+    def document_ids(self) -> List[str]:
+        """IDs of every stored document, the active one included."""
+        ids = set(self._documents)
+        if self.document_id is not None:
+            ids.add(self.document_id)
+        return sorted(ids)
+
+    def switch_document(self, document_id: str, source_file: str = "",
+                        source_path: str = "") -> None:
+        """Make ``document_id`` the active document.
+
+        ``document_id`` is opaque (the caller supplies e.g. a source
+        fingerprint). The current document is snapshotted first; a known ID is
+        restored, an unknown one starts empty. Global settings are untouched
+        and no document-scoped data crosses between IDs. Switching to the
+        active ID keeps all in-memory work and only refreshes the file
+        metadata. Nothing is written to disk: call :meth:`save`.
+        """
+        if not isinstance(document_id, str) or not document_id:
+            raise ValueError("document_id must be a non-empty string")
+        if document_id != self.document_id:
+            if self.document_id is not None:
+                self._documents[self.document_id] = self._document_snapshot()
+            elif self._has_document_work():
+                # Work bound to no document is kept aside, never transferred.
+                self._unbound = self._document_snapshot()
+            entry = self._documents.get(document_id)
+            self._apply_document(entry if entry is not None else {})
+            self.document_id = document_id
+        self.source_file = source_file
+        self.source_path = source_path
+
+    def reset_active_document(self) -> None:
+        """Clear the active document's working state, and nothing else.
+
+        Keeps the document ID and its file metadata, every other stored
+        document, retained legacy/unbound work and all global settings. Refuses
+        unbound and legacy state, which have no document of their own to
+        reset. Nothing is written to disk: call :meth:`save`.
+        """
+        if self.document_id is None or self.document_id == LEGACY_DOCUMENT_ID:
+            raise ValueError("reset_active_document needs an active document")
+        self.segments = {}
+        self.order = []
+        self.corrections = []
+        self.analysis = {}
+        self.global_directive = ""
+        self.current_batch = 0
+        self.created_at = _now()
+        self._active_extra = {}
+        self._nested_extra = {}
+
+    def reset_active_document_and_save(self) -> str:
+        """Reset the active document and persist it, all or nothing.
+
+        If saving fails, the pre-reset active work is restored in memory and
+        the error propagates, so a failed reset never looks like a success.
+        """
+        snapshot = self._document_snapshot()
+        self.reset_active_document()
+        try:
+            return self.save()
+        except BaseException:
+            self._apply_document(snapshot)
+            raise
+
+    # ------------------------------------------------------------------ save
+
+    def save(self) -> str:
+        self.updated_at = _now()
+        active = self._document_snapshot()
+        documents = copy.deepcopy(self._documents)
+        if self.document_id is None:
+            unbound = active
+        else:
+            documents[self.document_id] = active
+            unbound = copy.deepcopy(self._unbound)
+        payload = {
+            "version": STATE_VERSION,
+            "batch_size": self.batch_size,
             "vibe": self.vibe,
             "hard_rules_text": self.hard_rules_text,
             "detailed_feedback": self.detailed_feedback,
-            "analysis": self.analysis,
             "prompt_templates": self.prompt_templates,
             "prompt_stage": self.prompt_stage,
             "tag_source": self.tag_source,
-            "global_directive": self.global_directive,
             "auto_merge_proposals": self.auto_merge_proposals,
             "rule_log": self.rule_log,
             "termbase": [asdict(t) for t in self.termbase],
-            "corrections": [asdict(c) for c in self.corrections],
-            "order": self.order,
-            "segments": {k: asdict(v) for k, v in self.segments.items()},
+            "active_document": self.document_id,
+            "documents": documents,
+            "unbound_document": unbound,
         }
+        for key, value in self._extra_top.items():
+            payload.setdefault(key, copy.deepcopy(value))
+        # Serialise before touching the disk so a bad value cannot leave a
+        # half-written file behind.
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
+        # A pre-v5 file is backed up byte for byte before its first overwrite;
+        # if that fails, StateBackupError propagates and nothing is written.
+        self._backup_legacy_file()
         # Write to a sibling temp file then replace, so an interrupted save
         # cannot leave a half-written state.json behind.
         temp = self.path + ".tmp"
         with open(temp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write(text)
         os.replace(temp, self.path)
+        self.version = STATE_VERSION
         return self.path
+
+    def _backup_legacy_file(self) -> Optional[str]:
+        """Back up the on-disk state file if it is not in the v5 format.
+
+        Decided from the bytes on disk at save time, not from memory. The
+        backup is created with exclusive creation (never overwriting), fsynced
+        and read back. An existing backup is reused only if it is byte-for-byte
+        identical; otherwise a distinct numbered backup is created. Returns the
+        backup path, or None when no backup was needed.
+        """
+        try:
+            with open(self.path, "rb") as handle:
+                current = handle.read()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise StateBackupError(
+                "Cannot read %s to back it up: %s" % (self.path, exc)) from exc
+        try:
+            data = json.loads(current.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            # Not JSON at all: the existing .corrupt copy made by load() is the
+            # safeguard for that case, as before.
+            return None
+        if _is_v5_payload(data):
+            return None
+
+        version = data.get("version", 1) if isinstance(data, dict) else "unknown"
+        base = "%s.v%s.bak" % (self.path, version)
+        for attempt in range(_MAX_BACKUP_ATTEMPTS):
+            candidate = base if attempt == 0 else "%s.%d" % (base, attempt)
+            try:
+                written = _write_backup(candidate, current)
+            except FileExistsError:
+                try:
+                    with open(candidate, "rb") as handle:
+                        if handle.read() == current:
+                            return candidate  # a verified identical backup
+                except OSError:
+                    pass
+                continue  # different or unreadable: never trust or overwrite
+            except OSError as exc:
+                raise StateBackupError(
+                    "Could not back up %s to %s: %s" % (self.path, candidate, exc)
+                ) from exc
+            if not written:
+                raise StateBackupError(
+                    "Backup %s did not verify; %s was not overwritten."
+                    % (candidate, self.path))
+            return candidate
+        raise StateBackupError(
+            "No free backup name for %s; it was not overwritten." % self.path)
 
     # ---------------------------------------------------------------- binding
 

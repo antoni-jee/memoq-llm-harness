@@ -20,6 +20,7 @@ Workflow the UI is built around:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import traceback
 from typing import Dict, List, Optional
@@ -84,6 +85,9 @@ def bootstrap() -> None:
     ss.document = None
     ss.doc_bytes = None
     ss.doc_name = ""
+    ss.doc_path = ""
+    ss.upload_marker = None
+    ss.confirm_reset = False
     ss.seg_filter = mqxliff.SegmentFilter()
     ss.source_lang = ""
     ss.target_lang = ""
@@ -124,43 +128,86 @@ def flush_notice() -> None:
 # ------------------------------------------------------------ document I/O
 
 
-def load_document(raw: bytes, filename: str) -> None:
-    """Parse an uploaded file and bind it to the project state."""
-    doc = mqxliff.MqxliffDocument.from_bytes(raw, filename)
-    doc.parse_segments(st.session_state.seg_filter, tag_source=project().tag_source)
+def upload_marker(name: str, data: bytes) -> str:
+    """Identity of one uploaded file *version*: its name plus its exact bytes.
 
-    proj = project()
-    if proj.source_file and proj.source_file != filename:
-        # Different document: start clean rather than mixing two files' history.
-        proj = state_mod.ProjectState(STATE_PATH)
-        proj.termbase = project().termbase
-        proj.hard_rules_text = project().hard_rules_text
-        proj.vibe = project().vibe
-        proj.batch_size = project().batch_size
-        proj.prompt_templates = dict(project().prompt_templates)
-        proj.prompt_stage = project().prompt_stage
-        proj.tag_source = project().tag_source
-        st.session_state.project = proj
+    Deliberately not the source fingerprint: a target-only change keeps the
+    fingerprint but is still a new file that must be loaded. Two different
+    files sharing a basename get different markers.
+    """
+    digest = hashlib.sha256()
+    digest.update(name.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(data)
+    return digest.hexdigest()
 
-    # Pass the full-document key set separately from the filtered selection, so
-    # a row hidden by the filter keeps its saved work instead of being pruned.
-    proj.bind_segments(
-        doc.translatable_segments(),
-        filename,
-        present_keys={s.key for s in doc.segments},
-    )
-    proj.save()
 
-    # Drop grid widget state from the previous document/filter, or rows would
-    # inherit text belonging to whatever segment last held the same key.
+def upload_needs_load(marker: Optional[str], last_marker: Optional[str]) -> bool:
+    """Load only when the uploader holds a file version not yet loaded.
+
+    Streamlit keeps returning the same upload on every rerun, so reloading it
+    each time would discard unsaved widget edits.
+    """
+    return marker is not None and marker != last_marker
+
+
+def _clear_grid_widgets() -> None:
+    """Drop grid widget state so rows cannot inherit another document's text."""
     for key in [k for k in st.session_state
                 if k.startswith(("txt_", "note_", "txtrev_"))]:
         del st.session_state[key]
 
+
+def _retained_work_label(proj: state_mod.ProjectState) -> str:
+    """Name of active work that a switch would leave retained but detached."""
+    if proj.document_id == state_mod.LEGACY_DOCUMENT_ID:
+        return proj.source_file or "an earlier session"
+    if proj.document_id is None and (proj.segments or proj.corrections
+                                     or proj.analysis or proj.global_directive):
+        return proj.source_file or "an earlier session"
+    return ""
+
+
+def load_document(raw: bytes, filename: str, source_path: str = "") -> None:
+    """Parse a file and make it the active document of the project state.
+
+    The document's identity is its source fingerprint, so the same document
+    under another name or path reopens its own saved work, and a different
+    document never inherits it. ``source_path`` is the disk path, or "" for a
+    browser upload. Parsing and fingerprinting happen before any state change,
+    so a bad file neither switches nor saves anything.
+    """
+    doc = mqxliff.MqxliffDocument.from_bytes(raw, filename)
+    doc.parse_segments(st.session_state.seg_filter, tag_source=project().tag_source)
+    document_id = doc.source_fingerprint()
+
+    proj = project()
+    retained = ""
+    if proj.document_id != document_id:
+        retained = _retained_work_label(proj)
+    proj.switch_document(document_id, filename, source_path)
+    # Pass the full-document key set separately from the filtered selection, so
+    # a row hidden by the filter keeps its saved work instead of being pruned.
+    # bind_segments() also sets source_file/source_path, so pass the same path.
+    proj.bind_segments(
+        doc.translatable_segments(),
+        filename,
+        source_path,
+        present_keys={s.key for s in doc.segments},
+    )
+    save_error = ""
+    try:
+        proj.save()
+    except OSError as exc:  # includes StateBackupError: nothing was written
+        save_error = str(exc)
+
+    _clear_grid_widgets()
     st.session_state.document = doc
     st.session_state.doc_bytes = raw
     st.session_state.doc_name = filename
+    st.session_state.doc_path = source_path
     st.session_state.page = 0
+    st.session_state.confirm_reset = False
 
     header = _find_file_header(doc)
     if header is not None:
@@ -168,8 +215,7 @@ def load_document(raw: bytes, filename: str) -> None:
         st.session_state.target_lang = header.get("target-language", "") or ""
 
     stats = doc.stats()
-    notify(
-        "success",
+    message = (
         "Loaded **%s** - %d segments, %d to work on "
         "(%d confirmed, %d locked, %d empty skipped). %d batches of %d."
         % (
@@ -181,8 +227,20 @@ def load_document(raw: bytes, filename: str) -> None:
             stats["empty_source"],
             proj.batch_count,
             proj.batch_size,
-        ),
+        )
     )
+    kind = "success"
+    if retained:
+        kind = "warning"
+        message += (
+            "\n\nEarlier work for **%s** (not tied to a specific document) is "
+            "retained in state.json but was NOT attached to this document. "
+            "Reopening it needs a recovery flow that is not available yet."
+            % retained)
+    if save_error:
+        kind = "error"
+        message += "\n\nThe project state was NOT saved: %s" % save_error
+    notify(kind, message)
 
 
 def _find_file_header(doc: mqxliff.MqxliffDocument):
@@ -192,9 +250,62 @@ def _find_file_header(doc: mqxliff.MqxliffDocument):
     return None
 
 
+def reset_active_document() -> None:
+    """Clear the active document's saved work and unload it from the editor.
+
+    Other documents, retained earlier work and global settings are kept. The
+    document is unloaded (not rebound) so the next rerun cannot reload it; the
+    upload marker is left as is, so a file still sitting in the uploader is not
+    reloaded either. Reopening is a deliberate Load or re-upload.
+    """
+    proj = project()
+    name = st.session_state.doc_name or proj.source_file
+    st.session_state.confirm_reset = False
+    try:
+        proj.reset_active_document_and_save()
+    except OSError as exc:
+        # Nothing was cleared: the state restored itself, the editor stays.
+        notify("error", "Reset FAILED; nothing was cleared: %s" % exc)
+        return
+    notify("success", "Cleared the saved work for **%s**. Other documents "
+                      "and global settings are unchanged." % name)
+    _clear_grid_widgets()
+    st.session_state.document = None
+    st.session_state.doc_bytes = None
+    st.session_state.doc_name = ""
+    st.session_state.doc_path = ""
+    st.session_state.page = 0
+    st.session_state.confirm_reset = False
+
+
+def render_reset_controls(proj: state_mod.ProjectState) -> None:
+    """Two-step reset of the active document only."""
+    if document() is None:
+        st.session_state.confirm_reset = False
+    if not st.session_state.get("confirm_reset"):
+        if st.button("Reset active document", width='stretch',
+                     disabled=document() is None,
+                     help="Clear the saved work of the open document only. "
+                          "Asks for confirmation."):
+            st.session_state.confirm_reset = True
+            st.rerun()
+        return
+    st.warning("Clear all saved work (translations, comments, corrections, "
+               "analysis) for **%s**? Other documents and global settings are "
+               "kept." % (st.session_state.doc_name or proj.source_file))
+    confirm_col, cancel_col = st.columns(2)
+    if confirm_col.button("Confirm reset", width='stretch', type="primary"):
+        reset_active_document()
+        st.rerun()
+    if cancel_col.button("Cancel", width='stretch'):
+        st.session_state.confirm_reset = False
+        st.rerun()
+
+
 def reapply_filter() -> None:
     if st.session_state.doc_bytes:
-        load_document(st.session_state.doc_bytes, st.session_state.doc_name)
+        load_document(st.session_state.doc_bytes, st.session_state.doc_name,
+                      st.session_state.get("doc_path", ""))
 
 
 def segments_by_key() -> Dict[str, mqxliff.Segment]:
@@ -603,12 +714,22 @@ def render_sidebar() -> None:
         # -- Document ------------------------------------------------------
         st.header("2. Document")
         upload = st.file_uploader("memoQ bilingual XLIFF", type=["mqxliff", "xliff", "xlf", "xml"])
-        if upload is not None and upload.name != st.session_state.doc_name:
-            try:
-                load_document(upload.getvalue(), upload.name)
-                st.rerun()
-            except mqxliff.MqxliffError as exc:
-                st.error(str(exc))
+        if upload is None:
+            # Emptying the uploader re-arms it, so the same file can be
+            # uploaded again deliberately (e.g. after a reset).
+            st.session_state.upload_marker = None
+        else:
+            data = upload.getvalue()
+            marker = upload_marker(upload.name, data)
+            if upload_needs_load(marker, st.session_state.get("upload_marker")):
+                # Recorded before loading, so a failing file is not retried on
+                # every rerun; re-uploading a fixed file loads it.
+                st.session_state.upload_marker = marker
+                try:
+                    load_document(data, upload.name, "")
+                    st.rerun()
+                except (mqxliff.MqxliffError, OSError) as exc:
+                    st.error(str(exc))
 
         # Typing a path beats the upload dialog when the file is already on
         # this machine, which for a local VM tool is the normal case.
@@ -624,7 +745,9 @@ def render_sidebar() -> None:
             else:
                 try:
                     with open(candidate, "rb") as handle:
-                        load_document(handle.read(), os.path.basename(candidate))
+                        raw = handle.read()
+                    load_document(raw, os.path.basename(candidate),
+                                  os.path.abspath(candidate))
                 except (OSError, mqxliff.MqxliffError) as exc:
                     notify("error", str(exc))
             st.rerun()
@@ -726,14 +849,12 @@ def render_sidebar() -> None:
                 {"segments": totals["segments"], "batches": totals["batches"],
                  "applied": totals["applied"], "corrections": totals["corrections"]}
             )
-            if st.button("Reset project state", width='stretch'):
-                st.session_state.project = state_mod.ProjectState(STATE_PATH)
-                st.session_state.project.save()
-                st.session_state.document = None
-                st.session_state.doc_bytes = None
-                st.session_state.doc_name = ""
-                notify("success", "Project state cleared.")
-                st.rerun()
+            if state_mod.LEGACY_DOCUMENT_ID in proj.document_ids and \
+                    proj.document_id != state_mod.LEGACY_DOCUMENT_ID:
+                st.caption(":orange[Earlier work saved before per-document "
+                           "storage is retained in state.json; reopening it "
+                           "needs a recovery flow that is not available yet.]")
+            render_reset_controls(proj)
 
 
 # -------------------------------------------------------------- left panel

@@ -516,8 +516,10 @@ class AppTestCase(unittest.TestCase):
         self.assertEqual(app.exception, [], [str(e) for e in app.exception])
 
         # 2. The revision reached the sandboxed state file on disk.
+        # v5 layout: the record lives under the active document's entry.
         with open(self.state_path, "r", encoding="utf-8") as handle:
-            saved = json.load(handle)["segments"][target.key]
+            raw = json.load(handle)
+        saved = raw["documents"][raw["active_document"]]["segments"][target.key]
         self.assertEqual(saved["user_final"], manual)
         self.assertTrue(saved["edited_by_human"])
 
@@ -923,10 +925,412 @@ class AppTestCase(unittest.TestCase):
         self.assertTrue(any("shorter sentences" in m.value for m in app.markdown))
 
     def test_reset_clears_the_project(self):
+        # Reset is now scoped to the active document and needs confirmation.
         app = self.load_doc(self.run_app())
-        self.button(app.sidebar, "Reset project state").click().run()
+        self.button(app.sidebar, "Reset active document").click().run()
+        self.button(app.sidebar, "Confirm reset").click().run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
         self.assertIsNone(app.session_state.document)
         self.assertEqual(len(app.session_state.project.segments), 0)
+
+    # -------------------------------------------------- document switching
+
+    @staticmethod
+    def _write_mqxliff(path: str, original: str, rows) -> str:
+        """Write a minimal synthetic MQXLIFF for document-switching tests.
+
+        Rows are (unit_id, source, target) tuples; every row is NotStarted and
+        unlocked, so it is translatable under the default filter. Text and
+        attribute values are XML-escaped. The file is written UTF-8 under the
+        test's own temporary storage.
+        """
+        from xml.sax.saxutils import escape  # noqa: PLC0415
+
+        def attr(value: str) -> str:
+            return escape(value, {'"': "&quot;"})
+
+        units = "\n".join(
+            '      <trans-unit id="%s" mq:status="NotStarted" '
+            'mq:locked="false">\n'
+            '        <source>%s</source>\n'
+            '        <target>%s</target>\n'
+            '      </trans-unit>' % (attr(unit_id), escape(source), escape(target))
+            for (unit_id, source, target) in rows)
+        xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<xliff version="1.2" xmlns="urn:oasis:names:tc:xliff:document:1.2" '
+            'xmlns:mq="http://www.memoq.com/memoq/xliff">\n'
+            '  <file original="%s" source-language="en-US" '
+            'target-language="de-DE" datatype="x-docx">\n'
+            "    <header>\n      <mq:hiddentexts />\n    </header>\n"
+            "    <body>\n%s\n    </body>\n  </file>\n</xliff>\n"
+            % (attr(original), units))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(xml)
+        return path
+
+    def load_path(self, app: AppTest, path: str) -> AppTest:
+        """Load a document from an arbitrary path via the sidebar loader.
+
+        Unlike :meth:`load_doc` it does not touch project state first, so a
+        document switch is driven purely by the real UI path.
+        """
+        app.sidebar.text_input(key="disk_path").set_value(path).run()
+        self.button(app.sidebar, "Load").click().run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        self.assertIsNotNone(app.session_state.document)
+        return app
+
+    def _apply_edit(self, app: AppTest, key: str, text: str, comment: str) -> None:
+        """Type a translation and a comment into a row, then Apply."""
+        self.row_text(app, key).set_value(text).run()
+        app.text_area(key="note_%s" % key).set_value(comment).run()
+        self.button(app, "Apply Changes & Calculate Diffs").click().run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+
+    def _check_row(self, app: AppTest, phase: str, key: str, user_final: str,
+                   user_comment: str, edited: bool) -> None:
+        """Assert a row's saved record and both of its widgets, field by field.
+
+        Each field is its own subTest so one failure does not hide the rest.
+        The editor and note widgets seed from user_final / user_comment.
+        """
+        record = app.session_state.project.segments.get(key)
+        with self.subTest(phase=phase, field="record-present"):
+            self.assertIsNotNone(record)
+        if record is not None:
+            with self.subTest(phase=phase, field="user_final"):
+                self.assertEqual(record.user_final, user_final)
+            with self.subTest(phase=phase, field="user_comment"):
+                self.assertEqual(record.user_comment, user_comment)
+            with self.subTest(phase=phase, field="edited_by_human"):
+                self.assertEqual(record.edited_by_human, edited)
+        with self.subTest(phase=phase, field="editor"):
+            self.assertEqual(self.row_text(app, key).value, user_final)
+        with self.subTest(phase=phase, field="note-widget"):
+            self.assertEqual(app.text_area(key="note_%s" % key).value,
+                             user_comment)
+
+    def _check_loaded(self, app: AppTest, phase: str, source_file: str,
+                      expected: dict) -> None:
+        """Prove which document is loaded, independently of the edited row.
+
+        ``expected`` maps segment key -> (source_text, mt_target).
+        """
+        proj = app.session_state.project
+        with self.subTest(phase=phase, field="source_file"):
+            self.assertEqual(proj.source_file, source_file)
+        for seg_key, (source_text, mt_target) in expected.items():
+            record = proj.segments.get(seg_key)
+            with self.subTest(phase=phase, field="source_text", key=seg_key):
+                self.assertIsNotNone(record)
+                self.assertEqual(record.source_text, source_text)
+            with self.subTest(phase=phase, field="mt_target", key=seg_key):
+                self.assertIsNotNone(record)
+                self.assertEqual(record.mt_target, mt_target)
+
+    def test_document_switch_does_not_leak_and_reopen(self):
+        """Switching A -> B -> A must isolate B from A and restore A's work.
+
+        A is the sandbox copy of the shipped fixture; B is a distinct document
+        under a different basename whose keys deliberately overlap A's. This is
+        a document-switch UI test, not a separate-process restart.
+        """
+        a_manual = "A-MANUAL-1"
+        a_comment = "A-Kommentar-1"
+        a_path = os.path.join(self.app_dir, "tests", "fixtures", "sample.mqxliff")
+        self.assertTrue(os.path.isfile(a_path), a_path)
+        b_rows = [("1", "Other document first row.", "Other target one."),
+                  ("2", "Other document second row.", "Other target two.")]
+        b_path = self._write_mqxliff(
+            os.path.join(self.tmp, "other.mqxliff"), "other.docx", b_rows)
+        b_expected = {"1#0": (b_rows[0][1], b_rows[0][2]),
+                      "2#1": (b_rows[1][1], b_rows[1][2])}
+        key = "1#0"
+
+        # 1-3. Load A, apply a distinctive edit, confirm it is saved.
+        app = self.run_app()
+        app.session_state.project.batch_size = 4
+        self.load_path(app, a_path)
+        a_source = app.session_state.project.segments[key].source_text
+        a_mt = app.session_state.project.segments[key].mt_target
+        self._apply_edit(app, key, a_manual, a_comment)
+        self._check_row(app, "A-saved", key, a_manual, a_comment, True)
+
+        # 4-5. Load a distinct B; prove it is B, and that it inherits nothing:
+        # an untouched row's editor and note widgets are empty.
+        self.load_path(app, b_path)
+        self._check_loaded(app, "B-loaded", "other.mqxliff", b_expected)
+        self._check_row(app, "B-isolation", key, "", "", False)
+
+        # 6-7. Reload A; its saved work must return in state and both widgets.
+        self.load_path(app, a_path)
+        self._check_loaded(app, "A-reloaded", "sample.mqxliff",
+                           {key: (a_source, a_mt)})
+        self._check_row(app, "A-restored", key, a_manual, a_comment, True)
+
+    def test_same_basename_documents_do_not_share_saved_edits(self):
+        """Two distinct documents that share a basename must not share edits.
+
+        The shared segment keeps the same key AND source text across A and B so
+        the source-change reset cannot mask the filename-identity hazard; the
+        target text and a second segment differ to keep the documents distinct.
+        Returning to A must then restore A's own work.
+        """
+        a_manual = "A-MANUAL-2"
+        a_comment = "A-Kommentar-2"
+        shared_source = "Shared source row."
+        a_path = os.path.join(self.tmp, "dir_a", "document.mqxliff")
+        b_path = os.path.join(self.tmp, "dir_b", "document.mqxliff")
+        self._write_mqxliff(a_path, "a.docx",
+                            [("1", shared_source, "A-shared-target."),
+                             ("2", "A-only source row.", "A-only-target.")])
+        self._write_mqxliff(b_path, "b.docx",
+                            [("1", shared_source, "B-shared-target."),
+                             ("2", "B-only source row.", "B-only-target.")])
+        a_expected = {"1#0": (shared_source, "A-shared-target."),
+                      "2#1": ("A-only source row.", "A-only-target.")}
+        b_expected = {"1#0": (shared_source, "B-shared-target."),
+                      "2#1": ("B-only source row.", "B-only-target.")}
+        key = "1#0"
+
+        # 1-3. Load A, apply a distinctive edit, confirm it is saved.
+        app = self.run_app()
+        app.session_state.project.batch_size = 4
+        self.load_path(app, a_path)
+        self._check_loaded(app, "A-loaded", "document.mqxliff", a_expected)
+        self._apply_edit(app, key, a_manual, a_comment)
+        self._check_row(app, "A-saved", key, a_manual, a_comment, True)
+
+        # 4-5. Load B from a different full path but the SAME basename; prove
+        # it is B independently of the shared key's saved work.
+        self.load_path(app, b_path)
+        self._check_loaded(app, "B-loaded", "document.mqxliff", b_expected)
+
+        # 6-7. B must not inherit A's edits in state or in either widget.
+        self._check_row(app, "B-isolation", key, "", "", False)
+
+        # 8-9. Return to A; A's own work must be restored.
+        self.load_path(app, a_path)
+        self._check_loaded(app, "A-reloaded", "document.mqxliff", a_expected)
+        self._check_row(app, "A-restored", key, a_manual, a_comment, True)
+
+    # --------------------------------------- multi-document integration
+
+    KEY = "1#0"
+
+    def _sandbox_a(self) -> str:
+        path = os.path.join(self.app_dir, "tests", "fixtures", "sample.mqxliff")
+        self.assertTrue(os.path.isfile(path), path)
+        return path
+
+    def _other_b(self) -> str:
+        return self._write_mqxliff(
+            os.path.join(self.tmp, "other.mqxliff"), "other.docx",
+            [("1", "Other document first row.", "Other target one."),
+             ("2", "Other document second row.", "Other target two.")])
+
+    @staticmethod
+    def _fingerprint(path: str) -> str:
+        from memoq_harness import mqxliff  # noqa: PLC0415
+        return mqxliff.MqxliffDocument.from_path(path).source_fingerprint()
+
+    def _raw_state(self) -> dict:
+        with open(self.state_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def _a_and_b_with_work(self):
+        """A and B both edited and applied; B is left active."""
+        a_path, b_path = self._sandbox_a(), self._other_b()
+        app = self.run_app()
+        app.session_state.project.batch_size = 4
+        self.load_path(app, a_path)
+        self._apply_edit(app, self.KEY, "A-MANUAL", "A-note")
+        self.load_path(app, b_path)
+        self._apply_edit(app, self.KEY, "B-MANUAL", "B-note")
+        self._check_row(app, "B-saved", self.KEY, "B-MANUAL", "B-note", True)
+        return app, a_path, b_path
+
+    def test_new_session_keeps_b_active_and_reload_restores_a(self):
+        """A -> B -> fresh AppTest session (not a real process restart)."""
+        _, a_path, b_path = self._a_and_b_with_work()
+        fresh = self.run_app()
+        proj = fresh.session_state.project
+        self.assertIsNone(fresh.session_state.document)
+        with self.subTest(field="active-document"):
+            self.assertEqual(proj.document_id, self._fingerprint(b_path))
+        with self.subTest(field="active-source-file"):
+            self.assertEqual(proj.source_file, "other.mqxliff")
+        with self.subTest(field="active-b-work"):
+            self.assertEqual(proj.segments[self.KEY].user_final, "B-MANUAL")
+
+        self.load_path(fresh, a_path)
+        self._check_row(fresh, "A-after-new-session", self.KEY,
+                        "A-MANUAL", "A-note", True)
+        with self.subTest(field="disk-path-kept"):
+            self.assertEqual(fresh.session_state.project.source_path,
+                             os.path.abspath(a_path))
+        self.load_path(fresh, b_path)
+        self._check_row(fresh, "B-after-new-session", self.KEY,
+                        "B-MANUAL", "B-note", True)
+
+    def test_renamed_document_restores_its_state(self):
+        a_path = self._sandbox_a()
+        app = self.run_app()
+        app.session_state.project.batch_size = 4
+        self.load_path(app, a_path)
+        self._apply_edit(app, self.KEY, "A-MANUAL", "A-note")
+        renamed = os.path.join(self.tmp, "moved", "renamed.mqxliff")
+        os.makedirs(os.path.dirname(renamed))
+        shutil.copyfile(a_path, renamed)
+
+        self.load_path(app, renamed)
+        proj = app.session_state.project
+        self.assertEqual(proj.source_file, "renamed.mqxliff")
+        self.assertEqual(proj.source_path, os.path.abspath(renamed))
+        self.assertEqual(proj.document_id, self._fingerprint(a_path))
+        self.assertEqual(proj.document_ids, [proj.document_id])
+        self._check_row(app, "renamed", self.KEY, "A-MANUAL", "A-note", True)
+
+    def test_reset_active_document_keeps_other_documents_and_globals(self):
+        app, a_path, b_path = self._a_and_b_with_work()
+        app.session_state.project.vibe = "GLOBAL-VIBE"
+        self.load_path(app, a_path)
+        self._check_row(app, "A-before-reset", self.KEY, "A-MANUAL", "A-note", True)
+
+        self.button(app.sidebar, "Reset active document").click().run()
+        self.button(app.sidebar, "Confirm reset").click().run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        self.assertIsNone(app.session_state.document)
+        self.assertEqual(app.session_state.project.segments, {})
+
+        raw = self._raw_state()
+        fp_a, fp_b = self._fingerprint(a_path), self._fingerprint(b_path)
+        with self.subTest(field="a-cleared"):
+            self.assertEqual(raw["documents"][fp_a]["segments"], {})
+            self.assertEqual(raw["documents"][fp_a]["corrections"], [])
+        with self.subTest(field="b-kept"):
+            self.assertEqual(
+                raw["documents"][fp_b]["segments"][self.KEY]["user_final"], "B-MANUAL")
+        with self.subTest(field="global-kept"):
+            self.assertEqual(raw["vibe"], "GLOBAL-VIBE")
+
+        fresh = self.run_app()
+        self.load_path(fresh, b_path)
+        self._check_row(fresh, "B-after-reset", self.KEY, "B-MANUAL", "B-note", True)
+
+    def test_cancel_reset_changes_nothing(self):
+        app = self.run_app()
+        app.session_state.project.batch_size = 4
+        self.load_path(app, self._sandbox_a())
+        self._apply_edit(app, self.KEY, "A-MANUAL", "A-note")
+        with open(self.state_path, "rb") as handle:
+            before = handle.read()
+
+        self.button(app.sidebar, "Reset active document").click().run()
+        self.button(app.sidebar, "Cancel").click().run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        self.assertIsNotNone(app.session_state.document)
+        self._check_row(app, "after-cancel", self.KEY, "A-MANUAL", "A-note", True)
+        with open(self.state_path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        self.assertFalse(self.button(app.sidebar, "Reset active document").disabled)
+
+    def test_confirmed_reset_does_not_reload_and_allows_reopening(self):
+        app = self.run_app()
+        app.session_state.project.batch_size = 4
+        self.load_path(app, self._sandbox_a())
+        self._apply_edit(app, self.KEY, "A-MANUAL", "A-note")
+        self.button(app.sidebar, "Reset active document").click().run()
+        self.button(app.sidebar, "Confirm reset").click().run()
+        app.run()
+        app.run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        self.assertIsNone(app.session_state.document)
+        self.assertEqual(app.session_state.project.segments, {})
+        self.assertTrue(self.button(app.sidebar, "Reset active document").disabled)
+
+        # Deliberately reopening the same file works and starts clean.
+        self.button(app.sidebar, "Load").click().run()
+        self.assertIsNotNone(app.session_state.document)
+        self._check_row(app, "reopened", self.KEY, "", "", False)
+
+    def test_failed_reset_save_keeps_active_work_and_editor(self):
+        app = self.run_app()
+        app.session_state.project.batch_size = 4
+        self.load_path(app, self._sandbox_a())
+        self._apply_edit(app, self.KEY, "A-MANUAL", "A-note")
+        with open(self.state_path, "rb") as handle:
+            before = handle.read()
+        self.button(app.sidebar, "Reset active document").click().run()
+
+        original = state_mod.ProjectState.save
+
+        def failing_save(proj):
+            raise OSError("simulated: disk not writable")
+
+        state_mod.ProjectState.save = failing_save
+        try:
+            self.button(app.sidebar, "Confirm reset").click().run()
+        finally:
+            state_mod.ProjectState.save = original
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        self.assertIsNotNone(app.session_state.document)
+        self._check_row(app, "after-failed-reset", self.KEY, "A-MANUAL", "A-note", True)
+        self.assertTrue(any("simulated: disk not writable" in e.value for e in app.error),
+                        [e.value for e in app.error])
+        self.assertFalse(any("Cleared" in s.value for s in app.success))
+        with open(self.state_path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_legacy_work_is_retained_not_attached_and_warned(self):
+        legacy = {
+            "version": 4, "source_file": "sample.mqxliff", "order": ["1#0"],
+            "segments": {"1#0": {
+                "key": "1#0", "segment_id": "1", "ordinal": 0, "batch_index": 0,
+                "source_text": "x", "user_final": "LEGACY-WORK",
+                "edited_by_human": True}},
+        }
+        with open(self.state_path, "w", encoding="utf-8") as handle:
+            json.dump(legacy, handle)
+        app = self.run_app()
+        app.session_state.project.batch_size = 4
+        self.load_path(app, self._sandbox_a())
+        self._check_row(app, "not-attached", self.KEY, "", "", False)
+        self.assertTrue(any("NOT attached" in w.value for w in app.warning),
+                        [w.value for w in app.warning])
+        raw = self._raw_state()
+        self.assertEqual(
+            raw["documents"]["legacy"]["segments"]["1#0"]["user_final"], "LEGACY-WORK")
+        self.assertTrue(os.path.exists(self.state_path + ".v4.bak"))
+
+    def test_upload_change_detection_helper(self):
+        """Unit test of the uploader's change detection, NOT end-to-end
+        uploader coverage: AppTest cannot drive st.file_uploader."""
+        import importlib.util  # noqa: PLC0415
+        spec = importlib.util.spec_from_file_location("harness_app_ut", self.app_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        marker, needs = module.upload_marker, module.upload_needs_load
+
+        one = self._write_mqxliff(os.path.join(self.tmp, "u1", "doc.mqxliff"),
+                                  "d.docx", [("1", "Same source.", "Target one.")])
+        two = self._write_mqxliff(os.path.join(self.tmp, "u2", "doc.mqxliff"),
+                                  "d.docx", [("1", "Same source.", "Target two.")])
+        # Target-only change: same fingerprint, still a new upload to load.
+        self.assertEqual(self._fingerprint(one), self._fingerprint(two))
+        with open(one, "rb") as h1, open(two, "rb") as h2:
+            data_one, data_two = h1.read(), h2.read()
+        m1 = marker("doc.mqxliff", data_one)
+        m2 = marker("doc.mqxliff", data_two)
+        self.assertNotEqual(m1, m2)  # same basename, different files
+        self.assertEqual(m1, marker("doc.mqxliff", data_one))
+        self.assertNotEqual(marker("a.mqxliff", b"x"), marker("b.mqxliff", b"x"))
+        self.assertTrue(needs(m1, None))
+        self.assertFalse(needs(m1, m1))      # a plain rerun does not reload
+        self.assertTrue(needs(m2, m1))
+        self.assertFalse(needs(None, m1))    # empty uploader loads nothing
 
 
 if __name__ == "__main__":

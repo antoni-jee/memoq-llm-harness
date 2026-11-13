@@ -61,16 +61,14 @@ Reuse the existing Streamlit app and Python modules. Do not rewrite.
   confirmed here. Verify against current code.
 
 ## 4. Persistence already implemented
-memoq_harness/state.py already provides:
-- a state schema version;
-- migration logic;
-- saving through a sibling .tmp file and os.replace;
-- a .corrupt copy on JSON load failure.
-These guarantees must be preserved when state.py changes.
+memoq_harness/state.py provides: schema version (now 5) with migrations;
+saving via a sibling .tmp file and os.replace; a .corrupt copy on JSON load
+failure; multi-document storage (§6.3). Preserve these when changing it.
 
 ## 5. Remaining stateful requirements
+Document isolation/restoration is implemented (uncommitted, §6.3).
 Still open; not confirmed implemented:
-- document isolation;
+- legacy/unbound work recovery UI;
 - original-document persistence;
 - revisions;
 - durable job/chunk checkpoints;
@@ -81,27 +79,33 @@ Unknowns: which of these are partially present are not confirmed here.
 
 ## 6. Findings
 ### 6.1 Reproduced and fixed (commit c0ffe3a, branch experiment/local-qwen)
-- capture_edits() stored user_final without setting edited_by_human, so a manual
-  edit captured without Apply was overwritten by a later record_suggestions()
-  (Retry / Process Current Batch). Before the fix THREE of the four new
-  regression tests failed; the comment-only state test passed even before. It
-  is a reproduced result, NOT an unreproduced hypothesis.
-- Fix in memoq_harness/state.py: capture_edits() now sets edited_by_human=True
-  when a captured, non-empty revision differs from the baseline (llm_suggestion,
-  else mt_target), mirroring calculate_diffs(); the flag is only ever set True.
-  Committed as c0ffe3a "fix: preserve unapplied human edits during
-  regeneration"; not pushed.
-- Human-run verification: all 6 targeted tests passed; assertions were then
-  strengthened; full tests/test_core.py passed (185 tests). A full
-  tests/test_app.py run exposed test-isolation errors (two existing retry tests
-  deleted LLMClient.translate_one in cleanup); they now restore the original.
-  The human reports subsequent verification passed. The full repository suite
-  was NOT run.
+- capture_edits() stored user_final without setting edited_by_human, so an
+  unapplied manual edit was overwritten by Retry / Process Current Batch
+  (3 of 4 regression tests failed before the fix). capture_edits() now sets
+  the flag when a non-empty revision differs from the baseline. Commit
+  c0ffe3a; later 5c3a918 preserved saved edits across filter changes.
 - Empty-text and automatic flag-reset semantics remain outside this fix.
-- Both UI button paths already call capture_grid before inference, so the fix
-  lands in state.py; app.py was not changed.
-- .claude/settings.local.json (notification hooks; notifier behavior not
-  inspected) remains modified and is NOT part of c0ffe3a.
+### 6.3 Document isolation and restoration (uncommitted on top of 5c3a918)
+- Reproduced: A -> B -> A lost A's work (different basename); a distinct
+  same-basename B inherited A's work. Two UI regressions: 10 failures before.
+- Identity: mqxliff source_fingerprint() v2 = SHA-256 of per-<file> language
+  pairs and, per trans-unit, id, global ordinal, and separately canonicalized
+  <source> and <seg-source> (absent=null, empty=[]). Prefixes, attribute
+  order, comments/PIs, targets, statuses, filter, tag mode, name, path excluded.
+- Fingerprint limits: identical source XML with different translations shares
+  state; any source XML change (incl. segmentation markup) is a new document;
+  no revision matching. parse_segments still uses `seg-source or source`.
+- state.json v5: global settings top-level; per-document snapshots keyed by
+  fingerprint; active_document; unbound_document. switch_document(), explicit
+  empty order kept, unknown nested fields preserved per object.
+- Legacy (<v5) file -> active "legacy" entry plus verbatim legacy_original;
+  never auto-attached; byte-for-byte .vN.bak before first overwrite; backup
+  failure blocks the overwrite.
+- app.py: load = parse + fingerprint, then switch/bind/save; uploads detected
+  by name+bytes hash; "Reset active document" with confirmation, transactional
+  (failed save restores work, keeps editor).
+- Not implemented: legacy/unbound recovery UI (only a warning). Other save()
+  handlers do not catch backup failures. Upload is helper-tested only.
 ### 6.2 Still static review (NOT reproduced)
 - capture-before-regeneration is covered for the two tested UI paths; other
   paths are not confirmed.

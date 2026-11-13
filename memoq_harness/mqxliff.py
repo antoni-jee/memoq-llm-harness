@@ -15,6 +15,8 @@ through untouched.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -186,6 +188,99 @@ class MqxliffDocument:
                 units.append(elem)
         return units
 
+    # ----------------------------------------------------------- fingerprint
+
+    def source_fingerprint(self) -> str:
+        """SHA-256 hex digest of the document's source-XML-content identity.
+
+        This identifies *source XML content*, not a project or a file, and it
+        does not promise identity across every memoQ re-export. Two files with
+        the same per-file language pairs and the same ordered source XML get
+        the same fingerprint even when their translations differ; adding or
+        changing segmentation markup (``<seg-source>``/``<mrk>``) changes it
+        even when the visible source text is unchanged.
+
+        Payload (scheme v2), grouped by ``<file>`` in document order::
+
+            {"scheme": "memoq-harness/source-fingerprint/v2",
+             "files": [{"source_language": str|null,
+                        "target_language": str|null,
+                        "units": [UNIT, ...]}, ...],
+             "units_outside_file": [UNIT, ...]}
+
+            UNIT = {"id": str|null, "ordinal": int,
+                    "source": CONTENT|null, "seg_source": CONTENT|null}
+
+        Every trans-unit the parser collected appears exactly once: under the
+        innermost ``<file>`` containing it, or in ``units_outside_file``.
+        ``ordinal`` is the parser's global ordinal. ``source`` and
+        ``seg_source`` are canonicalized separately (first direct child of
+        that local name, as the parser looks them up); ``null`` means the
+        element is absent and ``[]`` that it exists but is empty. CONTENT is
+        text plus inline-tag structure (see :func:`_canonical_content`).
+
+        Excluded: filename and path, target content, confirmation/locking
+        status, the active segment filter and the tag-placeholder mode. Namespace
+        prefixes, attribute order, comments and processing instructions do not
+        matter because names are compared in Clark notation and attributes are
+        sorted. It reads the already-parsed tree and does not depend on
+        :meth:`parse_segments` having run.
+        """
+        files: List[dict] = []
+        owners: List[Optional[int]] = []  # owning file index per walked unit
+        walked: List[object] = []
+
+        # Pre-order walk carrying the enclosing <file> down, so no parent
+        # pointers (lxml-only) are needed. Like _collect_units() it also
+        # descends into trans-units, so both see units in the same order.
+        def walk(elem, file_index: Optional[int]) -> None:
+            for child in elem:
+                name = xc.localname(child.tag)
+                index = file_index
+                if name == "file":
+                    files.append({
+                        "source_language": child.get("source-language"),
+                        "target_language": child.get("target-language"),
+                        "units": [],
+                    })
+                    index = len(files) - 1
+                elif name == "trans-unit":
+                    walked.append(child)
+                    owners.append(file_index)
+                walk(child, index)
+
+        walk(self.root, None)
+        # Every parsed unit exactly once - never silently dropped or doubled.
+        if len(walked) != len(self._units) or any(
+                a is not b for a, b in zip(walked, self._units)):
+            raise MqxliffError(
+                "Internal error: fingerprint walk disagrees with the parsed "
+                "trans-units (%d vs %d)." % (len(walked), len(self._units)))
+
+        outside: List[dict] = []
+        for ordinal, (unit, owner) in enumerate(zip(self._units, owners)):
+            source_el = _child(unit, "source")
+            seg_el = _child(unit, "seg-source")
+            entry = {
+                "id": unit.get("id"),
+                "ordinal": ordinal,
+                # Explicit None checks: absent -> null, empty element -> [].
+                "source": (_canonical_content(source_el)
+                           if source_el is not None else None),
+                "seg_source": (_canonical_content(seg_el)
+                               if seg_el is not None else None),
+            }
+            (outside if owner is None else files[owner]["units"]).append(entry)
+
+        payload = {
+            "scheme": "memoq-harness/source-fingerprint/v2",
+            "files": files,
+            "units_outside_file": outside,
+        }
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     # --------------------------------------------------------------- parsing
 
     def parse_segments(
@@ -349,6 +444,33 @@ def _child(parent, name: str):
         if xc.localname(child.tag) == name:
             return child
     return None
+
+
+def _canonical_content(elem) -> list:
+    """Prefix- and attribute-order-independent form of an element's content.
+
+    Returns a list of nodes: a text run is a ``str``; a child element is
+    ``["e", clark_tag, [[clark_attr, value], ...sorted], children]``. Comments
+    and processing instructions are dropped (their tails are kept) and adjacent
+    text runs are merged, so they leave no trace in the result.
+    """
+    nodes: list = []
+
+    def add_text(text: Optional[str]) -> None:
+        if not text:
+            return
+        if nodes and isinstance(nodes[-1], str):
+            nodes[-1] += text
+        else:
+            nodes.append(text)
+
+    add_text(elem.text)
+    for child in elem:
+        if isinstance(child.tag, str):
+            attrs = sorted([str(k), str(v)] for k, v in child.attrib.items())
+            nodes.append(["e", child.tag, attrs, _canonical_content(child)])
+        add_text(child.tail)
+    return nodes
 
 
 def _attr_localname(elem, name: str) -> Optional[str]:
