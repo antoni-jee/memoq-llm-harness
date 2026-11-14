@@ -13,9 +13,11 @@ Revision semantics:
   snapshot) is a no-op and keeps the revision;
 * any bind that changes the selection, the bound original or the stored
   snapshot increments the revision;
-* a save (PATCH) must name ``expected_revision``; a mismatch is rejected
-  with nothing applied; an effective save increments the revision, and a
-  save that changes nothing keeps it.
+* a save (PATCH) or a suggestions submission must name
+  ``expected_revision``; it is compared first, so a mismatch - including a
+  replay of an identical earlier request - is rejected with nothing applied;
+  an effective change increments the revision, and identical content sent
+  with the current revision is a no-op that keeps it.
 
 Error messages and logs contain identifiers only - never segment text or
 credentials.
@@ -46,6 +48,9 @@ BIND_FIELDS = ("original_id", "source_file", "tag_source", "segments", "present_
 SEGMENT_FIELDS = ("key", "unit_id", "source_text", "target_text")
 PATCH_FIELDS = ("expected_revision", "segments")
 UPDATE_FIELDS = ("text", "comment")
+SUGGESTION_FIELDS = ("expected_revision", "suggestions")
+SUGGESTION_ITEM_FIELDS = ("text", "tag_report")
+MAX_TAG_REPORT_CHARS = 1000
 MAX_LISTED = 20
 MAX_SOURCE_FILE_CHARS = 255
 
@@ -82,6 +87,10 @@ class TooLarge(ServiceError):
 
 class UnknownSegment(ServiceError):
     status, code = 422, "unknown_segment"
+
+
+class InactiveSegment(ServiceError):
+    status, code = 422, "inactive_segment"
 
 
 class TagSourceMismatch(ServiceError):
@@ -261,15 +270,72 @@ def parse_bind_request(body: object) -> BindRequest:
                        present_keys=tuple(present))
 
 
+@dataclass(frozen=True)
+class Suggestion:
+    text: str
+    tag_report: str = ""
+
+
+@dataclass(frozen=True)
+class SuggestionRequest:
+    expected_revision: int
+    suggestions: Dict[str, Suggestion]
+
+
+def _expected_revision(body: dict) -> int:
+    expected = body.get("expected_revision")
+    if not isinstance(expected, int) or isinstance(expected, bool) or expected < 1:
+        raise BadRequest("'expected_revision' must be a positive integer.")
+    return expected
+
+
+def parse_suggestions_request(body: object) -> SuggestionRequest:
+    """Validate a suggestions submission completely before anything is touched.
+
+    Text must be a string that is not empty or whitespace-only (the app keeps
+    memoQ's target when the model returns nothing); accepted text is stored
+    exactly as sent, without trimming.
+    """
+    if not isinstance(body, dict):
+        raise BadRequest("The request body must be a JSON object.")
+    unknown = set(body) - set(SUGGESTION_FIELDS)
+    if unknown:
+        raise BadRequest("Unknown request field(s).", {"fields": _listed(unknown)})
+    expected = _expected_revision(body)
+    raw = body.get("suggestions")
+    if not isinstance(raw, dict) or not raw:
+        raise BadRequest("'suggestions' must be a non-empty object mapping segment keys "
+                         "to {\"text\", \"tag_report\"?}.")
+    bad, empty = [], []
+    for key, item in raw.items():
+        if (not isinstance(item, dict) or "text" not in item
+                or set(item) - set(SUGGESTION_ITEM_FIELDS)
+                or not all(isinstance(v, str) for v in item.values())
+                or len(item.get("tag_report", "")) > MAX_TAG_REPORT_CHARS):
+            bad.append(key)
+        elif not item["text"].strip():
+            empty.append(key)
+    if bad:
+        raise BadRequest("Each suggestion must be an object with a string 'text' and an "
+                         "optional string 'tag_report' (at most %d characters)."
+                         % MAX_TAG_REPORT_CHARS, {"keys": _listed(bad)})
+    if empty:
+        raise BadRequest("Suggestion text must not be empty or whitespace-only; omit the "
+                         "segment instead.", {"keys": _listed(empty)})
+    return SuggestionRequest(
+        expected_revision=expected,
+        suggestions={k: Suggestion(text=v["text"], tag_report=v.get("tag_report", ""))
+                     for k, v in raw.items()},
+    )
+
+
 def parse_patch_request(body: object) -> PatchRequest:
     if not isinstance(body, dict):
         raise BadRequest("The request body must be a JSON object.")
     unknown = set(body) - set(PATCH_FIELDS)
     if unknown:
         raise BadRequest("Unknown request field(s).", {"fields": _listed(unknown)})
-    expected = body.get("expected_revision")
-    if not isinstance(expected, int) or isinstance(expected, bool) or expected < 1:
-        raise BadRequest("'expected_revision' must be a positive integer.")
+    expected = _expected_revision(body)
     raw = body.get("segments")
     if not isinstance(raw, dict) or not raw:
         raise BadRequest("'segments' must be a non-empty object mapping segment keys "
@@ -447,6 +513,68 @@ class WorkspaceService:
                  document_id[:12], stored.revision, len(changed))
         return {"document_id": document_id, "revision": stored.revision,
                 "updated_keys": changed, "changed": wrote}
+
+    # ----------------------------------------------------------- suggestions
+
+    def record_suggestions(self, document_id: str,
+                           request: SuggestionRequest) -> Dict[str, object]:
+        """Store externally produced suggestions with the app's own rule.
+
+        ``ProjectState.record_suggestions`` sets ``llm_suggestion``,
+        ``tag_report`` and ``status="processed"`` and copies the suggestion
+        into ``user_final`` unless ``edited_by_human`` protects the row. The
+        response names which rows were prefilled and which were protected.
+        """
+        require_id(document_id)
+
+        def decide(current: Optional[WorkspaceRow]) -> Decision:
+            if current is None:
+                raise NotFound("Unknown workspace; bind the document first.")
+            state = _state_from_row(current)
+            # Revision first: a replay of an old request is stale even if its
+            # content would change nothing.
+            if current.revision != request.expected_revision:
+                raise StaleRevision(
+                    "The workspace changed since it was read; reload and retry.",
+                    {"expected_revision": request.expected_revision,
+                     "current_revision": current.revision})
+            keys = list(request.suggestions)
+            unknown = [k for k in keys if k not in state.segments]
+            if unknown:
+                raise UnknownSegment("Suggestions name segment keys this workspace does not "
+                                     "have.", {"keys": _listed(unknown), "count": len(unknown)})
+            active = set(state.order)
+            inactive = [k for k in keys if k not in active]
+            if inactive:
+                raise InactiveSegment(
+                    "Suggestions name segments outside the active selection.",
+                    {"keys": _listed(inactive), "count": len(inactive)})
+
+            protected = sorted(k for k in keys if state.segments[k].edited_by_human)
+            prefilled = sorted(k for k in keys if not state.segments[k].edited_by_human)
+            before = _comparable(state.document_snapshot())
+            state.record_suggestions(
+                {k: s.text for k, s in request.suggestions.items()},
+                {k: s.tag_report for k, s in request.suggestions.items()})
+            payload = {"recorded_keys": sorted(keys), "prefilled_keys": prefilled,
+                       "protected_keys": protected}
+            if _comparable(state.document_snapshot()) == before:
+                return None, payload  # identical content at the current revision: no-op
+            state.updated_at = _now()
+            row = WorkspaceRow(
+                document_id=document_id, snapshot=state.document_snapshot(),
+                state_version=SUPPORTED_STATE_VERSION, revision=current.revision + 1,
+                tag_source=current.tag_source, bound_original_id=current.bound_original_id)
+            return row, payload
+
+        stored, payload, wrote = self._transact(document_id, decide)
+        log.info("suggestions: document %s revision %d (%d recorded, %d prefilled, "
+                 "%d protected, %s)", document_id[:12], stored.revision,
+                 len(payload["recorded_keys"]), len(payload["prefilled_keys"]),
+                 len(payload["protected_keys"]), "changed" if wrote else "no change")
+        result = {"document_id": document_id, "revision": stored.revision, "changed": wrote}
+        result.update(payload)
+        return result
 
     # ------------------------------------------------------------------ read
 

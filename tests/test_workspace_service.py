@@ -407,6 +407,198 @@ class TestSave(WorkspaceTestCase):
         self.assertEqual(response.status_code, 413)
 
 
+class TestSuggestions(WorkspaceTestCase):
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(self.bind().status_code, 201)
+
+    def suggest(self, suggestions, expected_revision=None, document_id=DOC_A):
+        if expected_revision is None:
+            expected_revision = self.get(document_id).json()["revision"]
+        return self.client.post("/workspaces/%s/suggestions" % document_id,
+                                json={"expected_revision": expected_revision,
+                                      "suggestions": suggestions})
+
+    def test_unprotected_rows_are_prefilled_protected_rows_keep_text(self):
+        self.patch({"1#0": {"text": "Meine Fassung"}}, 1)            # edited -> protected
+        self.patch({"2#1": {"comment": "nur Notiz"}}, 2)             # comment only
+        response = self.suggest({
+            "1#0": {"text": "Modell eins"},
+            "2#1": {"text": "Modell zwei"},
+            "12#11": {"text": "Modell drei", "tag_report": "missing 2"},
+        }, 3)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {
+            "document_id": DOC_A, "revision": 4, "changed": True,
+            "recorded_keys": ["1#0", "12#11", "2#1"],
+            "prefilled_keys": ["12#11", "2#1"],
+            "protected_keys": ["1#0"]})
+
+        protected = self.record("1#0")
+        self.assertEqual((protected["user_final"], protected["llm_suggestion"],
+                          protected["edited_by_human"], protected["status"]),
+                         ("Meine Fassung", "Modell eins", True, "processed"))
+        comment_only = self.record("2#1")
+        self.assertEqual((comment_only["user_final"], comment_only["user_comment"],
+                          comment_only["edited_by_human"]),
+                         ("Modell zwei", "nur Notiz", False))
+        third = self.record("12#11")
+        self.assertEqual((third["user_final"], third["tag_report"], third["status"]),
+                         ("Modell drei", "missing 2", "processed"))
+        self.assertEqual(self.record("7#6")["status"], "pending")  # not named: untouched
+
+    def test_result_equals_local_project_state_record_suggestions(self):
+        self.patch({"1#0": {"text": "Meine Fassung", "comment": "c"}}, 1)
+        row = self.repo.rows[DOC_A]
+        suggestions = {"1#0": "Modell eins", "2#1": "  Modell zwei  "}
+        reports = {"1#0": "", "2#1": "unknown 9"}
+        reference = state_mod.ProjectState(os.path.join(os.sep, "never", "written.json"))
+        reference.batch_size = FIXED_BATCH_SIZE
+        reference.open_document_snapshot(DOC_A, row.snapshot)
+        reference.record_suggestions(suggestions, reports)
+
+        self.suggest({k: {"text": v, "tag_report": reports[k]} for k, v in suggestions.items()},
+                     2)
+        stored = self.repo.rows[DOC_A].snapshot
+        expected = reference.document_snapshot()
+        self.assertEqual(stored["segments"], expected["segments"])
+        self.assertEqual(stored["order"], expected["order"])
+
+    def test_accepted_text_is_stored_exactly(self):
+        text = "  Leerzeichen bleiben\nund Zeilenumbruch {1}x{2}  "
+        self.suggest({"1#0": {"text": text}}, 1)
+        record = self.record("1#0")
+        self.assertEqual(record["llm_suggestion"], text)
+        self.assertEqual(record["user_final"], text)
+
+    def test_empty_and_whitespace_text_are_rejected_atomically(self):
+        before = self.repo.rows[DOC_A]
+        for bad in ("", "   ", "\n\t "):
+            with self.subTest(text=repr(bad)):
+                response = self.suggest({"1#0": {"text": "gut"}, "2#1": {"text": bad}}, 1)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json()["details"]["keys"], ["2#1"])
+                self.assert_unchanged(before)
+
+    def test_revision_ordering(self):
+        body = {"1#0": {"text": "Modell"}}
+        first = self.suggest(body, 1)
+        self.assertEqual((first.status_code, first.json()["revision"]), (200, 2))
+        # Replay with the old revision: stale even though the content is identical.
+        replay = self.suggest(body, 1)
+        self.assertEqual(replay.status_code, 409)
+        self.assertEqual(replay.json()["error"], "stale_revision")
+        self.assertEqual(replay.json()["details"]["current_revision"], 2)
+        # Identical content with the current revision: no-op, revision kept.
+        writes = self.repo.writes
+        same = self.suggest(body, 2)
+        self.assertEqual(same.status_code, 200)
+        self.assertFalse(same.json()["changed"])
+        self.assertEqual(same.json()["revision"], 2)
+        self.assertEqual(self.repo.writes, writes)
+        # A different suggestion with the current revision increments it.
+        changed = self.suggest({"1#0": {"text": "Modell neu"}}, 2)
+        self.assertEqual((changed.json()["revision"], changed.json()["changed"]), (3, True))
+
+    def test_stale_after_edit_or_rebind(self):
+        read_revision = self.get().json()["revision"]
+        self.patch({"1#0": {"text": "Mensch"}}, read_revision)
+        before = self.repo.rows[DOC_A]
+        stale = self.suggest({"2#1": {"text": "Modell"}}, read_revision)
+        self.assertEqual(stale.status_code, 409)
+        self.assert_unchanged(before)
+
+        read_revision = self.get().json()["revision"]
+        self.bind(original_id=ORIG_2)
+        before = self.repo.rows[DOC_A]
+        self.assertEqual(self.suggest({"2#1": {"text": "Modell"}}, read_revision).status_code,
+                         409)
+        self.assert_unchanged(before)
+
+    def test_unknown_and_inactive_keys_reject_the_whole_request(self):
+        before = self.repo.rows[DOC_A]
+        unknown = self.suggest({"1#0": {"text": "ok"}, "99#99": {"text": "x"}}, 1)
+        self.assertEqual(unknown.status_code, 422)
+        self.assertEqual(unknown.json()["error"], "unknown_segment")
+        self.assertEqual(unknown.json()["details"]["keys"], ["99#99"])
+        self.assert_unchanged(before)
+
+        # 3#2 is a confirmed row: present in the document, hidden by the filter.
+        relaxed = bind_body(seg_filter=mqxliff.SegmentFilter(skip_confirmed=False))
+        self.bind(body=relaxed)
+        self.bind()  # narrow again: 3#2 kept but inactive
+        self.assertIn("3#2", self.get().json()["segments"])
+        before = self.repo.rows[DOC_A]
+        inactive = self.suggest({"1#0": {"text": "ok"}, "3#2": {"text": "x"}})
+        self.assertEqual(inactive.status_code, 422)
+        self.assertEqual(inactive.json()["error"], "inactive_segment")
+        self.assertEqual(inactive.json()["details"]["keys"], ["3#2"])
+        self.assert_unchanged(before)
+
+    def test_tag_report_is_set_and_cleared_as_record_suggestions_does(self):
+        self.suggest({"1#0": {"text": "a", "tag_report": "missing 2"}}, 1)
+        self.assertEqual(self.record("1#0")["tag_report"], "missing 2")
+        self.suggest({"1#0": {"text": "a"}}, 2)
+        self.assertEqual(self.record("1#0")["tag_report"], "")
+
+    def test_invalid_suggestion_requests(self):
+        before = self.repo.rows[DOC_A]
+        url = "/workspaces/%s/suggestions" % DOC_A
+        cases = [
+            [], {}, {"suggestions": {"1#0": {"text": "x"}}},
+            {"expected_revision": 0, "suggestions": {"1#0": {"text": "x"}}},
+            {"expected_revision": False, "suggestions": {"1#0": {"text": "x"}}},
+            {"expected_revision": 1, "suggestions": {}},
+            {"expected_revision": 1, "suggestions": ["1#0"]},
+            {"expected_revision": 1, "suggestions": {"1#0": "x"}},
+            {"expected_revision": 1, "suggestions": {"1#0": {}}},
+            {"expected_revision": 1, "suggestions": {"1#0": {"tag_report": "x"}}},
+            {"expected_revision": 1, "suggestions": {"1#0": {"text": 5}}},
+            {"expected_revision": 1, "suggestions": {"1#0": {"text": "x", "tag_report": 3}}},
+            {"expected_revision": 1, "suggestions": {"1#0": {"text": "x", "status": "applied"}}},
+            {"expected_revision": 1, "suggestions": {"1#0": {"text": "x",
+                                                            "tag_report": "r" * 1001}}},
+            {"expected_revision": 1, "suggestions": {"1#0": {"text": "x"}}, "extra": 1},
+        ]
+        for body in cases:
+            with self.subTest(body=repr(body)[:60]):
+                response = self.client.post(url, json=body)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assert_unchanged(before)
+        self.assertEqual(self.client.post(url, content=b"x",
+                                          headers={"content-type": "text/plain"}).status_code,
+                         415)
+        self.service.max_body_bytes = 100
+        self.assertEqual(self.suggest({"1#0": {"text": "x" * 500}}, 1).status_code, 413)
+        self.assert_unchanged(before)
+
+    def test_unknown_workspace_isolation_and_unsupported_version(self):
+        self.assertEqual(self.suggest({"1#0": {"text": "x"}}, 1, DOC_B).status_code, 404)
+        self.bind(DOC_B, original_id=ORIG_2)
+        self.suggest({"1#0": {"text": "Nur A"}}, 1, DOC_A)
+        self.assertEqual(self.record("1#0", DOC_B)["llm_suggestion"], "")
+        self.assertEqual(self.record("1#0", DOC_B)["user_final"], "")
+
+        row = self.repo.rows[DOC_B]
+        future = WorkspaceRow(**{**row.__dict__, "state_version": state_mod.STATE_VERSION + 1})
+        self.repo.rows[DOC_B] = future
+        response = self.suggest({"1#0": {"text": "x"}}, 1, DOC_B)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"], "unsupported_state_version")
+        self.assertIs(self.repo.rows[DOC_B], future)
+
+    def test_logs_and_errors_hold_no_suggestion_text(self):
+        with self.assertLogs("workspace-service", level="DEBUG") as logs:
+            ok = self.suggest({"1#0": {"text": SECRET_TEXT, "tag_report": SECRET_TEXT}}, 1)
+            bad = self.suggest({"1#0": {"text": SECRET_TEXT}, "zz": {"text": SECRET_TEXT}}, 2)
+            stale = self.suggest({"1#0": {"text": SECRET_TEXT}}, 1)
+            logging.getLogger("workspace-service").debug("end")
+        self.assertEqual(ok.status_code, 200)
+        for response in (ok, bad, stale):
+            self.assertNotIn(SECRET_TEXT, response.text)
+        self.assertNotIn(SECRET_TEXT, "\n".join(logs.output))
+
+
 class TestIsolationAndStorage(WorkspaceTestCase):
     def test_documents_with_identical_keys_stay_isolated(self):
         self.bind(DOC_A)

@@ -3,12 +3,14 @@
 Owns saved document work: per-segment manual translations, comments and
 human-edit flags, one workspace per document, in PostgreSQL. It reuses the
 existing `memoq_harness.state.ProjectState` logic (`bind_segments`,
-`capture_edits` and the v5 per-document snapshot) in memory for one document
-per request; the snapshot is stored as JSONB instead of `state.json`.
+`capture_edits`, `record_suggestions` and the v5 per-document snapshot) in
+memory for one document per request; the snapshot is stored as JSONB instead
+of `state.json`. It stores model suggestions supplied by the caller; it does
+not call a model.
 
-Out of this slice: model suggestions, prompt context, global settings
-(`batch_size` is fixed at 100) and the frontend, which does not call this
-service yet. The service never reads document files or calls document-service;
+Not here yet: the Apply step that turns edits into corrections
+(`calculate_diffs`), prompt context, global settings (`batch_size` is fixed
+at 100) and the frontend, which does not call this service yet. The service never reads document files or calls document-service;
 the caller supplies segment records it obtained from document-service.
 
 ## Identifiers
@@ -28,6 +30,7 @@ the caller supplies segment records it obtained from document-service.
 | `POST /workspaces/{document_id}/bind` | Open or create the workspace and merge segment records. 201 created, 200 otherwise. |
 | `GET /workspaces/{document_id}` | The saved workspace (`revision`, `order`, `segments` with every record field). 404 if unknown. |
 | `PATCH /workspaces/{document_id}/segments` | Save manual text and/or comments. |
+| `POST /workspaces/{document_id}/suggestions` | Record model suggestions; prefills rows not protected by a human edit. |
 
 Errors are JSON `{"error", "message"}` plus `details` with identifiers only.
 Messages and logs never contain segment text, the database URL or
@@ -76,15 +79,48 @@ PATCH /workspaces/{document_id}/segments
 * Unknown keys -> 422 `unknown_segment`; bad shapes -> 400; unknown
   workspace -> 404. Nothing is applied unless the whole request is valid.
 
+### Suggestions
+
+```json
+POST /workspaces/{document_id}/suggestions
+{"expected_revision": 4,
+ "suggestions": {"1#0": {"text": "...", "tag_report": "missing 2"}, "2#1": {"text": "..."}}}
+```
+
+Recorded with `ProjectState.record_suggestions`, the rule the app uses after
+Process Current Batch and Rerun. For every named segment it sets
+`llm_suggestion`, `tag_report` (the supplied text, or empty) and
+`status: "processed"`, and copies the suggestion into `user_final` unless the
+row is protected by `edited_by_human`. A row with only a comment is not
+protected: its text is prefilled and its comment kept. This slice does not
+create corrections or mark rows applied.
+
+```json
+{"document_id": "...", "revision": 5, "changed": true,
+ "recorded_keys": ["1#0", "2#1"], "prefilled_keys": ["2#1"], "protected_keys": ["1#0"]}
+```
+
+* `text` is required and must not be empty or whitespace-only (the app keeps
+  memoQ's target when the model returns nothing). Accepted text is stored
+  exactly as sent. `tag_report` is optional, computed by the caller (this
+  service has no tag data), at most 1000 characters.
+* Rejected as a whole, nothing applied: bad shapes -> 400; unknown keys ->
+  422 `unknown_segment`; keys outside the active selection (rows hidden by
+  the filter) -> 422 `inactive_segment`; stale revision -> 409.
+
 ### Revisions
 
 * A new workspace starts at revision 1.
 * A bind that changes nothing (same selection, same original, same stored
   snapshot) is a no-op and keeps the revision; any other bind increments it.
-* A save must send `expected_revision`. If the workspace has changed since,
-  it is rejected with 409 `stale_revision` (`details.current_revision`) and
-  nothing is applied; reload and retry. A save that changes nothing keeps
-  the revision; an effective save increments it.
+* A save or a suggestions submission must send `expected_revision`; it is
+  compared first. If the workspace has changed since, the request is
+  rejected with 409 `stale_revision` (`details.current_revision`) and
+  nothing is applied - this includes replaying an identical earlier request
+  with its old revision. Identical content sent with the current revision is
+  a no-op that keeps the revision; an effective change increments it.
+* A processing result computed from revision N is therefore refused if any
+  edit, comment or rebind happened after N; re-read and resubmit.
 * Every change runs in one transaction holding the workspace row lock, so
   concurrent requests serialise and a bind never overwrites a save.
 
@@ -139,8 +175,9 @@ python -m unittest -v tests.test_workspace_service_pg   # needs HARNESS_TEST_DAT
 
 The PostgreSQL tests create one schema `wstest_<random hex>` per test class
 and drop exactly that schema; they cover migrations, revisions, concurrent
-saves and binds, isolation, an unsupported stored version and a restart of
-the service process.
+saves and binds, a suggestions submission racing a save, isolation, an
+unsupported stored version and a restart of the service process with saved
+edits and suggestions.
 
 ## Limitations
 
@@ -148,4 +185,6 @@ the service process.
 * The service trusts the caller's segment records; it does not verify them
   against document-service.
 * Identical source XML shares one workspace (document-service identity rule).
-* No suggestions, corrections, prompt context or export selection yet.
+* No Apply/corrections step, prompt context or export selection yet.
+* Suggestions for rows changed since `expected_revision` are refused as a
+  whole; there is no per-row merge.

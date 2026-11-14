@@ -39,7 +39,7 @@ from services.workspace_service.repository import (  # noqa: E402
 )
 from services.workspace_service.service import (  # noqa: E402
     StaleRevision, UnsupportedStateVersion, WorkspaceService, parse_bind_request,
-    parse_patch_request,
+    parse_patch_request, parse_suggestions_request,
 )
 from tests.test_workspace_service import DOC_A, DOC_B, ORIG_1, ORIG_2, bind_body  # noqa: E402
 
@@ -182,6 +182,54 @@ class TestMigrationsAndConcurrency(PostgresTestCase):
                          "WHERE document_id = :d" % q, d=b)
         self.assertEqual(after, before)
 
+    def test_6_suggestions_race_a_save_with_the_same_revision(self):
+        self.migrate()
+        service = self.service()
+        document_id = "f" * 64
+        service.bind(document_id, parse_bind_request(bind_body()))
+        results, barrier = [], threading.Barrier(2)
+
+        def run(name, call):
+            barrier.wait()
+            try:
+                call()
+                results.append((name, "ok"))
+            except StaleRevision:
+                results.append((name, "stale"))
+
+        save = lambda: service.save_segments(document_id, parse_patch_request(  # noqa: E731
+            {"expected_revision": 1, "segments": {"1#0": {"text": "Mensch"}}}))
+        suggest = lambda: service.record_suggestions(  # noqa: E731
+            document_id, parse_suggestions_request(
+                {"expected_revision": 1, "suggestions": {"1#0": {"text": "Modell"}}}))
+        threads = [threading.Thread(target=run, args=("save", save)),
+                   threading.Thread(target=run, args=("suggest", suggest))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        self.assertEqual(sorted(status for _, status in results), ["ok", "stale"])
+        record = self.service().get(document_id)["segments"]["1#0"]
+        winner = dict(results)
+        if winner["save"] == "ok":
+            self.assertEqual((record["user_final"], record["llm_suggestion"]), ("Mensch", ""))
+        else:
+            self.assertEqual((record["user_final"], record["llm_suggestion"]),
+                             ("Modell", "Modell"))
+        self.assertEqual(self.service().get(document_id)["revision"], 2)
+
+    def test_7_suggestions_are_isolated_per_document(self):
+        self.migrate()
+        service = self.service()
+        a, b = "1" * 63 + "a", "1" * 63 + "b"
+        service.bind(a, parse_bind_request(bind_body()))
+        service.bind(b, parse_bind_request(bind_body(original_id=ORIG_2)))
+        service.record_suggestions(a, parse_suggestions_request(
+            {"expected_revision": 1, "suggestions": {"1#0": {"text": "Nur A"}}}))
+        self.assertEqual(service.get(a)["segments"]["1#0"]["llm_suggestion"], "Nur A")
+        self.assertEqual(service.get(b)["segments"]["1#0"]["llm_suggestion"], "")
+        self.assertEqual(service.get(b)["revision"], 1)
+
 
 class TestServiceProcess(PostgresTestCase):
     """The real service as a separate process, started outside the repo root."""
@@ -241,17 +289,34 @@ class TestServiceProcess(PostgresTestCase):
                              "2#1": {"comment": "nur Kommentar"}}})
             self.assertEqual(saved.status_code, 200, saved.text)
             self.assertEqual(saved.json()["revision"], 2)
+            suggested = requests.post(
+                base + "/workspaces/%s/suggestions" % DOC_A, timeout=30, json={
+                    "expected_revision": 2,
+                    "suggestions": {"1#0": {"text": "Modell eins"},
+                                    "2#1": {"text": "Modell zwei", "tag_report": "missing 1"}}})
+            self.assertEqual(suggested.status_code, 200, suggested.text)
+            self.assertEqual(suggested.json()["revision"], 3)
+            self.assertEqual(suggested.json()["protected_keys"], ["1#0"])
+            self.assertEqual(suggested.json()["prefilled_keys"], ["2#1"])
         finally:
             self.stop(proc)
 
         proc, base = self.start()
         try:
             workspace = requests.get(base + "/workspaces/%s" % DOC_A, timeout=30).json()
-            self.assertEqual(workspace["revision"], 2)
+            self.assertEqual(workspace["revision"], 3)
             self.assertEqual(workspace["segments"]["1#0"]["user_final"], "Nach Neustart")
             self.assertEqual(workspace["segments"]["1#0"]["user_comment"], "bleibt")
+            self.assertEqual(workspace["segments"]["1#0"]["llm_suggestion"], "Modell eins")
+            self.assertEqual(workspace["segments"]["1#0"]["status"], "processed")
             self.assertEqual(workspace["segments"]["2#1"]["user_comment"], "nur Kommentar")
-            self.assertEqual(workspace["segments"]["2#1"]["user_final"], "")
+            self.assertEqual(workspace["segments"]["2#1"]["user_final"], "Modell zwei")
+            self.assertEqual(workspace["segments"]["2#1"]["tag_report"], "missing 1")
+            replay = requests.post(
+                base + "/workspaces/%s/suggestions" % DOC_A, timeout=30, json={
+                    "expected_revision": 2,
+                    "suggestions": {"1#0": {"text": "Modell eins"}}})
+            self.assertEqual(replay.status_code, 409)
             rebind = requests.post(base + "/workspaces/%s/bind" % DOC_A, json=bind_body(),
                                    timeout=30)
             self.assertFalse(rebind.json()["changed"])

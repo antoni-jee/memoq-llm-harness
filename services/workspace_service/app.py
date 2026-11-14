@@ -7,6 +7,7 @@ Endpoints
 ``POST  /workspaces/{document_id}/bind``    open/create and merge segment records
 ``GET   /workspaces/{document_id}``         the saved workspace
 ``PATCH /workspaces/{document_id}/segments`` save manual text and/or comments
+``POST  /workspaces/{document_id}/suggestions`` record suggestions (prefills unprotected rows)
 
 Errors are JSON ``{"error": <code>, "message": <safe text>}`` plus, where
 useful, ``"details"`` with identifiers only.
@@ -28,7 +29,7 @@ from starlette.routing import Route
 from . import SERVICE_NAME
 from .service import (
     BadRequest, ServiceError, TooLarge, WorkspaceService, parse_bind_request,
-    parse_patch_request,
+    parse_patch_request, parse_suggestions_request,
 )
 
 log = logging.getLogger(SERVICE_NAME)
@@ -93,6 +94,12 @@ def create_app(service: WorkspaceService) -> Starlette:
             service.save_segments, request.path_params["document_id"], body)
         return JSONResponse(result)
 
+    async def record_suggestions(request: Request) -> Response:
+        body = parse_suggestions_request(await _read_json(request, service.max_body_bytes))
+        result = await run_in_threadpool(
+            service.record_suggestions, request.path_params["document_id"], body)
+        return JSONResponse(result)
+
     async def service_error(request: Request, exc: ServiceError) -> Response:
         if exc.status >= 500:
             log.warning("%s %s -> %d %s", request.method, request.url.path, exc.status, exc.code)
@@ -116,6 +123,7 @@ def create_app(service: WorkspaceService) -> Starlette:
         Route("/workspaces/{document_id}/bind", bind, methods=["POST"]),
         Route("/workspaces/{document_id}", get_workspace, methods=["GET"]),
         Route("/workspaces/{document_id}/segments", save_segments, methods=["PATCH"]),
+        Route("/workspaces/{document_id}/suggestions", record_suggestions, methods=["POST"]),
     ]
     handlers: Dict[object, object] = {
         ServiceError: service_error,
