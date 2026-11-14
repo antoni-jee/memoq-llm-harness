@@ -9,12 +9,15 @@ Run with:  python tests/test_app.py
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -576,6 +579,203 @@ class AppTestCase(unittest.TestCase):
         field = next(t for t in app.sidebar.text_input
                      if "Anthropic API key" in t.label)
         self.assertEqual(field.proto.type, TextInputProto.PASSWORD)
+
+    # ------------------------------------------------- model Test button
+
+    def _fake_openai_sdk(self, reply):
+        """Real LLMClient constructor and probe; only the SDK is stubbed."""
+        llm.LLMClient.__init__ = self._patches[2][2]
+        requests = []
+
+        def factory(**_kwargs):
+            def create(**request):
+                requests.append(request)
+                return reply
+            return SimpleNamespace(
+                chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+        patcher = mock.patch.object(llm, "OpenAI", factory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return requests
+
+    def _work_with_manual_edit(self):
+        app = self.load_doc(self.run_app())
+        self.button(app, "Process Current Batch").click().run()
+        key = app.session_state.project.batch_records(0)[0].key
+        self.row_text(app, key).set_value("Manuelle Fassung").run()
+        app.text_area(key="note_%s" % key).set_value("probe must keep this").run()
+        self.button(app, "Apply Changes & Calculate Diffs").click().run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        return app
+
+    def _snapshot(self, app):
+        segments = {
+            k: (s.user_final, s.user_comment, s.edited_by_human)
+            for k, s in app.session_state.project.segments.items()}
+        with open(self.state_path, "rb") as handle:
+            disk = handle.read()
+        return dataclasses.asdict(app.session_state.config), segments, disk
+
+    def _click_test(self, app):
+        self.button(app.sidebar, "Test").click().run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+
+    def test_model_test_success_preserves_work_and_config(self):
+        app = self._work_with_manual_edit()
+        requests = self._fake_openai_sdk(SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="ok"))]))
+        before = self._snapshot(app)
+
+        self._click_test(app)
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["model"], app.session_state.config.model)
+        self.assertEqual(requests[0]["messages"], [dict(m) for m in llm.PROBE_MESSAGES])
+        self.assertEqual(requests[0]["max_tokens"], llm.PROBE_MAX_TOKENS)
+        shown = " ".join(s.value for s in app.success)
+        self.assertIn("returned visible text", shown)
+        self.assertIn("not checked", shown)
+        self.assertEqual(self._snapshot(app), before)
+
+    def test_model_test_without_visible_text_is_a_warning(self):
+        app = self._work_with_manual_edit()
+        requests = self._fake_openai_sdk(SimpleNamespace(
+            model="qwen3:8b",
+            choices=[SimpleNamespace(finish_reason="length", message=SimpleNamespace(
+                content="", reasoning="hidden chain of thought"))]))
+        before = self._snapshot(app)
+
+        self._click_test(app)
+
+        self.assertEqual(len(requests), 1)
+        warned = " ".join(w.value for w in app.warning)
+        self.assertIn("inconclusive", warned)
+        self.assertIn("Server-reported model: `qwen3:8b`", warned)
+        self.assertNotIn("hidden chain", warned)
+        self.assertFalse(any("Model test" in e.value for e in app.error))
+        self.assertEqual(self._snapshot(app), before)
+
+    # ------------------------------------------- engine widgets and presets
+
+    @staticmethod
+    def _engine(app):
+        base = next(t for t in app.sidebar.text_input if t.label == "Base URL")
+        key = next(t for t in app.sidebar.text_input if "API key" in t.label)
+        model = next(s for s in app.sidebar.selectbox if s.label == "Model")
+        return base, key, model
+
+    def _assert_widgets_match_config(self, app):
+        base, key, model = self._engine(app)
+        config = app.session_state.config
+        self.assertEqual(base.value, config.base_url)
+        self.assertEqual(key.value, config.api_key)
+        self.assertEqual(model.value, config.model)
+
+    def test_provider_switch_clears_typed_key_and_resets_widgets(self):
+        app = self.run_app()
+        app.sidebar.selectbox[0].set_value("DeepSeek").run()
+        self._engine(app)[1].set_value("sk-deepseek-typed").run()
+        self.assertEqual(app.session_state.config.api_key, "sk-deepseek-typed")
+
+        # Same OpenAI-compatible protocol, different provider: key must go.
+        app.sidebar.selectbox[0].set_value("OpenRouter").run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        config = app.session_state.config
+        self.assertEqual(config.api_key, "")
+        self.assertEqual(config.base_url, llm.PRESETS["OpenRouter"].base_url)
+        self.assertEqual(config.model, llm.PRESETS["OpenRouter"].default_model)
+        self._assert_widgets_match_config(app)
+
+        app.sidebar.selectbox[0].set_value("Anthropic API").run()
+        self.assertEqual(app.session_state.config.base_url,
+                         llm.PRESETS["Anthropic API"].base_url)
+        self._assert_widgets_match_config(app)
+
+    def test_reruns_and_model_changes_keep_the_key(self):
+        app = self.run_app()
+        app.sidebar.selectbox[0].set_value("OpenAI API").run()
+        self._engine(app)[1].set_value("sk-openai-typed").run()
+        app.run()
+        self.assertEqual(app.session_state.config.api_key, "sk-openai-typed")
+        self._engine(app)[2].set_value("gpt-4o-mini").run()
+        self.assertEqual(app.session_state.config.model, "gpt-4o-mini")
+        self.assertEqual(app.session_state.config.api_key, "sk-openai-typed")
+        self._assert_widgets_match_config(app)
+
+    def test_connection_summary_is_shown_without_secrets(self):
+        app = self.run_app()
+        app.sidebar.selectbox[0].set_value("OpenAI API").run()
+        self._engine(app)[1].set_value("sk-summary-secret").run()
+        captions = " ".join(c.value for c in app.sidebar.caption)
+        self.assertIn("Endpoint: `https://api.openai.com/v1`", captions)
+        self.assertIn("Requested model: `gpt-4o`", captions)
+        self.assertIn("Credentials: sidebar key", captions)
+        self.assertNotIn("sk-summary-secret", captions)
+
+    # ---------------------------------------------------------------- retry
+
+    def _fake_translate_one(self, outcome):
+        calls = []
+
+        def translate_one(client, record, system_prompt):
+            calls.append(record.key)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome, '{"raw": true}'
+
+        patcher = mock.patch.object(llm.LLMClient, "translate_one", translate_one)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def test_retry_runs_once_and_keeps_other_row_edits(self):
+        app = self.load_doc(self.run_app())
+        self.button(app, "Process Current Batch").click().run()
+        first, second = [r.key for r in app.session_state.project.batch_records(0)[:2]]
+        self.row_text(app, second).set_value("Unapplied edit on row two").run()
+        calls = self._fake_translate_one("Neu uebersetzt")
+
+        app.button(key="retry_%s" % first).click().run()
+
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        self.assertEqual(calls, [first])
+        self.assertNotIn("pending_retry", app.session_state)
+        self.assertIn("re-translated", " ".join(s.value for s in app.success))
+        self.assertEqual(self.row_text(app, first).value, "Neu uebersetzt")
+        self.assertEqual(self.row_text(app, second).value, "Unapplied edit on row two")
+        self.assertEqual(app.session_state.project.segments[second].user_final,
+                         "Unapplied edit on row two")
+        app.run()
+        self.assertEqual(calls, [first])
+
+    def test_failed_retry_is_not_repeated_on_rerun(self):
+        app = self.load_doc(self.run_app())
+        key = app.session_state.project.batch_records(0)[0].key
+        calls = self._fake_translate_one(llm.LLMError("simulated failure"))
+
+        app.button(key="retry_%s" % key).click().run()
+        self.assertEqual(app.exception, [], [str(e) for e in app.exception])
+        self.assertEqual(calls, [key])
+        self.assertIn("Retry failed", " ".join(e.value for e in app.error))
+        self.assertNotIn("pending_retry", app.session_state)
+
+        app.run()
+        app.run()
+        self.assertEqual(calls, [key])
+
+    def test_model_test_failure_is_reported_without_side_effects(self):
+        app = self._work_with_manual_edit()
+        requests = self._fake_openai_sdk("<html>gateway page</html>")
+        before = self._snapshot(app)
+
+        self._click_test(app)
+
+        self.assertEqual(len(requests), 1)
+        shown = " ".join(e.value for e in app.error)
+        self.assertIn("Model test failed", shown)
+        self.assertIn("response format", shown)
+        self.assertEqual(self._snapshot(app), before)
 
     def test_collapse_button_hides_the_rules_panel(self):
         app = self.load_doc(self.run_app())

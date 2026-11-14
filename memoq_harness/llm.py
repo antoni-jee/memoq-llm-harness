@@ -20,21 +20,31 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from . import prompts
 from .state import Correction, SegmentRecord
 
 try:
-    from openai import OpenAI
+    from openai import OpenAI, OpenAIError
 except ImportError:  # pragma: no cover
     OpenAI = None  # type: ignore[assignment]
+    OpenAIError = None  # type: ignore[assignment]
 
 try:
     import anthropic
 except ImportError:  # pragma: no cover
     anthropic = None  # type: ignore[assignment]
+
+# Base classes of every error the two SDKs raise for transport, HTTP status and
+# response validation. The model Test probe catches exactly these - not
+# arbitrary exceptions, so programming errors still surface.
+_SDK_ERRORS: Tuple[type, ...] = tuple(
+    cls for cls in (OpenAIError, getattr(anthropic, "AnthropicError", None))
+    if isinstance(cls, type)
+)
 
 BACKEND_OPENAI = "openai"
 BACKEND_ANTHROPIC = "anthropic"
@@ -270,17 +280,8 @@ class LLMClient:
         return sorted(model.id for model in data)
 
     def ping(self) -> str:
-        """Smallest possible round trip, for the sidebar's test button."""
-        start = time.time()
-        text = self._chat(
-            [
-                {"role": "system", "content": "Reply with the single word: ok"},
-                {"role": "user", "content": "ping"},
-            ],
-            force_json=False,
-            max_tokens=16,
-        )
-        return "%s (%.0f ms)" % (text.strip()[:40] or "(empty reply)", (time.time() - start) * 1000)
+        """Kept for callers of the old name; see :func:`probe_model`."""
+        return probe_model(self.config).message()
 
     # -------------------------------------------------------------- inference
 
@@ -544,6 +545,316 @@ class LLMClient:
             last_error = LLMError("Model returned an empty response.")
 
         raise LLMError(_clean_error(last_error) if last_error else "Request failed.")
+
+
+# ------------------------------------------------------------------ probe
+
+PROBE_TIMEOUT = 30.0
+"""Upper bound, in seconds, for the sidebar Test request."""
+
+PROBE_MAX_TOKENS = 16
+"""Output budget for the Test request. Always sent; never dropped."""
+
+PROBE_PREVIEW_CHARS = 40
+
+PROBE_MESSAGES: Tuple[Dict[str, str], ...] = (
+    {"role": "system", "content": "Reply with the single word: ok"},
+    {"role": "user", "content": "ping"},
+)
+"""The fixed synthetic probe. No document text, rules or corrections."""
+
+
+PROBE_OK = "ok"
+PROBE_INCONCLUSIVE = "inconclusive"
+
+CREDENTIAL_UNDETERMINED = "SDK-managed credentials; source not determined"
+
+
+@dataclass
+class ProbeResult:
+    """What one Test probe established - and, by omission, what it did not.
+
+    Metadata fields are optional: endpoints differ in what they report, and a
+    missing field is normal. Reasoning text is only ever measured, not kept.
+    """
+
+    status: str
+    requested_model: str
+    endpoint: str
+    credential_source: str
+    elapsed_ms: float
+    preview: str = ""
+    server_model: str = ""
+    finish_reason: str = ""
+    output_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
+    reasoning_present: bool = False
+    reasoning_chars: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.status == PROBE_OK
+
+    def message(self) -> str:
+        """Markdown summary for the sidebar notice. Never contains credentials."""
+        if self.ok:
+            lines = ["Model test: the endpoint returned visible text in %.0f ms: %s"
+                     % (self.elapsed_ms, _md_code(self.preview))]
+        else:
+            lines = [
+                "Model test inconclusive: the endpoint returned a well-formed "
+                "response with no visible text within the %d-token probe "
+                "(%.0f ms). Text generation was not confirmed; this does not "
+                "mean the model is unavailable. Test does not retry."
+                % (PROBE_MAX_TOKENS, self.elapsed_ms)
+            ]
+        lines.append("Requested model: %s" % _md_code(self.requested_model))
+        lines.append("Server-reported model: %s" % (
+            _md_code(self.server_model) if self.server_model else "not reported"))
+        details = []
+        if self.finish_reason:
+            details.append("finish reason %s" % _md_code(self.finish_reason))
+        if self.output_tokens is not None:
+            details.append("%d output tokens" % self.output_tokens)
+        if self.reasoning_tokens is not None:
+            details.append("%d reasoning tokens" % self.reasoning_tokens)
+        if self.reasoning_present:
+            details.append("reasoning text present (%d chars, not shown)"
+                           % self.reasoning_chars)
+        if details:
+            lines.append("Response metadata: %s" % ", ".join(details))
+        lines.append("Endpoint: %s" % _md_code(self.endpoint))
+        lines.append("Credentials: %s" % self.credential_source)
+        if self.ok:
+            lines.append("This only shows that text came back; translation "
+                         "quality and JSON output were not checked.")
+        return "  \n".join(lines)
+
+
+def sanitize_url(url: str) -> str:
+    """Scheme, host, port and path only: no userinfo, query or fragment."""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        return "(unparseable URL)"
+    if not parts.scheme or not host:
+        return "(unparseable URL)"
+    if ":" in host:
+        host = "[%s]" % host
+    netloc = host + (":%d" % port if port else "")
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def display_endpoint(config: ClientConfig) -> str:
+    """The configured endpoint, sanitized for display."""
+    return sanitize_url(config.base_url) or "SDK default endpoint; not determined here"
+
+
+def credential_source(config: ClientConfig) -> str:
+    """Where the request's credential comes from - a label, never a value.
+
+    The OpenAI SDK is always handed a key (the placeholder when the field is
+    empty), so it never falls back to the environment. The Anthropic SDK is
+    handed ``None`` for an empty field and then resolves credentials itself:
+    ``ANTHROPIC_API_KEY`` first, then ``ANTHROPIC_AUTH_TOKEN``, then profile or
+    federation sources this harness does not inspect.
+    """
+    if config.api_key.strip():
+        return "sidebar key"
+    if not config.is_anthropic:
+        return "none - local placeholder key (sidebar key empty)"
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        if os.environ.get(name):
+            return "%s environment variable (sidebar key empty)" % name
+    return "%s (sidebar key empty)" % CREDENTIAL_UNDETERMINED
+
+
+def connection_summary(config: ClientConfig) -> str:
+    """Markdown lines shown next to the Test button."""
+    return "  \n".join((
+        "Endpoint: %s" % _md_code(display_endpoint(config)),
+        "Requested model: %s" % _md_code(config.model),
+        "Credentials: %s" % credential_source(config),
+    ))
+
+
+def probe_model(config: ClientConfig) -> ProbeResult:
+    """One bounded generation request against the selected endpoint and model.
+
+    Backs the sidebar Test button. Unlike the translation path it makes exactly
+    one request: no harness or SDK retries, no JSON-mode or ``max_tokens``
+    fallback, and a timeout of at most :data:`PROBE_TIMEOUT`. It works on a
+    private copy of ``config`` and never writes to the original.
+
+    Returns a :class:`ProbeResult` - ``ok`` for visible text, ``inconclusive``
+    for a well-formed reply without any. Transport, API and response-shape
+    failures raise :class:`LLMError`.
+    """
+    probe_config = replace(
+        config,
+        timeout=min(float(config.timeout), PROBE_TIMEOUT),
+        max_tokens=PROBE_MAX_TOKENS,
+        max_retries=1,
+    )
+    client = LLMClient(probe_config)  # SDK clients are built with max_retries=0
+    system, user = PROBE_MESSAGES[0]["content"], PROBE_MESSAGES[1]["content"]
+
+    start = time.time()
+    try:
+        if probe_config.is_anthropic:
+            response = client._client.messages.create(
+                model=probe_config.model,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+                max_tokens=PROBE_MAX_TOKENS,
+            )
+        else:
+            response = client._client.chat.completions.create(
+                model=probe_config.model,
+                messages=[dict(m) for m in PROBE_MESSAGES],
+                temperature=probe_config.temperature,
+                max_tokens=PROBE_MAX_TOKENS,
+            )
+    except _SDK_ERRORS as exc:
+        raise LLMError(_probe_failure(exc, probe_config.timeout)) from exc
+    except TypeError as exc:
+        # The Anthropic SDK signals a missing key with a bare TypeError at
+        # request time. Anything else is a genuine bug and must propagate.
+        if "resolve authentication method" not in str(exc):
+            raise
+        raise LLMError(
+            "No Anthropic API key: enter one in the sidebar or set "
+            "ANTHROPIC_API_KEY. Test does not retry."
+        ) from exc
+
+    result = ProbeResult(
+        status=PROBE_INCONCLUSIVE,
+        requested_model=probe_config.model,
+        endpoint=_client_endpoint(client) or display_endpoint(probe_config),
+        credential_source=credential_source(probe_config),
+        elapsed_ms=(time.time() - start) * 1000,
+    )
+    text = _read_probe_reply(response, probe_config.is_anthropic, result)
+    preview = " ".join(text.split())
+    if preview:
+        if len(preview) > PROBE_PREVIEW_CHARS:
+            preview = preview[:PROBE_PREVIEW_CHARS] + "..."
+        result.status = PROBE_OK
+        result.preview = preview
+    return result
+
+
+def _client_endpoint(client: "LLMClient") -> str:
+    """The base URL the SDK client actually resolved, sanitized; '' if unknown."""
+    value = getattr(client._client, "base_url", None)
+    return sanitize_url(str(value)) if value is not None else ""
+
+
+def _md_code(text: object) -> str:
+    cleaned = " ".join(str(text).replace("`", "'").split())
+    return "`%s`" % cleaned if cleaned else "`(empty)`"
+
+
+def _str_field(obj: object, name: str) -> str:
+    value = getattr(obj, name, None)
+    return value if isinstance(value, str) else ""
+
+
+def _count_field(obj: object, name: str) -> Optional[int]:
+    value = getattr(obj, name, None)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _read_probe_reply(response: object, is_anthropic: bool, result: ProbeResult) -> str:
+    """Visible text of a probe reply, filling optional metadata into ``result``.
+
+    Raises :class:`LLMError` only when the required shape is wrong; optional
+    metadata that is missing or oddly typed is simply left unset.
+    """
+    malformed = LLMError(
+        "The endpoint answered, but not in the expected %s response format "
+        "(got %s). Check the base URL and preset. Test does not retry." % (
+            "Anthropic Messages" if is_anthropic else "OpenAI chat-completions",
+            type(response).__name__,
+        )
+    )
+    if is_anthropic:
+        blocks = getattr(response, "content", None)
+        if not isinstance(blocks, (list, tuple)):
+            raise malformed
+        result.server_model = _str_field(response, "model")
+        result.finish_reason = _str_field(response, "stop_reason")
+        result.output_tokens = _count_field(getattr(response, "usage", None), "output_tokens")
+        texts = []
+        for block in blocks:
+            kind = _str_field(block, "type")
+            if kind == "text":
+                texts.append(_str_field(block, "text"))
+            elif kind in ("thinking", "redacted_thinking"):
+                result.reasoning_present = True
+                result.reasoning_chars += len(_str_field(block, "thinking"))
+        return "".join(texts)
+
+    choices = getattr(response, "choices", None)
+    if not isinstance(choices, (list, tuple)) or not choices:
+        raise malformed
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        raise malformed
+    content = getattr(message, "content", None)
+    if content is not None and not isinstance(content, str):
+        raise malformed
+    result.server_model = _str_field(response, "model")
+    result.finish_reason = _str_field(choices[0], "finish_reason")
+    usage = getattr(response, "usage", None)
+    result.output_tokens = _count_field(usage, "completion_tokens")
+    result.reasoning_tokens = _count_field(
+        getattr(usage, "completion_tokens_details", None), "reasoning_tokens")
+    # Non-standard fields some servers (Ollama, DeepSeek, vLLM) add for
+    # thinking models. Measured only; the text itself is never displayed.
+    for name in ("reasoning_content", "reasoning"):
+        reasoning = _str_field(message, name)
+        if reasoning:
+            result.reasoning_present = True
+            result.reasoning_chars = len(reasoning)
+            break
+    return content or ""
+
+
+def _probe_failure(exc: Exception, timeout: float) -> str:
+    """Operator-facing explanation of an SDK error raised by the probe."""
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    message = str(exc)
+    if "APITimeoutError" in names:
+        lead = "No reply within %.0f s (the Test probe timeout)." % timeout
+    elif "APIConnectionError" in names:
+        lead = ("Could not connect to the endpoint. Check the base URL and "
+                "that the server is running.")
+    elif "APIResponseValidationError" in names:
+        lead = ("The endpoint answered, but not in the expected response "
+                "format. Check the base URL and preset.")
+    elif "AuthenticationError" in names or "PermissionDeniedError" in names:
+        lead = "The endpoint rejected the credentials."
+    elif "max_tokens" in message.lower() and (
+            "BadRequestError" in names or _is_param_rejection(message, "max_tokens")):
+        lead = ("The endpoint rejected the probe's output-token limit "
+                "(max_tokens=%d)." % PROBE_MAX_TOKENS)
+    elif "NotFoundError" in names:
+        lead = "Endpoint path or model not found. Check the base URL and model name."
+    elif "RateLimitError" in names:
+        lead = "The endpoint rate-limited the request."
+    elif "InternalServerError" in names or "OverloadedError" in names:
+        lead = "The endpoint returned a server error."
+    else:
+        lead = "The Test request failed."
+    return "%s Test does not retry. Details: %s" % (lead, _clean_error(exc))
 
 
 # ------------------------------------------------------------------ helpers

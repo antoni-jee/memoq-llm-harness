@@ -5,11 +5,14 @@ Run with:  python -m unittest discover -s tests -v
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -2646,6 +2649,503 @@ class TestAnthropicBackend(unittest.TestCase):
 
         client._chat([{"role": "user", "content": "hi"}], force_json=False)
         self.assertGreater(captured["max_tokens"], 0)
+
+
+def _sdk_error(cls, message):
+    """An SDK exception instance without the SDK's HTTP-object constructor."""
+    err = cls.__new__(cls)
+    Exception.__init__(err, message)
+    err.message = message
+    return err
+
+
+def _openai_reply(content):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+
+def _anthropic_reply(*texts):
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=t) for t in texts])
+
+
+class _FakeSDK:
+    """Stands in for both SDK constructors; records init kwargs and requests."""
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.init_kwargs = []
+        self.requests = []
+
+    def _respond(self, **kwargs):
+        self.requests.append(kwargs)
+        outcome = self.outcomes.pop(0) if self.outcomes else _openai_reply("ok")
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def factory(self, **kwargs):
+        self.init_kwargs.append(kwargs)
+        return SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=self._respond)),
+            messages=SimpleNamespace(create=self._respond),
+        )
+
+
+class TestModelProbe(unittest.TestCase):
+    """The sidebar Test button: one bounded request, no side effects."""
+
+    def setUp(self):
+        sleeper = mock.patch.object(llm.time, "sleep", side_effect=AssertionError(
+            "the probe must never back off and retry"))
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
+
+    def openai_config(self, **overrides):
+        values = dict(
+            preset="Local Engine (Ollama)", base_url="http://probe.invalid:11434/v1",
+            api_key="sk-test-key", model="qwen-selected", temperature=0.3,
+            max_tokens=4096, chunk_size=7, timeout=300.0, max_retries=3,
+            backend=llm.BACKEND_OPENAI,
+        )
+        values.update(overrides)
+        return llm.ClientConfig(**values)
+
+    def anthropic_config(self, **overrides):
+        values = dict(
+            preset="Anthropic API", base_url="https://anthropic.invalid",
+            api_key="sk-ant-test", model="claude-selected", max_tokens=4096,
+            timeout=300.0, max_retries=3, backend=llm.BACKEND_ANTHROPIC,
+        )
+        values.update(overrides)
+        return llm.ClientConfig(**values)
+
+    def run_openai(self, config, *outcomes):
+        sdk = _FakeSDK(*outcomes)
+        with mock.patch.object(llm, "OpenAI", sdk.factory):
+            try:
+                return sdk, llm.probe_model(config), None
+            except llm.LLMError as exc:
+                return sdk, None, exc
+
+    def run_anthropic(self, config, *outcomes):
+        if llm.anthropic is None:
+            self.skipTest("anthropic not installed")
+        sdk = _FakeSDK(*outcomes)
+        fake_module = SimpleNamespace(Anthropic=sdk.factory, NOT_GIVEN=object())
+        with mock.patch.object(llm, "anthropic", fake_module):
+            try:
+                return sdk, llm.probe_model(config), None
+            except llm.LLMError as exc:
+                return sdk, None, exc
+
+    # ---------------------------------------------------------- OpenAI path
+
+    def test_openai_success_reports_a_short_preview(self):
+        config = self.openai_config()
+        sdk, result, error = self.run_openai(config, _openai_reply("  ok\n " + "x" * 200))
+        self.assertIsNone(error)
+        self.assertEqual(len(sdk.requests), 1)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, llm.PROBE_OK)
+        self.assertTrue(result.preview.startswith("ok x"))
+        text = result.message()
+        self.assertNotIn("x" * (llm.PROBE_PREVIEW_CHARS + 1), text)
+        self.assertIn("not checked", text)  # no quality/JSON claim
+        self.assertIn("Requested model: `qwen-selected`", text)
+        self.assertIn("Server-reported model: not reported", text)
+        self.assertNotIn("HTTP", text)  # no status code is ever observed
+
+    def test_server_reported_model_is_labelled_separately(self):
+        reply = _openai_reply("ok")
+        reply.model = "qwen3:8b-q4"
+        _sdk, result, _error = self.run_openai(self.openai_config(), reply)
+        self.assertEqual(result.requested_model, "qwen-selected")
+        self.assertEqual(result.server_model, "qwen3:8b-q4")
+        text = result.message()
+        self.assertIn("Requested model: `qwen-selected`", text)
+        self.assertIn("Server-reported model: `qwen3:8b-q4`", text)
+
+    def test_reasoning_only_reply_is_inconclusive_with_metadata(self):
+        thinking = "Let me think about how to answer the user carefully"
+        reply = SimpleNamespace(
+            model="qwen3:8b",
+            choices=[SimpleNamespace(
+                finish_reason="length",
+                message=SimpleNamespace(content="", reasoning=thinking))],
+            usage=SimpleNamespace(
+                completion_tokens=16,
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=16)),
+        )
+        config = self.openai_config()
+        before = dataclasses.asdict(config)
+        sdk, result, error = self.run_openai(config, reply, _openai_reply("ok"))
+        self.assertIsNone(error)
+        self.assertEqual(len(sdk.requests), 1)
+        self.assertEqual(result.status, llm.PROBE_INCONCLUSIVE)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.finish_reason, "length")
+        self.assertEqual(result.output_tokens, 16)
+        self.assertEqual(result.reasoning_tokens, 16)
+        self.assertTrue(result.reasoning_present)
+        self.assertEqual(result.reasoning_chars, len(thinking))
+        text = result.message()
+        self.assertNotIn(thinking, text)
+        self.assertNotIn("think about", text)
+        self.assertIn("finish reason `length`", text)
+        self.assertIn("reasoning text present (%d chars, not shown)" % len(thinking), text)
+        self.assertEqual(dataclasses.asdict(config), before)
+
+    def test_odd_or_missing_metadata_never_breaks_the_probe(self):
+        reply = SimpleNamespace(
+            model=12345,
+            choices=[SimpleNamespace(
+                finish_reason=None,
+                message=SimpleNamespace(content="ok", reasoning=["not", "text"]))],
+            usage=SimpleNamespace(completion_tokens="many", completion_tokens_details=None),
+        )
+        _sdk, result, error = self.run_openai(self.openai_config(), reply)
+        self.assertIsNone(error)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.server_model, "")
+        self.assertEqual(result.finish_reason, "")
+        self.assertIsNone(result.output_tokens)
+        self.assertIsNone(result.reasoning_tokens)
+        self.assertFalse(result.reasoning_present)
+        self.assertNotIn("Response metadata", result.message())
+
+    def test_labels_are_sanitized_and_never_leak_secrets(self):
+        config = self.openai_config(
+            base_url="https://user:pa55word@Proxy.example:8443/v1?api_key=sk-query#frag",
+            api_key="sk-sidebar-secret")
+        sdk, result, error = self.run_openai(config, _openai_reply("ok"))
+        self.assertIsNone(error)
+        # The SDK still receives the endpoint exactly as configured.
+        self.assertEqual(sdk.init_kwargs[0]["base_url"], config.base_url.rstrip("/"))
+        for text in (result.message(), llm.connection_summary(config)):
+            with self.subTest(text=text[:30]):
+                self.assertIn("https://proxy.example:8443/v1", text)
+                for secret in ("pa55word", "user:", "sk-query", "frag", "sk-sidebar-secret"):
+                    self.assertNotIn(secret, text)
+                self.assertIn("Credentials: sidebar key", text)
+
+    def test_sanitize_url_edge_cases(self):
+        self.assertEqual(llm.sanitize_url(""), "")
+        self.assertEqual(llm.sanitize_url("http://localhost:11434/v1/"),
+                         "http://localhost:11434/v1/")
+        self.assertEqual(llm.sanitize_url("not a url"), "(unparseable URL)")
+        self.assertEqual(llm.sanitize_url("http://host:notaport/v1"), "(unparseable URL)")
+
+    def test_credential_source_labels(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(llm.credential_source(self.openai_config()), "sidebar key")
+            self.assertIn("local placeholder",
+                          llm.credential_source(self.openai_config(api_key="")))
+            self.assertIn(llm.CREDENTIAL_UNDETERMINED,
+                          llm.credential_source(self.anthropic_config(api_key="")))
+            with mock.patch.dict(os.environ, {"ANTHROPIC_AUTH_TOKEN": "tok-secret"}):
+                label = llm.credential_source(self.anthropic_config(api_key=""))
+                self.assertIn("ANTHROPIC_AUTH_TOKEN environment variable", label)
+                self.assertNotIn("tok-secret", label)
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-env-secret",
+                                              "ANTHROPIC_AUTH_TOKEN": "tok-secret"}):
+                label = llm.credential_source(self.anthropic_config(api_key=""))
+                self.assertIn("ANTHROPIC_API_KEY environment variable", label)
+                self.assertNotIn("secret", label)
+            # A typed key is what the SDK uses, whatever the environment holds.
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-env-secret"}):
+                self.assertEqual(llm.credential_source(self.anthropic_config()), "sidebar key")
+
+    def test_openai_uses_selected_model_endpoint_key_and_probe_bounds(self):
+        config = self.openai_config()
+        sdk, _message, error = self.run_openai(config, _openai_reply("ok"))
+        self.assertIsNone(error)
+        init = sdk.init_kwargs[0]
+        self.assertEqual(init["base_url"], "http://probe.invalid:11434/v1")
+        self.assertEqual(init["api_key"], "sk-test-key")
+        self.assertEqual(init["max_retries"], 0)
+        self.assertLessEqual(init["timeout"], 30)
+        request = sdk.requests[0]
+        self.assertEqual(request["model"], "qwen-selected")
+        self.assertEqual(request["max_tokens"], llm.PROBE_MAX_TOKENS)
+        self.assertLessEqual(llm.PROBE_MAX_TOKENS, 32)
+        self.assertNotIn("response_format", request)
+        self.assertEqual(request["messages"], [dict(m) for m in llm.PROBE_MESSAGES])
+
+    def test_openai_keyless_local_endpoint_keeps_placeholder_key(self):
+        sdk, _message, error = self.run_openai(self.openai_config(api_key=""), _openai_reply("ok"))
+        self.assertIsNone(error)
+        self.assertEqual(sdk.init_kwargs[0]["api_key"], "not-needed")
+
+    def test_shorter_operator_timeout_is_kept(self):
+        sdk, _message, _error = self.run_openai(self.openai_config(timeout=10.0), _openai_reply("ok"))
+        self.assertEqual(sdk.init_kwargs[0]["timeout"], 10.0)
+
+    def test_config_is_unchanged_after_success_and_every_failure(self):
+        import openai
+        outcomes = [
+            _openai_reply("ok"),
+            _openai_reply(""),
+            "<html>not json</html>",
+            _sdk_error(openai.BadRequestError, "Unsupported parameter: 'max_tokens'"),
+            _sdk_error(openai.APITimeoutError, "Request timed out."),
+        ]
+        for outcome in outcomes:
+            with self.subTest(outcome=repr(outcome)[:40]):
+                config = self.openai_config()
+                before = dataclasses.asdict(config)
+                self.run_openai(config, outcome)
+                self.assertEqual(dataclasses.asdict(config), before)
+
+    def test_rejected_token_limit_fails_after_one_capped_request(self):
+        import openai
+        config = self.openai_config()
+        sdk, message, error = self.run_openai(
+            config,
+            _sdk_error(openai.BadRequestError,
+                       "Error code: 400 - Unsupported parameter: 'max_tokens'"),
+            _openai_reply("would only be reached by an uncapped retry"),
+        )
+        self.assertIsNone(message)
+        self.assertIsNotNone(error)
+        self.assertEqual(len(sdk.requests), 1)
+        self.assertEqual(sdk.requests[0]["max_tokens"], llm.PROBE_MAX_TOKENS)
+        self.assertIn("max_tokens", str(error))
+        self.assertIn("does not retry", str(error))
+        self.assertEqual(config.max_tokens, 4096)
+
+    def test_empty_output_is_inconclusive_after_one_request(self):
+        for content in ("", "   \n", None):
+            with self.subTest(content=content):
+                config = self.openai_config()
+                before = dataclasses.asdict(config)
+                sdk, result, error = self.run_openai(
+                    config, _openai_reply(content), _openai_reply("ok"))
+                self.assertIsNone(error)
+                self.assertEqual(len(sdk.requests), 1)
+                self.assertEqual(result.status, llm.PROBE_INCONCLUSIVE)
+                text = result.message()
+                self.assertIn("no visible text", text)
+                self.assertIn("%d-token probe" % llm.PROBE_MAX_TOKENS, text)
+                self.assertIn("does not mean the model is unavailable", text)
+                self.assertNotIn("HTTP", text)
+                self.assertEqual(dataclasses.asdict(config), before)
+
+    def test_transport_and_server_errors_are_not_retried(self):
+        import openai
+        cases = [
+            (openai.APITimeoutError, "Request timed out.", "No reply within"),
+            (openai.APIConnectionError, "Connection error.", "Could not connect"),
+            (openai.RateLimitError, "Error code: 429", "rate-limited"),
+            (openai.InternalServerError, "Error code: 503", "server error"),
+            (openai.AuthenticationError, "Error code: 401", "credentials"),
+            (openai.NotFoundError, "Error code: 404 model not found", "not found"),
+        ]
+        for cls, raw, lead in cases:
+            with self.subTest(error=cls.__name__):
+                sdk, message, error = self.run_openai(
+                    self.openai_config(), _sdk_error(cls, raw), _openai_reply("ok"))
+                self.assertIsNone(message)
+                self.assertEqual(len(sdk.requests), 1)
+                self.assertIn(lead, str(error))
+                self.assertIn(raw, str(error))
+
+    def test_malformed_openai_responses_fail_cleanly(self):
+        import openai
+        cases = [
+            "<html>gateway page</html>",
+            SimpleNamespace(),
+            SimpleNamespace(choices=None),
+            SimpleNamespace(choices=[]),
+            SimpleNamespace(choices=[SimpleNamespace()]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=["x"]))]),
+            _sdk_error(openai.APIResponseValidationError, "Data returned by API invalid"),
+        ]
+        for outcome in cases:
+            with self.subTest(outcome=repr(outcome)[:50]):
+                sdk, message, error = self.run_openai(self.openai_config(), outcome)
+                self.assertIsNone(message)
+                self.assertIsInstance(error, llm.LLMError)
+                self.assertIn("response format", str(error))
+                self.assertEqual(len(sdk.requests), 1)
+
+    def test_programming_errors_are_not_swallowed(self):
+        sdk = _FakeSDK(ValueError("bug in caller"))
+        with mock.patch.object(llm, "OpenAI", sdk.factory):
+            with self.assertRaises(ValueError):
+                llm.probe_model(self.openai_config())
+
+    def test_ping_delegates_to_the_bounded_probe(self):
+        config = self.openai_config()
+        sdk = _FakeSDK(_openai_reply("ok"))
+        with mock.patch.object(llm, "OpenAI", sdk.factory):
+            client = llm.LLMClient(config)
+            self.assertIn("ok", client.ping())
+        self.assertEqual(sdk.requests[0]["max_tokens"], llm.PROBE_MAX_TOKENS)
+        self.assertLessEqual(sdk.init_kwargs[-1]["timeout"], 30)
+        self.assertEqual(config.timeout, 300.0)
+
+    # ------------------------------------------------------- Anthropic path
+
+    def test_anthropic_success_uses_selected_values_and_bounds(self):
+        config = self.anthropic_config()
+        before = dataclasses.asdict(config)
+        sdk, result, error = self.run_anthropic(config, _anthropic_reply("o", "k"))
+        self.assertIsNone(error)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.preview, "ok")
+        init = sdk.init_kwargs[0]
+        self.assertEqual(init["base_url"], "https://anthropic.invalid")
+        self.assertEqual(init["api_key"], "sk-ant-test")
+        self.assertEqual(init["max_retries"], 0)
+        self.assertLessEqual(init["timeout"], 30)
+        self.assertEqual(len(sdk.requests), 1)
+        request = sdk.requests[0]
+        self.assertEqual(request["model"], "claude-selected")
+        self.assertEqual(request["max_tokens"], llm.PROBE_MAX_TOKENS)
+        self.assertNotIn("temperature", request)
+        sent = [{"role": "system", "content": request["system"]}] + request["messages"]
+        self.assertEqual(sent, [dict(m) for m in llm.PROBE_MESSAGES])
+        self.assertEqual(dataclasses.asdict(config), before)
+
+    def test_anthropic_empty_key_keeps_sdk_environment_fallback(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            sdk, result, error = self.run_anthropic(
+                self.anthropic_config(api_key=""), _anthropic_reply("ok"))
+        self.assertIsNone(error)
+        self.assertIsNone(sdk.init_kwargs[0]["api_key"])
+        # The fallback stays enabled, but is made visible rather than silent.
+        self.assertIn(llm.CREDENTIAL_UNDETERMINED, result.credential_source)
+        self.assertIn(llm.CREDENTIAL_UNDETERMINED, result.message())
+
+    def test_anthropic_thinking_only_reply_is_inconclusive(self):
+        reply = SimpleNamespace(
+            model="claude-sonnet-5-20261001", stop_reason="max_tokens",
+            usage=SimpleNamespace(output_tokens=16),
+            content=[SimpleNamespace(type="thinking", thinking="private chain")],
+        )
+        sdk, result, error = self.run_anthropic(self.anthropic_config(), reply)
+        self.assertIsNone(error)
+        self.assertEqual(len(sdk.requests), 1)
+        self.assertEqual(result.status, llm.PROBE_INCONCLUSIVE)
+        self.assertEqual(result.finish_reason, "max_tokens")
+        self.assertEqual(result.output_tokens, 16)
+        self.assertEqual(result.server_model, "claude-sonnet-5-20261001")
+        self.assertEqual(result.requested_model, "claude-selected")
+        self.assertTrue(result.reasoning_present)
+        self.assertNotIn("private chain", result.message())
+
+    def test_anthropic_empty_reply_is_inconclusive(self):
+        sdk, result, error = self.run_anthropic(
+            self.anthropic_config(), _anthropic_reply(""), _anthropic_reply("ok"))
+        self.assertIsNone(error)
+        self.assertEqual(len(sdk.requests), 1)
+        self.assertEqual(result.status, llm.PROBE_INCONCLUSIVE)
+
+    def test_anthropic_failures_are_single_request(self):
+        import anthropic
+        cases = [
+            SimpleNamespace(content=None),
+            _sdk_error(anthropic.APITimeoutError, "Request timed out."),
+            _sdk_error(anthropic.RateLimitError, "Error code: 429"),
+            _sdk_error(anthropic.InternalServerError, "Error code: 529 overloaded"),
+        ]
+        for outcome in cases:
+            with self.subTest(outcome=repr(outcome)[:50]):
+                config = self.anthropic_config()
+                before = dataclasses.asdict(config)
+                sdk, message, error = self.run_anthropic(config, outcome, _anthropic_reply("ok"))
+                self.assertIsNone(message)
+                self.assertIsInstance(error, llm.LLMError)
+                self.assertEqual(len(sdk.requests), 1)
+                self.assertEqual(dataclasses.asdict(config), before)
+
+    def test_anthropic_missing_credentials_is_reported(self):
+        sdk, message, error = self.run_anthropic(
+            self.anthropic_config(api_key=""),
+            TypeError('"Could not resolve authentication method. Expected one of api_key"'))
+        self.assertIsNone(message)
+        self.assertIn("API key", str(error))
+
+    def test_anthropic_unrelated_type_errors_propagate(self):
+        if llm.anthropic is None:
+            self.skipTest("anthropic not installed")
+        sdk = _FakeSDK(TypeError("unexpected keyword argument 'foo'"))
+        fake_module = SimpleNamespace(Anthropic=sdk.factory, NOT_GIVEN=object())
+        with mock.patch.object(llm, "anthropic", fake_module):
+            with self.assertRaises(TypeError):
+                llm.probe_model(self.anthropic_config())
+
+
+class TestTranslationRetryUnchanged(unittest.TestCase):
+    """Characterises the normal request path so the probe work cannot drift it."""
+
+    def make_openai_client(self, create, **config):
+        client = llm.LLMClient.__new__(llm.LLMClient)
+        client.config = llm.ClientConfig(backend=llm.BACKEND_OPENAI, **config)
+        client._supports_json_mode = None
+        client._client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        return client
+
+    def test_rejected_max_tokens_still_falls_back_to_server_default(self):
+        calls = []
+
+        def create(**kwargs):
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                raise RuntimeError("Unsupported parameter: 'max_tokens'")
+            return _openai_reply("translated")
+
+        client = self.make_openai_client(create, max_tokens=4096)
+        self.assertEqual(client._chat([{"role": "user", "content": "x"}], False), "translated")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["max_tokens"], 4096)
+        self.assertNotIn("max_tokens", calls[1])
+        self.assertEqual(client.config.max_tokens, 0)
+
+    def test_retryable_errors_are_still_retried(self):
+        calls = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            if len(calls) < 3:
+                raise RuntimeError("Error code: 503 temporarily unavailable")
+            return _openai_reply("translated")
+
+        client = self.make_openai_client(create, max_retries=3)
+        with mock.patch.object(llm.time, "sleep") as sleep:
+            out = client._chat([{"role": "user", "content": "x"}], False)
+        self.assertEqual(out, "translated")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_empty_translation_reply_is_still_retried(self):
+        replies = [_openai_reply(""), _openai_reply("translated")]
+        client = self.make_openai_client(lambda **kw: replies.pop(0), max_retries=3)
+        self.assertEqual(client._chat([{"role": "user", "content": "x"}], False), "translated")
+
+    def test_anthropic_retryable_errors_are_still_retried(self):
+        if llm.anthropic is None:
+            self.skipTest("anthropic not installed")
+        calls = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            if len(calls) < 2:
+                raise RuntimeError("overloaded")
+            return _anthropic_reply("translated")
+
+        client = llm.LLMClient.__new__(llm.LLMClient)
+        client.config = llm.ClientConfig(backend=llm.BACKEND_ANTHROPIC, max_retries=3)
+        client._supports_json_mode = None
+        client._client = SimpleNamespace(messages=SimpleNamespace(create=create))
+        with mock.patch.object(llm.time, "sleep"):
+            out = client._chat([{"role": "user", "content": "x"}], False)
+        self.assertEqual(out, "translated")
+        self.assertEqual(len(calls), 2)
 
 
 class TestPrompts(unittest.TestCase):

@@ -409,6 +409,11 @@ def tag_report_for(key: str, text: str) -> str:
     return "" if report.ok else report.summary()
 
 
+def request_retry(key: str) -> None:
+    """Retry button callback: queue the row; render_grid performs the call."""
+    st.session_state.pending_retry = key
+
+
 def retry_segment(key: str) -> None:
     """Re-run one row without touching the rest of the batch."""
     proj = project()
@@ -629,21 +634,28 @@ def render_sidebar() -> None:
         )
         preset = llm.PRESETS[chosen]
         if chosen != config.preset:
-            # Switching preset replaces the endpoint defaults but keeps any key
-            # the operator already typed.
+            # Switching provider replaces the endpoint defaults and drops a
+            # typed key, so one provider's key is never sent to another - even
+            # between two OpenAI-compatible presets. Bumping the revision gives
+            # the engine widgets fresh keys, so what they display matches the
+            # new config instead of the previous preset's values.
             config.preset = chosen
             config.base_url = preset.base_url
             config.model = preset.default_model
             config.backend = preset.backend
+            config.api_key = ""
             st.session_state.model_list = []
+            st.session_state.engine_rev = st.session_state.get("engine_rev", 0) + 1
             st.rerun()
         config.backend = preset.backend
+        engine_rev = st.session_state.get("engine_rev", 0)
 
         st.caption(preset.hint)
         if preset.backend == llm.BACKEND_ANTHROPIC and llm.anthropic is None:
             st.error("The `anthropic` package is missing. Run: `pip install anthropic`")
 
-        config.base_url = st.text_input("Base URL", value=config.base_url)
+        config.base_url = st.text_input(
+            "Base URL", value=config.base_url, key="base_url_%d" % engine_rev)
         key_label = (
             "Anthropic API key" if preset.backend == llm.BACKEND_ANTHROPIC
             else "API key" + ("" if preset.requires_key else " (optional)")
@@ -652,7 +664,9 @@ def render_sidebar() -> None:
             key_label,
             value=config.api_key,
             type="password",
-            help="Held in this browser session only - never written to state.json.",
+            key="api_key_%d" % engine_rev,
+            help="Held in this browser session only - never written to state.json. "
+                 "Cleared when you switch provider preset.",
         )
 
         model_options = list(st.session_state.model_list or preset.model_suggestions)
@@ -663,15 +677,19 @@ def render_sidebar() -> None:
             model_options,
             index=model_options.index(config.model) if config.model in model_options else 0,
             accept_new_options=True,
+            key="model_%d" % engine_rev,
             help="Type any model name the endpoint serves.",
         )
 
         col_a, col_b = st.columns(2)
         if col_a.button("Test", width='stretch'):
+            # One bounded request on a private copy of the config; see
+            # llm.probe_model. Never touches document work or saved state.
             try:
-                notify("success", "Endpoint replied: %s" % llm.LLMClient(config).ping())
+                result = llm.probe_model(config)
+                notify("success" if result.ok else "warning", result.message())
             except llm.LLMError as exc:
-                notify("error", str(exc))
+                notify("error", "Model test failed: %s" % exc)
             st.rerun()
         if col_b.button("List models", width='stretch'):
             try:
@@ -680,6 +698,8 @@ def render_sidebar() -> None:
             except llm.LLMError as exc:
                 notify("error", str(exc))
             st.rerun()
+        # What Test and translation will actually use - sanitized, no secrets.
+        st.caption(llm.connection_summary(config))
 
         with st.expander("Inference settings"):
             anthropic_backend = preset.backend == llm.BACKEND_ANTHROPIC
@@ -1100,6 +1120,9 @@ def render_left_panel() -> None:
 
 def render_grid() -> None:
     proj = project()
+    # Consumed on every run, even one that returns early, so a queued Retry
+    # can never fire later by surprise.
+    pending_retry = st.session_state.pop("pending_retry", None)
     if document() is None:
         st.info("Upload a `.mqxliff` file in the sidebar to begin.")
         return
@@ -1195,6 +1218,13 @@ def render_grid() -> None:
 
     st.divider()
 
+    # A row's Retry button only queues its key (see request_retry). Run it here,
+    # above the grid, so progress gets the full grid width. Already popped at
+    # the top, so a failure or later rerun can never repeat the request.
+    if pending_retry:
+        retry_segment(pending_retry)
+        st.rerun()
+
     header = st.columns([1, 4, 4, 5, 3])
     for col, label in zip(header, ("ID", "Source", "Current target (memoQ MT)",
                                    "Your text", "Note to model")):
@@ -1236,11 +1266,6 @@ def _render_row(record: state_mod.SegmentRecord, segment: Optional[mqxliff.Segme
         if segment is not None and segment.lookup.tags:
             with st.popover("{ }", help="Show full raw XML tags"):
                 _render_tag_tabs(segment)
-        if st.button("Retry", key="retry_%s" % record.key,
-                     help="Re-run just this segment against the model",
-                     width='stretch'):
-            retry_segment(record.key)
-            st.rerun()
 
     cols[1].markdown(_display(record.source_text))
     cols[2].markdown(_display(record.mt_target) or ":grey[(empty)]")
@@ -1265,11 +1290,18 @@ def _render_row(record: state_mod.SegmentRecord, segment: Optional[mqxliff.Segme
 
     note_key = "note_%s" % record.key
     st.session_state.setdefault(note_key, record.user_comment)
-    cols[4].text_area(
-        "Note", key=note_key,
-        height="content", label_visibility="collapsed",
-        placeholder="Why you changed it - fed back to the model.",
-    )
+    with cols[4]:
+        st.text_area(
+            "Note", key=note_key,
+            height="content", label_visibility="collapsed",
+            placeholder="Why you changed it - fed back to the model.",
+        )
+        # Row action lives here, not in the narrow ID column, so its label
+        # fits. It only records the request: the model call and its spinner
+        # run from render_grid at full width above the grid.
+        st.button("Rerun", key="retry_%s" % record.key,
+                  help="Re-run just this segment against the model",
+                  width='content', on_click=request_retry, args=(record.key,))
 
     _render_diff(record)
 
