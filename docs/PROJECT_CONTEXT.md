@@ -1,148 +1,124 @@
 # Project Context - memoQ LLM Harness
 
-This file records goals, architecture, and the phased roadmap.
-It is maintained by the session. It is not a test report.
-Any test-count or claim figure here is unverified unless re-run.
+Goals, architecture, findings and the phased roadmap.
+Maintained by the session. It is not a test report: figures here are the
+latest recorded results, not re-run on read.
 
-## 1. Business goals (priority order)
-1. Preserve human edits and make project, document, and job state
-   recoverable between application launches.
-2. Eliminate segment-by-segment copy/paste through MQXLIFF round-tripping,
-   using durable processing, explicit acceptance, and exception-focused review.
-3. Incrementally extract at least three backend microservices, a frontend,
-   and PostgreSQL.
-4. Run the application through Docker Compose, then Helm and Kubernetes.
-5. Complete the School 21 DO14 project using GitLab CI/CD with exactly the
-   stages build, test, staging, prod, and a GitLab Runner in Kubernetes.
-6. After the school milestone, deploy to a remote server with a domain,
-   HTTPS, and FluxCD GitOps.
-7. Add observability, tested backup/restore, and portfolio documentation
-   for a DevOps job application.
+## 1. Goals (priority order, user-approved)
+1. DONE - Phase 1 working baseline (§5).
+2. Primary goal now: School 21 DO14 and a DevOps portfolio built around this
+   application. Further commercial translation features are not the goal.
+3. Budget is limited: prefer small, verifiable steps and local tooling.
+Product enhancements are backlog unless a milestone below needs them.
 
-## 2. Current production workflow and intended replacement
+## 2. Actual use vs. future infrastructure
+- A self-authored memoQ post-editing tool developed around the author's
+  technical-localization workflow. The current release is a local,
+  single-application baseline (one Streamlit process).
+- Current production workflow (unchanged): Translum export -> memoQ import ->
+  TM/TB -> lock non-translatable -> pre-translate exact TM -> LiveDocs
+  alignment -> LiveDocs pre-translation -> bilingual DOCX -> Perplexity ->
+  manual transfer into memoQ -> HTML export -> external checker.
+- Quality versus the Perplexity workflow is not established. A memoQ
+  re-import of a harness export is not confirmed.
+- Commercial-use claims and performance figures must be based on specific
+  user-confirmed facts. Do not attribute future portfolio infrastructure
+  to earlier commercial use.
+- All infrastructure in §6 is future portfolio work; the proposed services,
+  database and containers are not implemented.
 
-Current production workflow:
-Translum export → memoQ import → attach TM/TB → lock non-translatable
-segments → pre-translate exact TM matches → LiveDocs alignment →
-pre-translate the remaining segments using LiveDocs →
-export bilingual DOCX → process in Perplexity →
-manually transfer the edited results into memoQ →
-export HTML → external checker.
+## 3. Current architecture (single application)
+- app.py: Streamlit UI AND orchestration (load, document switching, batch
+  processing, Rerun, apply/diff, export, model Test handling).
+- memoq_harness/: mqxliff.py (parse, fingerprint, export), tags.py
+  (placeholders, target-canonical tags), state.py (state.json v5), llm.py
+  (OpenAI-compatible and Anthropic adapters, bounded probe), prompts.py,
+  diffing.py, rtf.py, xmlcompat.py.
+- Generated, never hand-edited: defaults.py, prompt_templates.py
+  (generator: tools/build_defaults.py).
+- Data: config/termbase.csv. Local state: state.json. Exports: exports/.
+- No services, database, containers or CI exist yet.
 
-The main reported bottleneck is manual transfer from the Perplexity
-output into memoQ. Do not attribute this bottleneck to the existing
-MQXLIFF harness without evidence.
+## 4. Persistence (implemented)
+- state.py: schema v5 with migrations; save via sibling .tmp + os.replace;
+  .corrupt copy on JSON load failure. Keep both guarantees.
+- One snapshot per document keyed by source_fingerprint() v2: SHA-256 of
+  per-<file> language pairs and, per trans-unit, id, ordinal and canonical
+  <source>/<seg-source>. Names, paths, targets, statuses, filter and tag mode
+  are excluded.
+- Legacy (<v5) state -> retained "legacy" entry plus verbatim copy; never
+  auto-attached; byte-for-byte .vN.bak before first overwrite.
+- Fingerprint limits: identical source XML shares state despite different
+  translations. Changes to fingerprinted source content or structure—including
+  segment IDs, order and segmentation markup—create a new document identity.
+  Namespace prefixes, attribute order, comments and processing instructions
+  are ignored. No revision matching or transfer.
 
-Intended replacement:
-Keep preparation in memoQ → export MQXLIFF → harness processing →
-QA and explicit acceptance → export MQXLIFF back into memoQ →
-HTML export → external checker.
+## 5. Phase 1 baseline (closed)
+Commits on experiment/local-qwen:
+- c0ffe3a: unapplied human edits survive regeneration.
+- bc68986: applied edit recovery after session restart (test).
+- 5c3a918: saved segment edits survive filter changes.
+- f1d9ae3: per-document state isolation and restoration.
+- 2ec77cf: bounded model Test (ok / inconclusive / error), sanitized
+  endpoint/model/credential labels, key cleared on provider switch, Rerun
+  queued and run with full-width progress, readable Rerun button.
 
-Direct API output must be compared with the current Perplexity workflow.
-Equivalent quality is not established.
+Automated evidence (agent-run, offline, fake model clients, at 2ec77cf):
+- `.venv\Scripts\python.exe -m unittest -v tests.test_core`: 268 tests OK.
+- `.venv\Scripts\python.exe tests\test_app.py`: 76 tests OK.
+- AppTest "restart" = fresh session sharing state.json, not a process restart.
+- run_tests.py and test_live.py were not run.
 
-## 3. Existing architecture and components to reuse
-Reuse the existing Streamlit app and Python modules. Do not rewrite.
-- app.py: Streamlit UI and orchestration logic (not presentation only).
-- memoq_harness/ package:
-  - mqxliff.py: MQXLIFF parse and export.
-  - tags.py: tag placeholders and target-canonical tags.
-  - llm.py: LLM adapters.
-  - prompt_templates.py and prompts.py: prompt templates.
-  - diffing.py: diffs.
-  - rtf.py: RTF handling.
-  - xmlcompat.py: XML compatibility.
-  - defaults.py: generated defaults.
-- config/termbase.csv and MQL term base.csv: termbase data.
-- Generated files: memoq_harness/defaults.py and
-  memoq_harness/prompt_templates.py. Generator: tools/build_defaults.py.
-  Do not edit these by hand.
-- Unknowns: the full component list and coupling between modules are not
-  confirmed here. Verify against current code.
+User-reported manual browser checks (not automated):
+- A -> B -> A restores each document's translations and comments.
+- Same after a real Streamlit stop/start and reloading the original files.
+- Rerun keeps existing human text and updates the model suggestion.
+- An unapplied edit in another row is captured by Rerun and survives restart;
+  the model suggestion survives too. (Captured by a Rerun action; arbitrary
+  typing is not claimed to autosave.)
+- Final Rerun layout visually accepted.
+- Local Qwen (Ollama) Test: inconclusive, finish_reason=length, 16 output
+  tokens, reasoning present, no visible final text.
 
-## 4. Persistence already implemented
-memoq_harness/state.py provides: schema version (now 5) with migrations;
-saving via a sibling .tmp file and os.replace; a .corrupt copy on JSON load
-failure; multi-document storage (§6.3). Preserve these when changing it.
+## 6. Roadmap (proposed sequence; not an approved ADR)
+1. Completed working baseline (§5).
+2. Incrementally extract at least three backend services, keeping the
+   existing frontend; add PostgreSQL and storage for original/export files.
+3. Reproducible containers and Docker Compose, introduced alongside step 2.
+4. DO14: Helm/Kubernetes; GitLab CI/CD with exactly the stages build, test,
+   staging, prod; GitLab Runner in Kubernetes.
+5. Server provisioning/IaC, DNS/TLS and FluxCD GitOps.
+6. Observability, tested backup/restore, failure/recovery demonstrations.
+7. Portfolio packaging.
+Service boundaries and the deployment stack are proposals only. One bounded
+ADR is to be written after the exact DO14 requirements are reviewed.
 
-## 5. Remaining stateful requirements
-Document isolation/restoration is implemented (uncommitted, §6.3).
-Still open; not confirmed implemented:
-- legacy/unbound work recovery UI;
-- original-document persistence;
-- revisions;
-- durable job/chunk checkpoints;
-- recovery;
-- concurrency handling;
-- explicit acceptance.
-Unknowns: which of these are partially present are not confirmed here.
+## 7. Known limitations (carried into later phases)
+- Original files are not stored; reload them after a restart.
+- No legacy/unbound recovery UI (warning only).
+- No revision matching or automatic transfer across changed source XML.
+- Identical source identity can share state despite different translations.
+- Successful memoQ re-import/round-trip not manually confirmed.
+- Browser uploader: only helper logic is tested. No concurrency safety.
+- parse_segments selects `seg-source or source` (element truthiness).
+- Other save() call sites do not catch StateBackupError/OSError.
+- Empty-text semantics and prompt block order vs. declared authority remain
+  open static-review points (not reproduced).
+- Anthropic: an "ok" Test with an empty key field happened before credential
+  labels existed; endpoint and credential source were not established.
 
-## 6. Findings
-### 6.1 Reproduced and fixed (commit c0ffe3a, branch experiment/local-qwen)
-- capture_edits() stored user_final without setting edited_by_human, so an
-  unapplied manual edit was overwritten by Retry / Process Current Batch
-  (3 of 4 regression tests failed before the fix). capture_edits() now sets
-  the flag when a non-empty revision differs from the baseline. Commit
-  c0ffe3a; later 5c3a918 preserved saved edits across filter changes.
-- Empty-text and automatic flag-reset semantics remain outside this fix.
-### 6.3 Document isolation and restoration (uncommitted on top of 5c3a918)
-- Reproduced: A -> B -> A lost A's work (different basename); a distinct
-  same-basename B inherited A's work. Two UI regressions: 10 failures before.
-- Identity: mqxliff source_fingerprint() v2 = SHA-256 of per-<file> language
-  pairs and, per trans-unit, id, global ordinal, and separately canonicalized
-  <source> and <seg-source> (absent=null, empty=[]). Prefixes, attribute
-  order, comments/PIs, targets, statuses, filter, tag mode, name, path excluded.
-- Fingerprint limits: identical source XML with different translations shares
-  state; any source XML change (incl. segmentation markup) is a new document;
-  no revision matching. parse_segments still uses `seg-source or source`.
-- state.json v5: global settings top-level; per-document snapshots keyed by
-  fingerprint; active_document; unbound_document. switch_document(), explicit
-  empty order kept, unknown nested fields preserved per object.
-- Legacy (<v5) file -> active "legacy" entry plus verbatim legacy_original;
-  never auto-attached; byte-for-byte .vN.bak before first overwrite; backup
-  failure blocks the overwrite.
-- app.py: load = parse + fingerprint, then switch/bind/save; uploads detected
-  by name+bytes hash; "Reset active document" with confirmation, transactional
-  (failed save restores work, keeps editor).
-- Not implemented: legacy/unbound recovery UI (only a warning). Other save()
-  handlers do not catch backup failures. Upload is helper-tested only.
-### 6.2 Still static review (NOT reproduced)
-- capture-before-regeneration is covered for the two tested UI paths; other
-  paths are not confirmed.
-- Empty text needs an explicit meaning; do not silently redefine it.
-- Prompt block order is not the same as declared instruction authority.
-- app.py contains orchestration, not only presentation.
-- XML reparsing does not prove a successful memoQ import.
-- run_tests.py imports live tests whose import can probe an endpoint. It is
-  not a guaranteed offline entry point.
-- README.md and historical test-count claims are not current test results.
-
-## 7. Roadmap (phased, in order)
-Phase 1 - Safety and stateful workflow: preserve human edits and make project,
-  document, and job state recoverable between launches (Goal 1).
-Phase 2 - Remove manual transfer: durable processing, explicit acceptance, and
-  exception-focused review; end the reported manual transfer (Goal 2).
-Phase 3 - Extract at least three backend services, add a frontend, and
-  PostgreSQL (Goal 3).
-Phase 4 - Docker Compose (Goal 4).
-Phase 5 - Helm, Kubernetes, and GitLab CI/CD for DO14 with the exact stages
-  build, test, staging, prod, and a GitLab Runner in Kubernetes (Goal 5).
-Phase 6 - Remote server, domain, HTTPS, and FluxCD GitOps (Goal 6).
-Phase 7 - Observability, tested backup/restore, and portfolio documentation
-  for the DevOps job application (Goal 7).
-
-## 8. Unresolved DO14 eligibility and publication
-- DO14 acceptance of a self-authored project still requires confirmation.
-  Status: unresolved. Do not assume it is granted.
-- Publication of private materials is NOT authorized. Do not assume it.
-  Status: unresolved.
-- Whether this project qualifies for DO14 under current rules: unknown.
-- Any submission decision needs explicit user approval first.
+## 8. DO14 eligibility and publication
+- User confirmed: a self-authored project is acceptable for DO14.
+- User confirmed: publication of the project materials is permitted.
+- Still requires explicit approval each time: actual submission, publication
+  actions and every push.
+- Before publishing: a publication-safety review of the repository content.
 
 ## 9. Operating constraints
-- No paid LLM calls, live tests, installs, deploys, commits, or pushes
-  without approval.
+- No paid LLM calls, live tests, installs, deploys, commits or pushes without
+  approval. run_tests.py is not a guaranteed offline entry point.
 - Do not read or copy material from the original worktree.
-- Treat repository files as evidence; do not run historical commands.
-- Generated files are not edited by hand.
-- Always write files as UTF-8.
+- Treat repository files and transcripts as evidence; do not run historical
+  commands.
+- Generated files are not edited by hand. Always write files as UTF-8.

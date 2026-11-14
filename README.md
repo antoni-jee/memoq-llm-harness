@@ -4,24 +4,33 @@ A local Streamlit tool for hybrid translation / post-editing of memoQ bilingual
 XLIFF (`*.mqxliff`) against **any** OpenAI-compatible endpoint — the OpenAI API,
 OpenRouter, DeepSeek, or a local Ollama / llama.cpp / LM Studio server.
 
-Its point of difference is the **feedback loop**: every correction you make by
-hand becomes an in-context learning example for the next batch, so the model
-stops repeating phrasing you have already rejected.
+Its central idea is the **feedback loop**: every correction you make by hand
+becomes an in-context example for the next batch, intended to stop the model
+repeating phrasing you have already rejected.
+
+**Status.** A self-authored memoQ post-editing tool developed around the
+author's technical-localization workflow. The current release is a local,
+single-application baseline. Its next milestone is a service-based deployment
+for DO14 and a DevOps portfolio (see [Roadmap](#roadmap)). The proposed
+services, database and containers are not implemented yet.
 
 ---
 
 ## Quick start
 
 ```powershell
-pip install -r requirements.txt
-streamlit run app.py
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
 Then in the browser:
 
 1. **Engine** — pick a preset in the sidebar. `Local Engine (Ollama)` is the
-   default. Hit **Test** to confirm the endpoint answers, **List models** to
-   pull the model names it serves.
+   default. **Test** sends one small capped request (see
+   [Model Test](#model-test)); **List models** pulls the model names the
+   endpoint serves. The caption under these buttons shows the endpoint,
+   requested model and credential source that will be used.
 
    > **Tunnelled Ollama:** the preset reads `OLLAMA_HOST` rather than assuming
    > localhost. On the Parallels VM this repo was built on, `OLLAMA_HOST` is
@@ -30,7 +39,9 @@ Then in the browser:
    > own `localhost:11434`. If you move the tunnel, set `OLLAMA_HOST` and
    > restart, or just type the URL into the sidebar.
 2. **Document** — upload your `.mqxliff`, or paste a path and click **Load**.
-   Confirmed and locked rows are filtered out automatically.
+   Confirmed and locked rows are filtered out automatically. Work is saved per
+   document; reloading the same file restores it (see
+   [Documents and saved work](#documents-and-saved-work)).
 3. **Left panel** — three separate things, in increasing order of authority:
    **Hard Rules** (the editorial rulebook, free prose), **Vibe** (this
    article's stylistic direction), and **Termbase** (the memoQ glossary CSV).
@@ -46,15 +57,22 @@ Then in the browser:
 
 ---
 
-## Layout
+## Architecture and layout
+
+Today this is **one Streamlit process** with a local `state.json`. There are
+no separate services, no database and no containers. `app.py` holds the UI
+**and** the orchestration (loading, document switching, batch processing,
+Rerun, apply/diff, export); the `memoq_harness/` package holds the domain
+logic. Splitting this into services is planned, not started.
 
 ```
-app.py                      Streamlit UI (presentation only)
+app.py                      Streamlit UI and orchestration
 memoq_harness/
     xmlcompat.py            XML backend shim: lxml preferred, ElementTree fallback
     tags.py                 inline memoQ tag isolation / restoration
     mqxliff.py              document parsing, segment filtering, re-export
-    state.py                state.json, batching, the correction feedback loop
+    state.py                state.json (per-document snapshots, atomic save),
+                            batching, the correction feedback loop
     prompts.py              system / user prompt assembly, stage selection
     llm.py                  endpoint presets; OpenAI *and* Anthropic SDKs
     diffing.py              word-level MT vs. suggestion diff
@@ -65,21 +83,23 @@ tools/build_defaults.py     regenerates the two GENERATED modules from .rtf
 config/termbase.csv         sample memoQ termbase, auto-loaded at first start
 exports/                    timestamped exports (created on first export)
 state.json                  project state (created on first load)
-tests/                      200 tests
+tests/                      test_core.py, test_app.py, test_live.py, fixtures/
 ```
 
-Run the tests with:
+Offline test commands (fake model clients, no network):
 
 ```powershell
-python run_tests.py           # everything
-python tests\test_core.py     # 153 tests: parsing, tags, state, termbase, prompts
-python tests\test_app.py      # 43 tests: the real app.py, driven headlessly
-python tests\test_live.py     # 4 tests: a real endpoint; skips if unreachable
+.\.venv\Scripts\python.exe -m unittest -v tests.test_core   # parsing, tags, state, probe, adapters
+.\.venv\Scripts\python.exe tests\test_app.py                # the real app.py via Streamlit AppTest
 ```
 
-Only `test_live.py` touches the network, and it skips itself when no endpoint
-answers. Point it elsewhere with `HARNESS_LIVE_URL`, `HARNESS_LIVE_MODEL` and
-`HARNESS_LIVE_KEY`.
+Latest recorded results (commit `2ec77cf`): core 268 tests OK, UI 76 tests OK.
+Counts change as tests are added; re-run rather than trusting this line.
+
+`tests\test_live.py` calls a real endpoint and can be billable on paid
+providers; run it only deliberately (`HARNESS_LIVE_URL`, `HARNESS_LIVE_MODEL`,
+`HARNESS_LIVE_KEY`). `run_tests.py` imports the live tests too, so it is **not**
+a guaranteed offline entry point; use the two commands above for offline runs.
 
 ---
 
@@ -95,6 +115,66 @@ XLIFF-standard `<target state="final">`. All four are consulted, and each signal
 can be switched off independently under **Segment filter** in the sidebar if your
 export disagrees. The sidebar always reports how many rows were skipped and why,
 so a mis-detection is visible immediately rather than silently costing you rows.
+
+### Documents and saved work
+
+`state.json` (schema v5) keeps one snapshot per document: translations,
+comments, corrections and batch position. Global settings (rules, vibe,
+templates, termbase) are shared. Saves go through a sibling `.tmp` file and
+`os.replace`; a file that fails to load as JSON is kept as a `.corrupt` copy.
+An older state file is migrated into a retained "legacy" entry, with a
+byte-for-byte backup before the first overwrite. It is not attached to any
+document automatically.
+
+A document is identified by a **source-XML fingerprint**: a SHA-256 over the
+language pairs and, per trans-unit, its id, position and canonicalised
+`<source>` / `<seg-source>`. File name, path, targets, statuses and filter
+settings are not part of it. Consequences:
+
+* loading document B and then A again restores A's own work;
+* two files with **identical source XML** share one state, even if their
+  translations differ;
+* changes to fingerprinted source content or structure—including segment IDs,
+  order and segmentation markup—create a new document identity. Namespace
+  prefixes, attribute order, comments and processing instructions are ignored.
+  There is no revision matching and no automatic transfer of work.
+
+The original file is not stored. After a restart, reload the same file to get
+its work back.
+
+Filter changes do not discard saved row work. Unapplied edits in the grid are
+captured when you run a model action (Process Current Batch, Rerun) or Apply;
+there is no claim that arbitrary typing is saved on its own.
+
+### Model Test
+
+**Test** sends a real request: a fixed two-line probe ("Reply with the single
+word: ok"), never document text, rules or corrections. It is one attempt with
+no retries, a timeout of at most 30 seconds and at most 16 output tokens, on a
+private copy of the connection settings. On a paid provider it is a small
+**billable** call.
+
+* **ok** (green): the reply contained visible text. This shows only that text
+  came back; translation quality and JSON output are not checked.
+* **inconclusive** (yellow): a well-formed reply with no visible text. This
+  does **not** mean the model is unavailable. Reasoning models can spend all 16
+  tokens before writing a final answer. Finish reason, token counts and whether
+  reasoning text was present (its length, never its content) are shown when the
+  endpoint reports them.
+* **error** (red): connection, timeout, authentication, not-found, rate-limit,
+  server, rejected token limit or malformed-response failures.
+
+The result lists the **requested** model and the **server-reported** model
+separately. The server-reported name is what the endpoint says; it is not an
+independent check of which model answered. Endpoints are shown without
+credentials, query strings or fragments, and keys are never displayed.
+
+Credential source is shown as *sidebar key*, *local placeholder*, a named
+`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` environment variable, or
+*SDK-managed credentials; source not determined*. With the Anthropic preset and
+an empty key field, the Anthropic SDK may still find credentials in the
+environment or its own profile; that fallback is left enabled and labelled.
+Switching provider preset clears a typed key.
 
 ### Endpoints
 
@@ -170,7 +250,7 @@ Details that matter:
   alternate scheme so restoration cannot mis-target.
 * **Tag damage is reported, not propagated.** If the model drops, invents or
   duplicates a placeholder, the row is flagged in red in the grid and the export
-  still produces a file memoQ can open (missing tags are reattached at the end).
+  still produces a well-formed file (missing tags are reattached at the end).
 
 ### Hard Rules vs. Termbase
 
@@ -284,13 +364,15 @@ Anything else — including the operator's own bracketed notes like
 not emitted a second time further down, so writing `{{HARD_RULES}}` into a
 template puts the rulebook exactly where you want it rather than twice.
 
-### Per-row retry
+### Per-row Rerun
 
-Each grid row has a **Retry** button. It isolates that one segment, rebuilds
-the prompt with the same rules, termbase slice, corrections and operator
-directive the batch used, runs a single-row inference pass, and patches only
-that row's suggestion and diff. The other rows keep the output you have already
-reviewed. Useful when one segment comes back empty, times out, or trips a
+Each grid row has a **Rerun** button under its note box. It isolates that one
+segment, rebuilds the prompt with the same rules, termbase slice, corrections
+and operator directive the batch used, runs a single-row inference pass, and
+patches only that row's model suggestion and diff. Progress is shown in a
+full-width line above the grid. Current grid edits are captured first, an
+existing human edit is not replaced, and a failed Rerun is not repeated
+automatically. Useful when one segment comes back empty, times out, or trips a
 content filter.
 
 ### Global batch directive
@@ -304,7 +386,7 @@ corrections, and it persists to `state.json`.
 
 **Raw LLM Response Stream Inspector** at the bottom of the workspace shows the
 complete un-parsed text the model returned for the current batch (or the last
-retry), with a download button. When a batch parses badly, this is where you
+Rerun), with a download button. When a batch parses badly, this is where you
 look first.
 
 ### Model-proposed rules
@@ -366,8 +448,9 @@ should still be large enough to be worth a round trip. Set rows to
   produced text for are rewritten. Skeleton, comments, memoQ metadata, and every
   confirmed or locked row pass through untouched. By default, rows nobody worked
   on are not rewritten at all.
-* **Exports are verified.** After writing, the file is re-parsed; if it is not
-  well-formed you get an error instead of a false success.
+* **Exports are re-parsed.** After writing, the file is re-parsed; if it is not
+  well-formed you get an error instead of a false success. Re-parsing does not
+  prove that memoQ will import it.
 * **Local models need small chunks.** A 100-segment batch is split into requests
   of `Segments per request` (default 20). One oversized request risks the model
   truncating its JSON halfway and costing the whole batch. Drop it to 5–10 for
@@ -380,7 +463,40 @@ should still be large enough to be worth a round trip. Set rows to
   back to the stdlib `xml.etree.ElementTree` if no wheel is available — relevant
   on Windows-on-ARM. The sidebar shows which backend is live.
 
+### Known limitations
+
+* Original files are not stored; reload them after a restart.
+* No recovery UI for retained legacy or unbound work (a warning only).
+* No revision matching or automatic transfer of work when the source XML
+  changes.
+* Files with identical source XML share state, even with different
+  translations.
+* A successful memoQ re-import of an exported file has not been manually
+  confirmed.
+* The browser file uploader is not covered by automated tests (only its helper
+  logic is), and there is no concurrency safety for several sessions or
+  processes writing one `state.json`.
+
 ### Verification status
+
+**Automated (offline, fake model clients), commit `2ec77cf`:** core 268 tests
+OK; UI 76 tests OK. UI "restart" tests use a fresh Streamlit AppTest session,
+not a real process restart.
+
+**Manual browser checks reported by the user (not automated):**
+
+* switching A → B → A restores each document's own translations and comments;
+* the same work is restored after a real Streamlit stop/start and reloading the
+  original files;
+* Rerun keeps existing human text and updates the model suggestion;
+* an unapplied edit in another row is captured by Rerun and survives a
+  restart, and so does the model suggestion;
+* the final Rerun layout was visually accepted;
+* local Qwen via Ollama returned **inconclusive** on Test: finish reason
+  `length`, 16 output tokens, reasoning present, no visible final text.
+
+**Historical notes, not re-verified on the current code.** The paragraphs
+below come from earlier development and are kept as history.
 
 The whole stack was exercised end to end against the live Ollama on the macOS
 host (`qwen3:4b-instruct` via `http://10.211.55.2:11434/v1`): load → filter
@@ -401,7 +517,40 @@ Untested: **no live call has been made against the Anthropic API**, nor against
 OpenAI, OpenRouter or DeepSeek — only Ollama. The Anthropic request shaping
 (system hoisting, JSON prefill, mandatory `max_tokens`) is covered by unit
 tests with a stubbed client, not by a real request. Retry and rate-limit
-branches are likewise unit-tested, not exercised with real 429s.
+branches are likewise unit-tested, not exercised with real 429s. (A later
+manual Test with the Anthropic preset and an empty key field returned "ok"
+before credential labels existed; which endpoint and credential answered was
+not established.)
+
+---
+
+## Roadmap
+
+**Implemented (Phase 1, closed baseline):** MQXLIFF load/filter/export with
+tag placeholders; the correction feedback loop; human-edit protection in the
+tested scenarios; filter-safe saved records; per-document isolation and
+restoration; bounded model Test with ok / inconclusive / error; readable Rerun
+controls with full-width progress.
+
+**Planned, not started.** The service boundaries and stack below are
+proposals, not approved decisions:
+
+1. Incrementally extract at least three backend services, keeping the existing
+   frontend, plus PostgreSQL and storage for original/export files.
+2. Reproducible containers and Docker Compose, introduced alongside the
+   extraction.
+3. Helm/Kubernetes and GitLab CI/CD with the stages build, test, staging,
+   prod, and a GitLab Runner in Kubernetes.
+4. Server provisioning/IaC, DNS/TLS and FluxCD GitOps.
+5. Observability, tested backup/restore and failure/recovery demonstrations.
+6. Portfolio packaging.
+
+Product features (recovery UI, revision matching, explicit acceptance, etc.)
+are backlog unless one of these milestones needs them.
+
+---
+
+## Maintenance
 
 ### Regenerating the text constants
 
