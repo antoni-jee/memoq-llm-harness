@@ -1,0 +1,6 @@
+# workspace-service runtime dependencies. Lower bounds are the versions tested.
+# The shared packages `memoq_harness` (state logic, standard library only) and
+# `services.common` are imported from the repository root (PYTHONPATH).
+starlette>=1.10
+uvicorn>=0.54
+pg8000>=1.31.6

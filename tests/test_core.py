@@ -2514,6 +2514,69 @@ class TestDiffing(unittest.TestCase):
         self.assertIsInstance(diffing.render_html("", ""), str)
 
 
+class TestDocumentSnapshotWrappers(unittest.TestCase):
+    """Public per-document snapshot API used by workspace-service."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "state.json")
+
+    def tearDown(self):
+        import shutil  # noqa: PLC0415
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def worked_state(self):
+        proj = state.ProjectState(self.path)
+        proj.switch_document("doc-a", "a.mqxliff")
+        doc = load_doc()
+        proj.bind_segments(doc.translatable_segments(), "a.mqxliff",
+                           present_keys={s.key for s in doc.segments})
+        key = proj.order[0]
+        proj.capture_edits({key: "Meine Fassung"}, {key: "Notiz"})
+        return proj, key
+
+    def test_snapshot_equals_the_private_snapshot(self):
+        proj, _ = self.worked_state()
+        self.assertEqual(proj.document_snapshot(), proj._document_snapshot())
+
+    def test_round_trip_keeps_work_and_unknown_fields(self):
+        proj, key = self.worked_state()
+        entry = proj.document_snapshot()
+        entry["future_document_field"] = {"x": 1}
+        entry["segments"][key]["future_record_field"] = [1, 2]
+
+        other = state.ProjectState(self.path)
+        other.open_document_snapshot("doc-a", json.loads(json.dumps(entry)))
+        self.assertEqual(other.document_id, "doc-a")
+        record = other.segments[key]
+        self.assertEqual((record.user_final, record.user_comment, record.edited_by_human),
+                         ("Meine Fassung", "Notiz", True))
+        self.assertEqual(other.order, proj.order)
+        again = other.document_snapshot()
+        self.assertEqual(again["future_document_field"], {"x": 1})
+        self.assertEqual(again["segments"][key]["future_record_field"], [1, 2])
+        self.assertEqual(again, entry)
+
+    def test_matches_switch_document_view_and_writes_nothing(self):
+        proj, key = self.worked_state()
+        proj.save()
+        loaded = state.ProjectState.load(self.path)
+        loaded.switch_document("doc-a", "a.mqxliff")
+        before = os.listdir(self.tmp)
+
+        fresh = state.ProjectState(os.path.join(self.tmp, "never-written.json"))
+        fresh.open_document_snapshot("doc-a", proj.document_snapshot())
+        self.assertEqual({k: vars(r) for k, r in fresh.segments.items()},
+                         {k: vars(r) for k, r in loaded.segments.items()})
+        self.assertEqual(os.listdir(self.tmp), before)
+
+    def test_open_rejects_bad_input(self):
+        proj = state.ProjectState(self.path)
+        for document_id, entry in (("", {}), (None, {}), ("doc", None), ("doc", [])):
+            with self.assertRaises(ValueError):
+                proj.open_document_snapshot(document_id, entry)
+
+
 class TestAnthropicBackend(unittest.TestCase):
     def test_preset_exists_and_uses_the_anthropic_sdk(self):
         preset = llm.PRESETS["Anthropic API"]

@@ -491,6 +491,26 @@ class ProjectState:
             ids.add(self.document_id)
         return sorted(ids)
 
+    def open_document_snapshot(self, document_id: str, entry: dict) -> None:
+        """Make one stored per-document entry the active document, in memory.
+
+        ``entry`` has the shape of one value of the v5 ``documents`` map, as
+        returned by :meth:`document_snapshot`. Unknown fields are carried
+        verbatim. Global settings are untouched and nothing is written to disk.
+        This lets a caller that stores documents elsewhere (workspace-service)
+        reuse the same per-document logic as ``state.json``.
+        """
+        if not isinstance(document_id, str) or not document_id:
+            raise ValueError("document_id must be a non-empty string")
+        if not isinstance(entry, dict):
+            raise ValueError("entry must be a dict")
+        self._apply_document(entry)
+        self.document_id = document_id
+
+    def document_snapshot(self) -> dict:
+        """JSON-shaped copy of the active document's entry, unknown keys kept."""
+        return self._document_snapshot()
+
     def switch_document(self, document_id: str, source_file: str = "",
                         source_path: str = "") -> None:
         """Make ``document_id`` the active document.

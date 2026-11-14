@@ -11,7 +11,6 @@ contain the database URL, credentials, SQL or server error text.
 from __future__ import annotations
 
 import json
-import ssl
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,15 +18,15 @@ from typing import Dict, Iterator, Optional, Tuple
 
 import pg8000.native
 
+from services.common import db as common_db
+# Shared with workspace-service; re-exported so existing imports keep working.
+from services.common.db import RepositoryError, quote_schema  # noqa: F401
+
 from .config import DatabaseSettings
 
 DB_STATUS_OK = "ok"
 DB_STATUS_UNAVAILABLE = "unavailable"
 DB_STATUS_NOT_MIGRATED = "not_migrated"
-
-
-class RepositoryError(RuntimeError):
-    """The database could not complete an operation. The message is safe to show."""
 
 
 @dataclass(frozen=True)
@@ -62,45 +61,9 @@ class DocumentRecord:
     originals: Tuple[OriginalRecord, ...]
 
 
-def _ssl_context(mode: str):
-    """Map a libpq-style sslmode onto pg8000's ``ssl_context`` argument."""
-    if mode == "disable":
-        return False
-    if mode == "prefer":
-        return None  # pg8000: try TLS without verification, fall back to plain
-    if mode == "require":
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        return context
-    context = ssl.create_default_context()
-    if mode == "verify-ca":
-        context.check_hostname = False
-    return context  # verify-full: certificate and host name are checked
-
-
 def open_connection(settings: DatabaseSettings, application_name: str = "document-service"):
     """Open a pg8000 native connection. Failures raise a sanitised RepositoryError."""
-    try:
-        return pg8000.native.Connection(
-            user=settings.user,
-            password=settings.password or None,
-            host=settings.host,
-            port=settings.port,
-            database=settings.database,
-            timeout=settings.timeout,
-            ssl_context=_ssl_context(settings.sslmode),
-            application_name=application_name,
-        )
-    except (pg8000.native.Error, OSError, ssl.SSLError):
-        raise RepositoryError("Database connection failed.") from None
-
-
-def quote_schema(schema: str) -> str:
-    """Quote an already-validated schema identifier."""
-    if not schema or not all(c.islower() or c.isdigit() or c == "_" for c in schema):
-        raise ValueError("Invalid schema identifier.")
-    return '"%s"' % schema
+    return common_db.open_connection(settings, application_name)
 
 
 _ORIGINAL_COLUMNS = "original_id, document_id, filename, size_bytes, segment_count, created_at"

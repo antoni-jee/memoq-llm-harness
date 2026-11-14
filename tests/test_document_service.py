@@ -756,6 +756,22 @@ class TestMigrationFiles(unittest.TestCase):
         self.assertIn('REFERENCES "doc_x".originals', exports[0])
         self.assertIn("'[]'::jsonb", exports[0])
 
+    def test_advisory_lock_key_is_unchanged_by_the_shared_runner(self):
+        """The runner moved to services.common; the lock must stay the same."""
+        import zlib
+        for schema in ("document", "doctest_abc123"):
+            self.assertEqual(
+                migrate._lock_key(schema),
+                zlib.crc32(("memoq-harness:document:" + schema).encode("utf-8")))
+
+    def test_migrate_cli_messages_keep_the_service_name(self):
+        env = {config.ENV_DATABASE_URL: ""}
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(migrate.main([]), 2)
+        self.assertIn("document-service migrate: configuration error: "
+                      "DOCUMENT_DATABASE_URL is required.", err.getvalue())
+
     def test_migration_0001_is_unchanged(self):
         """0001 is committed and may already be applied; it must never change."""
         sql = dict(migrate.load_migrations())["0001"]
