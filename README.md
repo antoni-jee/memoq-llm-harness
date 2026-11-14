@@ -59,11 +59,13 @@ Then in the browser:
 
 ## Architecture and layout
 
-Today this is **one Streamlit process** with a local `state.json`. There are
-no separate services, no database and no containers. `app.py` holds the UI
-**and** the orchestration (loading, document switching, batch processing,
-Rerun, apply/diff, export); the `memoq_harness/` package holds the domain
-logic. Splitting this into services is planned, not started.
+Today the app is **one Streamlit process** with a local `state.json`. `app.py`
+holds the UI **and** the orchestration (loading, document switching, batch
+processing, Rerun, apply/diff, export); the `memoq_harness/` package holds the
+domain logic. Extraction into backend services has started:
+[`services/document_service`](services/document_service/README.md) (original
+files, parsing, PostgreSQL metadata) runs on its own, but the Streamlit app
+does not use it yet. There are no containers in this repository.
 
 ```
 app.py                      Streamlit UI and orchestration

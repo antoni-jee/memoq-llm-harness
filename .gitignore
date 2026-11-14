@@ -9,3 +9,8 @@ state.json.tmp
 state.json.corrupt
 exports/
 *.log
+
+# Local environment files with real settings (examples stay tracked)
+.env
+*.env
+!*.env.example

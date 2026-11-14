@@ -1,0 +1,59 @@
+"""Start document-service: ``python -m services.document_service``.
+
+All configuration comes from environment variables (see README.md in this
+directory). Run the migrations first: ``python -m services.document_service.migrate``.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+
+from . import SERVICE_NAME
+from .config import ConfigError, Settings, load_settings
+from .migrate import latest_version
+from .repository import PostgresDocumentRepository
+from .service import DocumentService
+from .storage import FileStorage
+
+
+def build_service(settings: Settings) -> DocumentService:
+    return DocumentService(
+        repository=PostgresDocumentRepository(settings.database, settings.db_schema),
+        storage=FileStorage(settings.storage_dir),
+        max_upload_bytes=settings.max_upload_bytes,
+        schema_version=latest_version(),
+    )
+
+
+def main() -> int:
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        print("%s: configuration error: %s" % (SERVICE_NAME, exc), file=sys.stderr)
+        return 2
+
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    import uvicorn
+
+    from .app import create_app
+
+    log = logging.getLogger(SERVICE_NAME)
+    log.info("starting on %s:%d; database %s schema %s; storage %s",
+             settings.host, settings.port, settings.database.redacted(),
+             settings.db_schema, settings.storage_dir)
+    uvicorn.run(
+        create_app(build_service(settings)),
+        host=settings.host,
+        port=settings.port,
+        log_level=settings.log_level,
+        server_header=False,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,9 @@
+# document-service runtime dependencies. Lower bounds are the versions tested.
+# The shared domain package `memoq_harness` is imported from the repository
+# root (put the repository root on PYTHONPATH); it needs only the standard
+# library plus the optional lxml backend below.
+starlette>=1.10
+uvicorn>=0.54
+python-multipart>=0.0.33
+pg8000>=1.31.6
+lxml>=5.0  # optional: memoq_harness falls back to xml.etree when absent

@@ -1,0 +1,211 @@
+"""PostgreSQL persistence for document-service (driver: pg8000, pure Python).
+
+A short-lived connection is opened per operation, with the configured socket
+timeout. That keeps the service correct across database restarts without a
+pool, which is adequate for this application's request rate.
+
+:class:`RepositoryError` messages are safe to return to clients: they never
+contain the database URL, credentials, SQL or server error text.
+"""
+
+from __future__ import annotations
+
+import ssl
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Iterator, Optional, Tuple
+
+import pg8000.native
+
+from .config import DatabaseSettings
+
+DB_STATUS_OK = "ok"
+DB_STATUS_UNAVAILABLE = "unavailable"
+DB_STATUS_NOT_MIGRATED = "not_migrated"
+
+
+class RepositoryError(RuntimeError):
+    """The database could not complete an operation. The message is safe to show."""
+
+
+@dataclass(frozen=True)
+class OriginalRecord:
+    original_id: str
+    document_id: str
+    filename: str
+    size_bytes: int
+    segment_count: int
+    created_at: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
+class DocumentRecord:
+    document_id: str
+    created_at: Optional[datetime]
+    originals: Tuple[OriginalRecord, ...]
+
+
+def _ssl_context(mode: str):
+    """Map a libpq-style sslmode onto pg8000's ``ssl_context`` argument."""
+    if mode == "disable":
+        return False
+    if mode == "prefer":
+        return None  # pg8000: try TLS without verification, fall back to plain
+    if mode == "require":
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+    context = ssl.create_default_context()
+    if mode == "verify-ca":
+        context.check_hostname = False
+    return context  # verify-full: certificate and host name are checked
+
+
+def open_connection(settings: DatabaseSettings, application_name: str = "document-service"):
+    """Open a pg8000 native connection. Failures raise a sanitised RepositoryError."""
+    try:
+        return pg8000.native.Connection(
+            user=settings.user,
+            password=settings.password or None,
+            host=settings.host,
+            port=settings.port,
+            database=settings.database,
+            timeout=settings.timeout,
+            ssl_context=_ssl_context(settings.sslmode),
+            application_name=application_name,
+        )
+    except (pg8000.native.Error, OSError, ssl.SSLError):
+        raise RepositoryError("Database connection failed.") from None
+
+
+def quote_schema(schema: str) -> str:
+    """Quote an already-validated schema identifier."""
+    if not schema or not all(c.islower() or c.isdigit() or c == "_" for c in schema):
+        raise ValueError("Invalid schema identifier.")
+    return '"%s"' % schema
+
+
+_ORIGINAL_COLUMNS = "original_id, document_id, filename, size_bytes, segment_count, created_at"
+
+
+def _original(row) -> OriginalRecord:
+    return OriginalRecord(
+        original_id=row[0], document_id=row[1], filename=row[2],
+        size_bytes=int(row[3]), segment_count=int(row[4]), created_at=row[5],
+    )
+
+
+class PostgresDocumentRepository:
+    """Documents and originals in one schema owned by document-service."""
+
+    def __init__(self, settings: DatabaseSettings, schema: str):
+        self.settings = settings
+        self.schema = schema
+        self._q = quote_schema(schema)
+
+    @contextmanager
+    def _session(self) -> Iterator[object]:
+        conn = open_connection(self.settings)
+        try:
+            yield conn
+        except pg8000.native.Error:
+            raise RepositoryError("Database operation failed.") from None
+        except OSError:
+            raise RepositoryError("Database connection was lost.") from None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - closing a broken socket must not mask the error
+                pass
+
+    # ------------------------------------------------------------- readiness
+
+    def status(self, expected_version: str) -> str:
+        """``ok``, ``unavailable`` or ``not_migrated`` - for the readiness probe."""
+        try:
+            with self._session() as conn:
+                conn.run("SELECT 1")
+                exists = conn.run(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = :s AND table_name = 'schema_migrations'",
+                    s=self.schema,
+                )
+                if not exists:
+                    return DB_STATUS_NOT_MIGRATED
+                rows = conn.run("SELECT max(version) FROM %s.schema_migrations" % self._q)
+                current = rows[0][0] if rows else None
+                return DB_STATUS_OK if current == expected_version else DB_STATUS_NOT_MIGRATED
+        except RepositoryError:
+            return DB_STATUS_UNAVAILABLE
+
+    # ---------------------------------------------------------------- writes
+
+    def add_original(self, record: OriginalRecord) -> Tuple[OriginalRecord, bool]:
+        """Insert the document (if new) and the original (if new), atomically.
+
+        Returns the stored record and whether this call created it. A repeated
+        identical upload returns the first record unchanged.
+        """
+        with self._session() as conn:
+            conn.run("START TRANSACTION")
+            try:
+                conn.run(
+                    "INSERT INTO %s.documents (document_id) VALUES (:d) "
+                    "ON CONFLICT (document_id) DO NOTHING" % self._q,
+                    d=record.document_id,
+                )
+                inserted = conn.run(
+                    "INSERT INTO %s.originals (original_id, document_id, filename, "
+                    "size_bytes, segment_count) VALUES (:o, :d, :f, :n, :c) "
+                    "ON CONFLICT (original_id) DO NOTHING RETURNING %s"
+                    % (self._q, _ORIGINAL_COLUMNS),
+                    o=record.original_id, d=record.document_id, f=record.filename,
+                    n=record.size_bytes, c=record.segment_count,
+                )
+                if not inserted:
+                    inserted = conn.run(
+                        "SELECT %s FROM %s.originals WHERE original_id = :o"
+                        % (_ORIGINAL_COLUMNS, self._q),
+                        o=record.original_id,
+                    )
+                    created = False
+                else:
+                    created = True
+                conn.run("COMMIT")
+            except BaseException:
+                try:
+                    conn.run("ROLLBACK")
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+        return _original(inserted[0]), created
+
+    # ----------------------------------------------------------------- reads
+
+    def get_original(self, original_id: str) -> Optional[OriginalRecord]:
+        with self._session() as conn:
+            rows = conn.run(
+                "SELECT %s FROM %s.originals WHERE original_id = :o" % (_ORIGINAL_COLUMNS, self._q),
+                o=original_id,
+            )
+        return _original(rows[0]) if rows else None
+
+    def get_document(self, document_id: str) -> Optional[DocumentRecord]:
+        with self._session() as conn:
+            docs = conn.run(
+                "SELECT document_id, created_at FROM %s.documents WHERE document_id = :d" % self._q,
+                d=document_id,
+            )
+            if not docs:
+                return None
+            rows = conn.run(
+                "SELECT %s FROM %s.originals WHERE document_id = :d "
+                "ORDER BY created_at, original_id" % (_ORIGINAL_COLUMNS, self._q),
+                d=document_id,
+            )
+        return DocumentRecord(
+            document_id=docs[0][0], created_at=docs[0][1],
+            originals=tuple(_original(r) for r in rows),
+        )

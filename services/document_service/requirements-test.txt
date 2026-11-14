@@ -1,0 +1,4 @@
+# document-service test dependencies (in addition to requirements.txt).
+-r requirements.txt
+httpx2>=2.16    # used by starlette.testclient (plain httpx also works)
+requests>=2.31  # integration tests talk to the service process over HTTP
