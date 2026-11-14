@@ -675,6 +675,96 @@ class TestExport(ServiceTestCase):
         self.assertNotIn(SECRET_TEXT, "\n".join(logs.output))
 
 
+def app_tag_report(raw, key, text, tag_source="target"):
+    """The app's tag_report_for, computed directly from a parsed document."""
+    from memoq_harness import tags as tagmod
+    segment = segments_of(raw, tag_source)[key]
+    _, report = tagmod.restore(text, segment.lookup, expected=segment.expected_numbers)
+    return "" if report.ok else report.summary()
+
+
+class TestTagReports(ServiceTestCase):
+    def setUp(self):
+        super().setUp()
+        self.original = self.upload().json()
+
+    def reports(self, texts, tag_source=None, original_id=None):
+        body = {"texts": texts}
+        if tag_source is not None:
+            body["tag_source"] = tag_source
+        return self.client.post("/originals/%s/tag-reports" % (
+            original_id or self.original["original_id"]), json=body)
+
+    def test_reports_equal_the_app_logic_in_both_tag_modes(self):
+        cases = {
+            "1#0": ["Click {1}Save{2} now.", "Click {1}Save now.", "Click {1}{1}Save{2}.",
+                    "Click {1}Save{2}{9}.", "No tags at all."],
+            "11#10": ["{1}Nested {2}formatting{3} here{4} plus {5}.", "{1}{2}{3}"],
+            "9#8": ["Neu geschrieben."],           # empty target in the original
+            "12#11": ["Export the report to PDF."],  # no tags
+            "7#6": ["Literal {1} kept as text."],   # alternate placeholder scheme
+        }
+        for tag_source in ("target", "source"):
+            for key, texts in cases.items():
+                for text in texts:
+                    with self.subTest(tag_source=tag_source, key=key, text=text):
+                        response = self.reports({key: text}, tag_source)
+                        self.assertEqual(response.status_code, 200, response.text)
+                        self.assertEqual(response.json()["tag_source"], tag_source)
+                        self.assertEqual(response.json()["reports"][key],
+                                         app_tag_report(SAMPLE, key, text, tag_source))
+
+    def test_report_values(self):
+        body = self.reports({"1#0": "Click {1}Save{2}.", "11#10": "{1}x"}).json()
+        self.assertEqual(body["reports"]["1#0"], "")
+        self.assertIn("missing", body["reports"]["11#10"])
+
+    def test_default_tag_source_is_target(self):
+        body = self.reports({"1#0": "Click {1}Save{2}."}).json()
+        self.assertEqual(body["tag_source"], "target")
+
+    def test_whole_request_validation_and_unknown_keys(self):
+        unknown = self.reports({"1#0": "x", "99#99": "y"})
+        self.assertEqual(unknown.status_code, 422)
+        self.assertEqual(unknown.json()["error"], "unknown_segment")
+        self.assertEqual(unknown.json()["details"]["keys"], ["99#99"])
+        url = "/originals/%s/tag-reports" % self.original["original_id"]
+        for body in ([], {}, {"texts": {}}, {"texts": []}, {"texts": {"1#0": 5}},
+                     {"texts": {"1#0": "x"}, "tag_source": "both"},
+                     {"texts": {"1#0": "x"}, "extra": 1}):
+            with self.subTest(body=repr(body)[:50]):
+                self.assertEqual(self.client.post(url, json=body).status_code, 400)
+        many = {"k%d" % i: "x" for i in range(5001)}
+        self.assertEqual(self.client.post(url, json={"texts": many}).status_code, 400)
+        self.assertEqual(self.client.post(url, content=b"{}",
+                                          headers={"content-type": "text/plain"}).status_code,
+                         415)
+        self.assertEqual(self.reports({"1#0": "x"}, original_id="0" * 64).status_code, 404)
+        self.assertEqual(self.reports({"1#0": "x"}, original_id="bad").status_code, 400)
+        self.service.max_upload_bytes = 50
+        self.assertEqual(self.reports({"1#0": "x" * 200}).status_code, 413)
+
+    def test_read_only(self):
+        files = stored_files(self.storage.root)
+        originals = dict(self.repo.originals)
+        self.reports({"1#0": "Click {1}Save{2}.", "2#1": "x"})
+        self.assertEqual(stored_files(self.storage.root), files)
+        self.assertEqual(self.repo.originals, originals)
+        self.assertEqual(self.repo.exports, {})
+        self.assertEqual(self.client.get(
+            "/originals/%s/content" % self.original["original_id"]).content, SAMPLE)
+
+    def test_no_text_in_logs_or_errors(self):
+        with self.assertLogs("document-service", level="DEBUG") as logs:
+            ok = self.reports({"1#0": SECRET_TEXT})
+            bad = self.reports({"zz": SECRET_TEXT})
+            logging.getLogger("document-service").debug("end")
+        self.assertEqual(ok.status_code, 200)
+        self.assertNotIn(SECRET_TEXT, ok.text)
+        self.assertNotIn(SECRET_TEXT, bad.text)
+        self.assertNotIn(SECRET_TEXT, "\n".join(logs.output))
+
+
 class TestConfig(unittest.TestCase):
     URL = "postgresql://harness:Pa55-secret@db.internal:6543/harness_db?sslmode=require"
 

@@ -10,6 +10,7 @@ Endpoints
 ``GET  /originals/{original_id}/content`` the stored bytes, unchanged
 ``GET  /originals/{original_id}/segments`` parsed segments of that original
 ``POST /originals/{original_id}/exports``  export with explicit translations (JSON)
+``POST /originals/{original_id}/tag-reports`` tag-integrity summaries (read-only)
 ``GET  /exports/{export_id}``              metadata of one export
 ``GET  /exports/{export_id}/content``      the exported bytes
 
@@ -37,7 +38,7 @@ from memoq_harness import mqxliff, tags as tagmod
 from . import SERVICE_NAME
 from .service import (
     FILTER_FLAGS, BadRequest, DocumentService, ServiceError, TooLarge, export_to_dict,
-    original_to_dict, parse_export_request,
+    original_to_dict, parse_export_request, parse_tag_report_request,
 )
 
 log = logging.getLogger(SERVICE_NAME)
@@ -167,6 +168,21 @@ def create_app(service: DocumentService) -> Starlette:
         payload["created"] = result.created
         return JSONResponse(payload, status_code=201 if result.created else 200)
 
+    async def tag_reports(request: Request) -> Response:
+        content_type = request.headers.get("content-type", "")
+        if not content_type.lower().startswith("application/json"):
+            return _error(415, "unsupported_media_type", "Send the request as JSON.")
+        raw = await _read_capped(request, service.max_upload_bytes)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise BadRequest("The request body is not valid UTF-8 JSON.") from None
+        tag_source, texts = parse_tag_report_request(body)
+        record, reports = await run_in_threadpool(
+            service.tag_reports, request.path_params["original_id"], tag_source, texts)
+        return JSONResponse({"original_id": record.original_id, "tag_source": tag_source,
+                             "reports": reports})
+
     async def get_export(request: Request) -> Response:
         record = await run_in_threadpool(service.get_export, request.path_params["export_id"])
         return JSONResponse(export_to_dict(record))
@@ -215,6 +231,7 @@ def create_app(service: DocumentService) -> Starlette:
         Route("/originals/{original_id}/content", get_content, methods=["GET"]),
         Route("/originals/{original_id}/segments", get_segments, methods=["GET"]),
         Route("/originals/{original_id}/exports", create_export, methods=["POST"]),
+        Route("/originals/{original_id}/tag-reports", tag_reports, methods=["POST"]),
         Route("/exports/{export_id}", get_export, methods=["GET"]),
         Route("/exports/{export_id}/content", get_export_content, methods=["GET"]),
     ]

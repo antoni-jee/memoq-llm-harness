@@ -46,6 +46,8 @@ TAG_SOURCES = (tagmod.TAG_SOURCE_TARGET, tagmod.TAG_SOURCE_SOURCE)
 FILTER_FLAGS = ("skip_confirmed", "skip_locked", "use_status_attribute",
                 "use_target_state", "require_nonempty_source")
 EXPORT_REQUEST_FIELDS = ("translations", "tag_source", "filter", "mark_confirmed")
+TAG_REPORT_FIELDS = ("tag_source", "texts")
+MAX_TAG_REPORT_KEYS = 5000
 MAX_LISTED_KEYS = 20
 
 
@@ -195,6 +197,28 @@ def parse_export_request(body: object) -> ExportRequest:
         seg_filter=mqxliff.SegmentFilter(**flags),
         mark_confirmed=mark_confirmed,
     )
+
+
+def parse_tag_report_request(body: object) -> Tuple[str, Dict[str, str]]:
+    """Validate a tag-report request completely: ``(tag_source, texts)``."""
+    if not isinstance(body, dict):
+        raise BadRequest("The request body must be a JSON object.")
+    unknown = set(body) - set(TAG_REPORT_FIELDS)
+    if unknown:
+        raise BadRequest("Unknown request field(s).", {"fields": _listed(unknown)})
+    tag_source = body.get("tag_source", tagmod.TAG_SOURCE_TARGET)
+    if tag_source not in TAG_SOURCES:
+        raise BadRequest("tag_source must be one of: %s." % ", ".join(TAG_SOURCES))
+    texts = body.get("texts")
+    if not isinstance(texts, dict) or not texts:
+        raise BadRequest("'texts' must be a non-empty object mapping segment keys to "
+                         "placeholder text.")
+    if len(texts) > MAX_TAG_REPORT_KEYS:
+        raise BadRequest("At most %d texts per request." % MAX_TAG_REPORT_KEYS)
+    not_text = [k for k, v in texts.items() if not isinstance(v, str)]
+    if not_text:
+        raise BadRequest("Text values must be strings.", {"keys": _listed(not_text)})
+    return tag_source, dict(texts)
 
 
 def require_id(value: str, label: str) -> str:
@@ -361,6 +385,37 @@ class DocumentService:
         except mqxliff.MqxliffError:
             raise Inconsistent("The stored original can no longer be parsed.") from None
         return record, [serialize_segment(s) for s in parsed]
+
+    # ------------------------------------------------------------ tag reports
+
+    def tag_reports(self, original_id: str, tag_source: str,
+                    texts: Dict[str, str]) -> Tuple[OriginalRecord, Dict[str, str]]:
+        """Tag-integrity summary per text, against this original's tags.
+
+        Read-only. Exactly the app's ``tag_report_for``: ``tags.restore`` with
+        the segment's lookup and expected placeholder numbers; "" when clean,
+        otherwise the report summary (e.g. "missing 2"). The ``tag_source``
+        must match the one the texts' placeholders were numbered with.
+        """
+        if tag_source not in TAG_SOURCES:
+            raise BadRequest("tag_source must be one of: %s." % ", ".join(TAG_SOURCES))
+        record, data = self.original_content(original_id)
+        try:
+            segments = mqxliff.MqxliffDocument.from_bytes(data, record.filename).parse_segments(
+                mqxliff.SegmentFilter(), tag_source)
+        except mqxliff.MqxliffError:
+            raise Inconsistent("The stored original can no longer be parsed.") from None
+        by_key = {s.key: s for s in segments}
+        unknown = [k for k in texts if k not in by_key]
+        if unknown:
+            raise UnknownSegment("Texts name segment keys this original does not have.",
+                                 {"keys": _listed(unknown), "count": len(unknown)})
+        reports: Dict[str, str] = {}
+        for key, text in texts.items():
+            segment = by_key[key]
+            _, report = tagmod.restore(text, segment.lookup, expected=segment.expected_numbers)
+            reports[key] = "" if report.ok else report.summary()
+        return record, reports
 
     # ----------------------------------------------------------------- export
 

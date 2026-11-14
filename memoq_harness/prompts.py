@@ -186,6 +186,50 @@ def build_system_prompt(
     return "\n\n".join(parts)
 
 
+def build_batch_prompt(
+    *,
+    hard_rules_text: str,
+    vibe: str,
+    termbase: Sequence[TermEntry],
+    corrections_block: str,
+    source_lang: str,
+    target_lang: str,
+    directive: str,
+    template: str,
+    batch_index: int,
+    batch_count: int,
+    segment_count: int,
+) -> str:
+    """System prompt for one batch, or a single-row rerun within it.
+
+    The pure part of the app's prompt assembly, shared by the Streamlit app
+    and processing-service: the caller resolves the stage template, filters
+    the termbase to the relevant terms and supplies the corrections block;
+    this fills the ``{{...}}`` template values and builds the prompt.
+    """
+    return build_system_prompt(
+        hard_rules_text=hard_rules_text,
+        termbase=termbase,
+        vibe=vibe,
+        corrections_block=corrections_block,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        extra_instructions=directive,
+        template=template,
+        template_values={
+            "{{HARD_RULES}}": hard_rules_text,
+            "{{VIBE}}": vibe,
+            "{{TERMBASE}}": render_termbase(termbase),
+            "{{CORRECTIONS}}": corrections_block,
+            "{{SOURCE_LANG}}": source_lang,
+            "{{TARGET_LANG}}": target_lang,
+            "{{BATCH_NUMBER}}": str(batch_index + 1),
+            "{{BATCH_COUNT}}": str(batch_count),
+            "{{SEGMENT_COUNT}}": str(segment_count),
+        },
+    )
+
+
 def build_user_payload(records: Sequence[SegmentRecord]) -> str:
     """Serialise a chunk of segments as the user message."""
     payload = {

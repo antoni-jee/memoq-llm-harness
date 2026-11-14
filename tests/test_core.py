@@ -3211,6 +3211,40 @@ class TestTranslationRetryUnchanged(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+class TestBuildBatchPrompt(unittest.TestCase):
+    """build_batch_prompt must equal the app's former inline assembly."""
+
+    def former_inline(self, terms, template, batch_index, batch_count, segment_count):
+        # Verbatim shape of the call app.build_prompt_for made before extraction.
+        return prompts.build_system_prompt(
+            hard_rules_text="RULES", termbase=terms, vibe="VIBE",
+            corrections_block="<1: \"x\">", source_lang="English", target_lang="German",
+            extra_instructions="DIRECTIVE", template=template,
+            template_values={
+                "{{HARD_RULES}}": "RULES", "{{VIBE}}": "VIBE",
+                "{{TERMBASE}}": prompts.render_termbase(terms),
+                "{{CORRECTIONS}}": "<1: \"x\">", "{{SOURCE_LANG}}": "English",
+                "{{TARGET_LANG}}": "German", "{{BATCH_NUMBER}}": str(batch_index + 1),
+                "{{BATCH_COUNT}}": str(batch_count), "{{SEGMENT_COUNT}}": str(segment_count),
+            })
+
+    def test_equivalent_for_every_stage_template_and_none(self):
+        terms = [state.TermEntry("dashboard", "Dashboard"), state.TermEntry("save", "Speichern")]
+        templates = dict(state.default_prompt_templates())
+        templates["none"] = ""
+        for key, template in templates.items():
+            for batch_index, batch_count, count in ((0, 1, 1), (1, 3, 12), (2, 3, 7)):
+                with self.subTest(stage=key, batch=batch_index):
+                    built = prompts.build_batch_prompt(
+                        hard_rules_text="RULES", vibe="VIBE", termbase=terms,
+                        corrections_block="<1: \"x\">", source_lang="English",
+                        target_lang="German", directive="DIRECTIVE", template=template,
+                        batch_index=batch_index, batch_count=batch_count,
+                        segment_count=count)
+                    self.assertEqual(built, self.former_inline(
+                        terms, template, batch_index, batch_count, count))
+
+
 class TestPrompts(unittest.TestCase):
     def test_layers_present_and_ordered(self):
         prompt = prompts.build_system_prompt(

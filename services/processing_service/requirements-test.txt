@@ -1,0 +1,8 @@
+# processing-service test dependencies.
+# Real-engine code paths are tested offline (LLMClient._chat patched), which
+# still needs the provider SDKs to construct the client.
+-r requirements-engines.txt
+httpx2>=2.16  # used by starlette.testclient (plain httpx also works)
+# The cross-service test checks stub output against document-service's real
+# tag-report logic, so it needs document-service's runtime dependencies too.
+-r ../document_service/requirements.txt

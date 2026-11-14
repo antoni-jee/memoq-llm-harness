@@ -372,26 +372,19 @@ def build_prompt_for(records, batch_index: int) -> str:
     terms = proj.relevant_terms([r.source_text for r in records])
     corrections = proj.feedback_block(upto_batch=batch_index)
     stage_key = proj.active_stage(batch_index)
-    system_prompt = prompts.build_system_prompt(
+    # The pure assembly is shared with processing-service.
+    system_prompt = prompts.build_batch_prompt(
         hard_rules_text=proj.hard_rules_text,
-        termbase=terms,
         vibe=proj.vibe,
+        termbase=terms,
         corrections_block=corrections,
         source_lang=st.session_state.source_lang,
         target_lang=st.session_state.target_lang,
-        extra_instructions=proj.global_directive,
+        directive=proj.global_directive,
         template=proj.template_for(stage_key),
-        template_values={
-            "{{HARD_RULES}}": proj.hard_rules_text,
-            "{{VIBE}}": proj.vibe,
-            "{{TERMBASE}}": prompts.render_termbase(terms),
-            "{{CORRECTIONS}}": corrections,
-            "{{SOURCE_LANG}}": st.session_state.source_lang,
-            "{{TARGET_LANG}}": st.session_state.target_lang,
-            "{{BATCH_NUMBER}}": str(batch_index + 1),
-            "{{BATCH_COUNT}}": str(proj.batch_count),
-            "{{SEGMENT_COUNT}}": str(len(records)),
-        },
+        batch_index=batch_index,
+        batch_count=proj.batch_count,
+        segment_count=len(records),
     )
     st.session_state.last_prompt = system_prompt
     st.session_state.last_stage = stage_key

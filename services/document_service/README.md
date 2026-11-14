@@ -32,6 +32,7 @@ call it yet (that comes in a later slice).
 | `GET /originals/{original_id}/content` | The stored bytes, unchanged. |
 | `GET /originals/{original_id}/segments` | Parsed segments. Query: `tag_source` (`target` default, or `source`) and the filter flags `skip_confirmed`, `skip_locked`, `use_status_attribute`, `use_target_state`, `require_nonempty_source` (`true`/`false`, default `true`). Every segment is returned with its `skip_reason`. |
 | `POST /originals/{original_id}/exports` | Export with explicit translations (JSON, see below). 201 new export, 200 identical bytes already exported. |
+| `POST /originals/{original_id}/tag-reports` | Read-only tag-integrity check: `{"tag_source": "target", "texts": {key: placeholder text}}` -> `{"reports": {key: "" or e.g. "missing 2"}}`, computed exactly like the app (`tags.restore` with the segment's tag lookup and expected placeholders). The `tag_source` must match the one the texts were numbered with. Unknown keys -> 422; at most 5000 texts; body limited by `DOCUMENT_MAX_UPLOAD_BYTES`. Nothing is stored. |
 | `GET /exports/{export_id}` | Metadata of one export. |
 | `GET /exports/{export_id}/content` | The exported bytes. |
 

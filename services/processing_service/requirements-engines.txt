@@ -1,0 +1,6 @@
+# Optional: provider SDKs for real engines (PROCESSING_ENGINE=openai|anthropic).
+# Not needed for the default offline stub; without them the stub still starts
+# and /readyz reports "sdk_missing" only if a real engine is configured.
+-r requirements.txt
+openai>=1.40
+anthropic>=0.40
