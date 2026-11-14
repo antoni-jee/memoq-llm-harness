@@ -9,14 +9,19 @@ Endpoints
 ``GET  /originals/{original_id}``         metadata of one exact upload
 ``GET  /originals/{original_id}/content`` the stored bytes, unchanged
 ``GET  /originals/{original_id}/segments`` parsed segments of that original
+``POST /originals/{original_id}/exports``  export with explicit translations (JSON)
+``GET  /exports/{export_id}``              metadata of one export
+``GET  /exports/{export_id}/content``      the exported bytes
 
-Errors are JSON ``{"error": <code>, "message": <safe text>}``.
+Errors are JSON ``{"error": <code>, "message": <safe text>}`` plus, where
+useful, ``"details"`` holding identifiers only (segment keys, field names).
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Dict
+from typing import Dict, Optional
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
@@ -31,21 +36,42 @@ from memoq_harness import mqxliff, tags as tagmod
 
 from . import SERVICE_NAME
 from .service import (
-    BadRequest, DocumentService, ServiceError, TooLarge, original_to_dict,
+    FILTER_FLAGS, BadRequest, DocumentService, ServiceError, TooLarge, export_to_dict,
+    original_to_dict, parse_export_request,
 )
 
 log = logging.getLogger(SERVICE_NAME)
 
 # Multipart framing around the file itself; the file is still capped exactly.
 MULTIPART_OVERHEAD = 64 * 1024
-FILTER_FLAGS = ("skip_confirmed", "skip_locked", "use_status_attribute",
-                "use_target_state", "require_nonempty_source")
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
 
 
-def _error(status: int, code: str, message: str) -> JSONResponse:
-    return JSONResponse({"error": code, "message": message}, status_code=status)
+def _error(status: int, code: str, message: str,
+           details: Optional[Dict[str, object]] = None) -> JSONResponse:
+    body: Dict[str, object] = {"error": code, "message": message}
+    if details:
+        body["details"] = details
+    return JSONResponse(body, status_code=status)
+
+
+async def _read_capped(request: Request, limit: int) -> bytes:
+    """Read the request body, refusing anything larger than ``limit`` bytes."""
+    length = request.headers.get("content-length")
+    if length is not None:
+        try:
+            if int(length) > limit:
+                raise TooLarge("The request body exceeds the %d-byte limit." % limit)
+        except ValueError:
+            raise BadRequest("Invalid Content-Length header.") from None
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise TooLarge("The request body exceeds the %d-byte limit." % limit)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _flag(params, name: str, default: bool) -> bool:
@@ -114,14 +140,41 @@ def create_app(service: DocumentService) -> Starlette:
         record = await run_in_threadpool(service.get_original, request.path_params["original_id"])
         return JSONResponse(original_to_dict(record))
 
+    def attachment(data: bytes, filename: str) -> Response:
+        safe_name = filename.replace('"', "'").encode("ascii", "replace").decode("ascii")
+        return Response(data, media_type="application/xml", headers={
+            "Content-Disposition": 'attachment; filename="%s"' % safe_name,
+        })
+
     async def get_content(request: Request) -> Response:
         record, data = await run_in_threadpool(
             service.original_content, request.path_params["original_id"])
-        safe_name = record.filename.replace('"', "'")
-        return Response(data, media_type="application/xml", headers={
-            "Content-Disposition": 'attachment; filename="%s"' % safe_name.encode(
-                "ascii", "replace").decode("ascii"),
-        })
+        return attachment(data, record.filename)
+
+    async def create_export(request: Request) -> Response:
+        content_type = request.headers.get("content-type", "")
+        if not content_type.lower().startswith("application/json"):
+            return _error(415, "unsupported_media_type", "Send the export request as JSON.")
+        raw = await _read_capped(request, service.max_upload_bytes)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise BadRequest("The request body is not valid UTF-8 JSON.") from None
+        export_request = parse_export_request(body)
+        result = await run_in_threadpool(
+            service.create_export, request.path_params["original_id"], export_request)
+        payload = export_to_dict(result.export)
+        payload["created"] = result.created
+        return JSONResponse(payload, status_code=201 if result.created else 200)
+
+    async def get_export(request: Request) -> Response:
+        record = await run_in_threadpool(service.get_export, request.path_params["export_id"])
+        return JSONResponse(export_to_dict(record))
+
+    async def get_export_content(request: Request) -> Response:
+        record, data = await run_in_threadpool(
+            service.export_content, request.path_params["export_id"])
+        return attachment(data, record.filename)
 
     async def get_segments(request: Request) -> Response:
         params = request.query_params
@@ -142,7 +195,7 @@ def create_app(service: DocumentService) -> Starlette:
     async def service_error(request: Request, exc: ServiceError) -> Response:
         if exc.status >= 500:
             log.warning("%s %s -> %d %s", request.method, request.url.path, exc.status, exc.code)
-        return _error(exc.status, exc.code, exc.message)
+        return _error(exc.status, exc.code, exc.message, exc.details)
 
     async def http_error(request: Request, exc: HTTPException) -> Response:
         return _error(exc.status_code, "http_%d" % exc.status_code, str(exc.detail))
@@ -161,6 +214,9 @@ def create_app(service: DocumentService) -> Starlette:
         Route("/originals/{original_id}", get_original, methods=["GET"]),
         Route("/originals/{original_id}/content", get_content, methods=["GET"]),
         Route("/originals/{original_id}/segments", get_segments, methods=["GET"]),
+        Route("/originals/{original_id}/exports", create_export, methods=["POST"]),
+        Route("/exports/{export_id}", get_export, methods=["GET"]),
+        Route("/exports/{export_id}/content", get_export_content, methods=["GET"]),
     ]
     handlers: Dict[object, object] = {
         ServiceError: service_error,

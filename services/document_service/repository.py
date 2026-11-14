@@ -10,11 +10,12 @@ contain the database URL, credentials, SQL or server error text.
 
 from __future__ import annotations
 
+import json
 import ssl
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterator, Optional, Tuple
+from typing import Dict, Iterator, Optional, Tuple
 
 import pg8000.native
 
@@ -36,6 +37,21 @@ class OriginalRecord:
     filename: str
     size_bytes: int
     segment_count: int
+    created_at: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
+class ExportRecord:
+    export_id: str
+    original_id: str
+    filename: str
+    size_bytes: int
+    segments_written: int
+    tag_source: str
+    mark_confirmed: bool
+    warnings: Tuple[Dict[str, object], ...] = ()
+    document_id: str = ""
+    """Filled from the original on reads; not stored in the exports table."""
     created_at: Optional[datetime] = None
 
 
@@ -94,6 +110,21 @@ def _original(row) -> OriginalRecord:
     return OriginalRecord(
         original_id=row[0], document_id=row[1], filename=row[2],
         size_bytes=int(row[3]), segment_count=int(row[4]), created_at=row[5],
+    )
+
+
+_EXPORT_COLUMNS = ("e.export_id, e.original_id, e.filename, e.size_bytes, e.segments_written, "
+                   "e.tag_source, e.mark_confirmed, e.warnings, o.document_id, e.created_at")
+
+
+def _export(row) -> ExportRecord:
+    warnings = row[7]
+    if isinstance(warnings, (str, bytes)):
+        warnings = json.loads(warnings)
+    return ExportRecord(
+        export_id=row[0], original_id=row[1], filename=row[2], size_bytes=int(row[3]),
+        segments_written=int(row[4]), tag_source=row[5], mark_confirmed=bool(row[6]),
+        warnings=tuple(warnings or ()), document_id=row[8], created_at=row[9],
     )
 
 
@@ -182,7 +213,33 @@ class PostgresDocumentRepository:
                 raise
         return _original(inserted[0]), created
 
+    def add_export(self, record: ExportRecord) -> Tuple[ExportRecord, bool]:
+        """Insert an export (if new). Identical bytes return the first record."""
+        with self._session() as conn:
+            inserted = conn.run(
+                "INSERT INTO %s.exports (export_id, original_id, filename, size_bytes, "
+                "segments_written, tag_source, mark_confirmed, warnings) "
+                "VALUES (:e, :o, :f, :n, :w, :t, :m, CAST(:j AS jsonb)) "
+                "ON CONFLICT (export_id) DO NOTHING RETURNING export_id" % self._q,
+                e=record.export_id, o=record.original_id, f=record.filename,
+                n=record.size_bytes, w=record.segments_written, t=record.tag_source,
+                m=record.mark_confirmed, j=json.dumps(list(record.warnings)),
+            )
+        stored = self.get_export(record.export_id)
+        if stored is None:  # pragma: no cover - the row was just written or already present
+            raise RepositoryError("Database operation failed.")
+        return stored, bool(inserted)
+
     # ----------------------------------------------------------------- reads
+
+    def get_export(self, export_id: str) -> Optional[ExportRecord]:
+        with self._session() as conn:
+            rows = conn.run(
+                "SELECT %s FROM %s.exports e JOIN %s.originals o USING (original_id) "
+                "WHERE e.export_id = :e" % (_EXPORT_COLUMNS, self._q, self._q),
+                e=export_id,
+            )
+        return _export(rows[0]) if rows else None
 
     def get_original(self, original_id: str) -> Optional[OriginalRecord]:
         with self._session() as conn:

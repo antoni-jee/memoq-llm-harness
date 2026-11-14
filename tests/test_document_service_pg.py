@@ -6,15 +6,16 @@ read from the environment only and is never printed.
 
 What these tests create and remove, and nothing else:
 
-* one schema per test run named ``doctest_<12 hex chars>`` (plus, for the
+* one schema per test class named ``doctest_<12 hex chars>`` (plus, for the
   readiness test, the name ``doctest_<hex>_absent`` is only *queried*, never
   created);
-* the tables, index and migration record that migration 0001 creates inside
-  that schema;
+* the tables, indexes and migration records that migrations 0001 and 0002
+  create inside that schema (the upgrade test applies 0001 first, from a
+  temporary copy of that single file, then upgrades);
 * temporary storage directories under the OS temp directory.
 
-Teardown runs ``DROP SCHEMA IF EXISTS "doctest_<hex>" CASCADE`` for that
-generated name only. No other schema or object is touched.
+Each class's teardown runs ``DROP SCHEMA IF EXISTS "doctest_<hex>" CASCADE``
+for its own generated name only. No other schema or object is touched.
 
 The database role needs CREATE on the database.
 
@@ -39,9 +40,11 @@ sys.path.insert(0, ROOT)
 
 from services.document_service import config, migrate  # noqa: E402
 from services.document_service.repository import (  # noqa: E402
-    DB_STATUS_NOT_MIGRATED, DB_STATUS_OK, OriginalRecord, PostgresDocumentRepository,
-    open_connection, quote_schema,
+    DB_STATUS_NOT_MIGRATED, DB_STATUS_OK, ExportRecord, OriginalRecord,
+    PostgresDocumentRepository, open_connection, quote_schema,
 )
+
+LATEST = migrate.latest_version()
 
 ENV_TEST_URL = "HARNESS_TEST_DATABASE_URL"
 TEST_URL = os.environ.get(ENV_TEST_URL, "").strip()
@@ -65,10 +68,19 @@ class PostgresTestCase(unittest.TestCase):
             conn.close()
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def migrate(self):
+    def migrate(self, directory=migrate.MIGRATIONS_DIR):
         conn = open_connection(self.db)
         try:
-            return migrate.apply_migrations(conn, self.schema)
+            return migrate.apply_migrations(conn, self.schema, directory)
+        finally:
+            conn.close()
+
+    def tables(self):
+        conn = open_connection(self.db)
+        try:
+            return {r[0] for r in conn.run(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = :s",
+                s=self.schema)}
         finally:
             conn.close()
 
@@ -76,18 +88,12 @@ class PostgresTestCase(unittest.TestCase):
 class TestMigrationsAndRepository(PostgresTestCase):
     def test_1_migrations_create_schema_and_are_idempotent(self):
         repo = PostgresDocumentRepository(self.db, self.schema)
-        self.assertEqual(repo.status("0001"), DB_STATUS_NOT_MIGRATED)
-        self.assertEqual(self.migrate(), ["0001"])
+        self.assertEqual(repo.status(LATEST), DB_STATUS_NOT_MIGRATED)
+        self.assertEqual(self.migrate(), ["0001", "0002"])
         self.assertEqual(self.migrate(), [])
-        conn = open_connection(self.db)
-        try:
-            tables = {r[0] for r in conn.run(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = :s",
-                s=self.schema)}
-        finally:
-            conn.close()
-        self.assertEqual(tables, {"documents", "originals", "schema_migrations"})
-        self.assertEqual(repo.status("0001"), DB_STATUS_OK)
+        self.assertEqual(self.tables(),
+                         {"documents", "originals", "exports", "schema_migrations"})
+        self.assertEqual(repo.status(LATEST), DB_STATUS_OK)
 
     def test_2_repository_round_trip_survives_new_instance(self):
         self.migrate()
@@ -107,9 +113,49 @@ class TestMigrationsAndRepository(PostgresTestCase):
         self.assertIsNone(fresh.get_original("c" * 64))
         self.assertIsNone(fresh.get_document("c" * 64))
 
+        warnings = ({"key": "1#0", "missing": [2], "unknown": [], "duplicated": []},)
+        export = ExportRecord(export_id="d" * 64, original_id="a" * 64,
+                              filename="x_harness.mqxliff", size_bytes=12,
+                              segments_written=2, tag_source="target",
+                              mark_confirmed=True, warnings=warnings)
+        stored_export, created = fresh.add_export(export)
+        self.assertTrue(created)
+        self.assertEqual(stored_export.document_id, "b" * 64)
+        _, created_again = fresh.add_export(export)
+        self.assertFalse(created_again)
+        read = PostgresDocumentRepository(self.db, self.schema).get_export("d" * 64)
+        self.assertEqual(read.warnings, warnings)
+        self.assertTrue(read.mark_confirmed)
+        self.assertEqual((read.segments_written, read.tag_source), (2, "target"))
+        self.assertIsNone(fresh.get_export("e" * 64))
+
     def test_3_readiness_reports_an_unmigrated_schema(self):
         absent = PostgresDocumentRepository(self.db, self.schema + "_absent")
-        self.assertEqual(absent.status("0001"), DB_STATUS_NOT_MIGRATED)
+        self.assertEqual(absent.status(LATEST), DB_STATUS_NOT_MIGRATED)
+
+
+class TestUpgradeFrom0001(PostgresTestCase):
+    def test_upgrade_keeps_data_and_repeat_is_safe(self):
+        only_0001 = os.path.join(self.tmp, "migrations-0001")
+        os.makedirs(only_0001)
+        shutil.copy(os.path.join(migrate.MIGRATIONS_DIR, "0001_documents_and_originals.sql"),
+                    only_0001)
+        self.assertEqual(self.migrate(only_0001), ["0001"])
+        self.assertEqual(self.tables(), {"documents", "originals", "schema_migrations"})
+
+        repo = PostgresDocumentRepository(self.db, self.schema)
+        self.assertEqual(repo.status(LATEST), DB_STATUS_NOT_MIGRATED)
+        repo.add_original(OriginalRecord(original_id="a" * 64, document_id="b" * 64,
+                                         filename="x.mqxliff", size_bytes=10, segment_count=3))
+
+        self.assertEqual(self.migrate(), ["0002"])
+        self.assertEqual(self.migrate(), [])
+        self.assertEqual(repo.status(LATEST), DB_STATUS_OK)
+        self.assertEqual(repo.get_original("a" * 64).filename, "x.mqxliff")
+        _, created = repo.add_export(ExportRecord(
+            export_id="d" * 64, original_id="a" * 64, filename="x_harness.mqxliff",
+            size_bytes=12, segments_written=1, tag_source="target", mark_confirmed=False))
+        self.assertTrue(created)
 
 
 class TestServiceProcess(PostgresTestCase):
@@ -190,6 +236,30 @@ class TestServiceProcess(PostgresTestCase):
                                   files={"file": ("sample.mqxliff", raw, "application/xml")})
             self.assertEqual(again.status_code, 200)
             self.assertFalse(again.json()["created"])
+
+            exported = requests.post(
+                base + "/originals/%s/exports" % body["original_id"], timeout=30,
+                json={"translations": {"1#0": "Click {1}Save{2} to continue."}})
+            self.assertEqual(exported.status_code, 201, exported.text)
+            export = exported.json()
+            export_bytes = requests.get(
+                base + "/exports/%s/content" % export["export_id"], timeout=30).content
+            self.assertEqual(hashlib.sha256(export_bytes).hexdigest(), export["export_id"])
+        finally:
+            self.stop(proc)
+
+        proc, base = self.start(storage)
+        try:
+            meta = requests.get(base + "/exports/%s" % export["export_id"], timeout=30)
+            self.assertEqual(meta.status_code, 200)
+            self.assertEqual(meta.json()["original_id"], body["original_id"])
+            self.assertEqual(meta.json()["document_id"], body["document_id"])
+            self.assertEqual(meta.json()["segments_written"], 1)
+            again = requests.get(base + "/exports/%s/content" % export["export_id"], timeout=30)
+            self.assertEqual(again.content, export_bytes)
+            original = requests.get(base + "/originals/%s/content" % body["original_id"],
+                                    timeout=30)
+            self.assertEqual(original.content, raw)
         finally:
             self.stop(proc)
 

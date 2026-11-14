@@ -29,8 +29,9 @@ from services.document_service import config, migrate  # noqa: E402
 from services.document_service.app import create_app  # noqa: E402
 from services.document_service.repository import (  # noqa: E402
     DB_STATUS_NOT_MIGRATED, DB_STATUS_OK, DB_STATUS_UNAVAILABLE, DocumentRecord,
-    OriginalRecord, RepositoryError,
+    ExportRecord, OriginalRecord, RepositoryError,
 )
+from services.document_service.storage import EXPORTS  # noqa: E402
 from services.document_service.service import DocumentService  # noqa: E402
 from services.document_service.storage import FileStorage  # noqa: E402
 
@@ -43,6 +44,8 @@ VARIANT = SAMPLE.replace(b"<target>Das Dashboard zeigt", b"<target>Das Dashboard
 assert VARIANT != SAMPLE
 
 SECRET_TEXT = "TOPSECRET-SEGMENT-TEXT"
+# SHA-256 (LF line endings) of migration 0001 as committed in 11465dd.
+MIGRATION_0001_SHA256 = "17ca69a13b348afb953a3351ce9c1ec36837d1b9f8eb828bc28bd9681cf0fe86"
 
 
 class FakeRepository:
@@ -51,6 +54,7 @@ class FakeRepository:
     def __init__(self):
         self.documents = {}
         self.originals = {}
+        self.exports = {}
         self.status_value = DB_STATUS_OK
         self.fail = False
 
@@ -74,6 +78,22 @@ class FakeRepository:
     def get_original(self, original_id):
         self._check()
         return self.originals.get(original_id)
+
+    def add_export(self, record):
+        self._check()
+        if record.export_id in self.exports:
+            return self.get_export(record.export_id), False
+        self.exports[record.export_id] = ExportRecord(
+            **{**record.__dict__, "created_at": datetime.now(timezone.utc)})
+        return self.get_export(record.export_id), True
+
+    def get_export(self, export_id):
+        self._check()
+        stored = self.exports.get(export_id)
+        if stored is None:
+            return None
+        document_id = self.originals[stored.original_id].document_id
+        return ExportRecord(**{**stored.__dict__, "document_id": document_id})
 
     def get_document(self, document_id):
         self._check()
@@ -379,6 +399,282 @@ class TestNoLeaks(ServiceTestCase):
         self.assertNotIn(SECRET_TEXT, "\n".join(logs.output))
 
 
+def reference_export(raw, translations, tag_source="target", mark_confirmed=False):
+    """What the app's own export path (apply_translation + to_bytes) produces."""
+    doc = mqxliff.MqxliffDocument.from_bytes(raw, "ref")
+    by_key = {s.key: s for s in doc.parse_segments(tag_source=tag_source)}
+    for key, text in translations.items():
+        doc.apply_translation(by_key[key], text, mark_confirmed=mark_confirmed)
+    return doc.to_bytes()
+
+
+def segments_of(raw, tag_source="target"):
+    return {s.key: s for s in mqxliff.MqxliffDocument.from_bytes(raw, "x").parse_segments(
+        tag_source=tag_source)}
+
+
+class TestExport(ServiceTestCase):
+    TRANSLATIONS = {
+        "1#0": "Click {1}Save{2} to continue.",
+        "12#11": "Export the report to PDF.",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.a = self.upload().json()
+        self.b = self.upload(VARIANT, "variant.mqxliff").json()
+
+    def export(self, original_id=None, **body):
+        body.setdefault("translations", self.TRANSLATIONS)
+        return self.client.post("/originals/%s/exports" % (original_id or self.a["original_id"]),
+                                json=body)
+
+    def content(self, export_id):
+        return self.client.get("/exports/%s/content" % export_id)
+
+    # ------------------------------------------------------------ happy path
+
+    def test_export_applies_translations_and_preserves_the_rest(self):
+        response = self.export()
+        self.assertEqual(response.status_code, 201, response.text)
+        body = response.json()
+        self.assertTrue(body["created"])
+        self.assertEqual(body["original_id"], self.a["original_id"])
+        self.assertEqual(body["document_id"], self.a["document_id"])
+        self.assertEqual(body["segments_written"], 2)
+        self.assertEqual(body["warnings"], [])
+        self.assertTrue(body["filename"].startswith("sample_harness_"))
+
+        data = self.content(body["export_id"]).content
+        self.assertEqual(body["export_id"], hashlib.sha256(data).hexdigest())
+        before, after = segments_of(SAMPLE), segments_of(data)
+        self.assertEqual(list(before), list(after))
+        for key in before:
+            if key in self.TRANSLATIONS:
+                self.assertEqual(after[key].target_text, self.TRANSLATIONS[key])
+            else:
+                self.assertEqual(after[key].target_text, before[key].target_text, key)
+                self.assertEqual((after[key].confirmed, after[key].locked,
+                                  after[key].status, after[key].target_state),
+                                 (before[key].confirmed, before[key].locked,
+                                  before[key].status, before[key].target_state), key)
+
+    def test_export_bytes_equal_the_existing_app_export_path(self):
+        body = self.export(mark_confirmed=True).json()
+        expected = reference_export(SAMPLE, self.TRANSLATIONS, mark_confirmed=True)
+        self.assertEqual(self.content(body["export_id"]).content, expected)
+        self.assertTrue(body["mark_confirmed"])
+        after = segments_of(expected)
+        self.assertTrue(after["1#0"].confirmed)
+        self.assertFalse(segments_of(SAMPLE)["1#0"].confirmed)
+
+    def test_export_uses_the_requested_original(self):
+        # Segment 2#1 is the one whose target differs between the two originals.
+        only_other = {"1#0": "Click {1}Save{2} to continue."}
+        from_a = self.export(self.a["original_id"], translations=only_other).json()
+        from_b = self.export(self.b["original_id"], translations=only_other).json()
+        self.assertEqual(from_a["original_id"], self.a["original_id"])
+        self.assertEqual(from_b["original_id"], self.b["original_id"])
+        self.assertNotEqual(from_a["export_id"], from_b["export_id"])
+        self.assertIn("zeigt", segments_of(self.content(from_a["export_id"]).content)
+                      ["2#1"].target_text)
+        self.assertIn("bietet", segments_of(self.content(from_b["export_id"]).content)
+                      ["2#1"].target_text)
+
+    def test_original_bytes_and_fingerprint_are_unchanged(self):
+        body = self.export().json()
+        self.assertEqual(self.client.get(
+            "/originals/%s/content" % self.a["original_id"]).content, SAMPLE)
+        exported = self.content(body["export_id"]).content
+        self.assertEqual(mqxliff.MqxliffDocument.from_bytes(exported, "e").source_fingerprint(),
+                         self.a["document_id"])
+
+    def test_inline_tags_are_restored_from_the_original_xml(self):
+        nested = segments_of(SAMPLE)["11#10"]
+        text = "{1}Nested {2}formatting{3} here{4} plus {5}."
+        body = self.export(translations={"11#10": text, "1#0": "{1}Save{2} now."}).json()
+        after = segments_of(self.content(body["export_id"]).content)
+        self.assertEqual(after["11#10"].target_text, text)
+        self.assertEqual(after["11#10"].lookup.tags, nested.lookup.tags)
+        self.assertEqual(after["1#0"].target.tags, segments_of(SAMPLE)["1#0"].target.tags)
+
+    def test_tag_damage_is_reported_but_exported_like_the_app(self):
+        body = self.export(translations={"1#0": "Click {1}Save to continue."}).json()
+        self.assertEqual(body["warnings"], [
+            {"key": "1#0", "missing": [2], "unknown": [], "duplicated": []}])
+        exported = self.content(body["export_id"]).content
+        self.assertEqual(exported, reference_export(
+            SAMPLE, {"1#0": "Click {1}Save to continue."}))
+        self.assertIn("{2}", segments_of(exported)["1#0"].target_text)  # appended
+        self.assertEqual(self.client.get("/exports/%s" % body["export_id"]).json()["warnings"],
+                         body["warnings"])
+
+    def test_source_tag_mode_and_empty_target_rows(self):
+        body = self.export(translations={"9#8": "Neu geschrieben.", "1#0": "{1}X{2}"},
+                           tag_source="source").json()
+        self.assertEqual(body["tag_source"], "source")
+        exported = self.content(body["export_id"]).content
+        self.assertEqual(exported, reference_export(
+            SAMPLE, {"9#8": "Neu geschrieben.", "1#0": "{1}X{2}"}, tag_source="source"))
+        self.assertEqual(segments_of(exported)["9#8"].target_text, "Neu geschrieben.")
+
+    def test_identical_export_is_idempotent(self):
+        first = self.export().json()
+        second = self.export(translations=dict(reversed(list(self.TRANSLATIONS.items()))))
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(second.json()["created"])
+        self.assertEqual(second.json()["export_id"], first["export_id"])
+        self.assertEqual(len(self.repo.exports), 1)
+
+    def test_metadata_and_download_round_trip(self):
+        body = self.export().json()
+        meta = self.client.get("/exports/%s" % body["export_id"]).json()
+        for field in ("export_id", "original_id", "document_id", "filename", "size_bytes",
+                      "segments_written", "tag_source", "mark_confirmed", "warnings"):
+            self.assertEqual(meta[field], body[field], field)
+        download = self.content(body["export_id"])
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(len(download.content), body["size_bytes"])
+        self.assertEqual(download.content, self.storage.read(body["export_id"], EXPORTS))
+        self.assertIn(body["filename"], download.headers["content-disposition"])
+
+    # ------------------------------------------------------------ rejections
+
+    def assert_rejected(self, response, status, code):
+        self.assertEqual(response.status_code, status, response.text)
+        self.assertEqual(response.json()["error"], code)
+        self.assertEqual(self.repo.exports, {})
+        self.assertFalse(os.path.isdir(os.path.join(self.storage.root, "exports"))
+                         and stored_files(os.path.join(self.storage.root, "exports")))
+
+    def test_unknown_original_and_segment(self):
+        self.assert_rejected(self.export("0" * 64), 404, "not_found")
+        self.assert_rejected(self.export("XYZ"), 400, "bad_request")
+        response = self.export(translations={"1#0": "ok", "99#99": "x", "1": "y"})
+        self.assert_rejected(response, 422, "unknown_segment")
+        self.assertEqual(response.json()["details"]["keys"], ["1", "99#99"])
+
+    def test_segments_by_position_or_source_text_are_not_accepted(self):
+        source_text = segments_of(SAMPLE)["1#0"].source_text
+        for key in ("0", "1", source_text):
+            with self.subTest(key=key[:20]):
+                self.assert_rejected(self.export(translations={key: "x"}), 422, "unknown_segment")
+
+    def test_non_translatable_and_empty_translations(self):
+        response = self.export(translations={"3#2": "x", "4#3": "y"})
+        self.assert_rejected(response, 422, "non_translatable_segment")
+        self.assertEqual(response.json()["details"]["reasons"],
+                         {"3#2": "confirmed", "4#3": "locked"})
+        relaxed = self.export(translations={"3#2": "Neu."}, filter={"skip_confirmed": False})
+        self.assertEqual(relaxed.status_code, 201)
+        self.repo.exports.clear()
+        shutil.rmtree(os.path.join(self.storage.root, "exports"))
+        self.assert_rejected(self.export(translations={"1#0": "  "}), 422, "empty_translation")
+
+    def test_invalid_request_shapes(self):
+        url = "/originals/%s/exports" % self.a["original_id"]
+        cases = [
+            ([], 400), ("text", 400), ({}, 400),
+            ({"translations": {}}, 400),
+            ({"translations": ["1#0", "x"]}, 400),
+            ({"translations": {"1#0": 5}}, 400),
+            ({"translations": {"1#0": None}}, 400),
+            ({"translations": {"1#0": "x"}, "extra": 1}, 400),
+            ({"translations": {"1#0": "x"}, "tag_source": "both"}, 400),
+            ({"translations": {"1#0": "x"}, "filter": {"skip_all": True}}, 400),
+            ({"translations": {"1#0": "x"}, "filter": {"skip_locked": "no"}}, 400),
+            ({"translations": {"1#0": "x"}, "filter": []}, 400),
+            ({"translations": {"1#0": "x"}, "mark_confirmed": "yes"}, 400),
+        ]
+        for body, status in cases:
+            with self.subTest(body=repr(body)[:60]):
+                self.assert_rejected(self.client.post(url, json=body), status, "bad_request")
+        self.assert_rejected(self.client.post(url, content=b"{not json",
+                                              headers={"content-type": "application/json"}),
+                             400, "bad_request")
+        self.assert_rejected(self.client.post(url, content=b"\xff\xfe",
+                                              headers={"content-type": "application/json"}),
+                             400, "bad_request")
+        self.assert_rejected(self.client.post(url, data={"translations": "x"}),
+                             415, "unsupported_media_type")
+
+    def test_oversized_request_body(self):
+        self.service.max_upload_bytes = 200
+        response = self.export(translations={"1#0": "x" * 500})
+        self.assert_rejected(response, 413, "too_large")
+
+    def test_unknown_export_ids(self):
+        self.assertEqual(self.client.get("/exports/%s" % ("0" * 64)).status_code, 404)
+        self.assertEqual(self.content("0" * 64).status_code, 404)
+        self.assertEqual(self.client.get("/exports/nope").status_code, 400)
+
+    # -------------------------------------------------------------- failures
+
+    def test_generation_failure_is_not_success(self):
+        with mock.patch.object(mqxliff.MqxliffDocument, "apply_translation",
+                               side_effect=mqxliff.MqxliffError("boom " + SECRET_TEXT)):
+            response = self.export()
+        self.assert_rejected(response, 500, "export_failed")
+        self.assertNotIn(SECRET_TEXT, response.text)
+
+    def test_validation_failure_is_not_success(self):
+        with mock.patch.object(mqxliff.MqxliffDocument, "to_bytes", return_value=b"<broken"):
+            response = self.export()
+        self.assert_rejected(response, 500, "export_validation_failed")
+
+    def test_changed_source_fails_validation(self):
+        changed = SAMPLE.replace(b"Export the report", b"Export a report", 1)
+        self.assertNotEqual(changed, SAMPLE)
+        with mock.patch.object(mqxliff.MqxliffDocument, "to_bytes", return_value=changed):
+            response = self.export()
+        self.assert_rejected(response, 500, "export_validation_failed")
+
+    def test_storage_failure_is_not_success(self):
+        with mock.patch("services.document_service.storage.os.replace",
+                        side_effect=OSError("disk full")):
+            response = self.export()
+        self.assert_rejected(response, 503, "unavailable")
+
+    def test_repository_failure_is_not_success_and_keeps_the_file(self):
+        with mock.patch.object(self.repo, "add_export",
+                               side_effect=RepositoryError("Database operation failed.")):
+            response = self.export()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.repo.exports, {})
+        export_id = hashlib.sha256(reference_export(SAMPLE, self.TRANSLATIONS)).hexdigest()
+        self.assertTrue(self.storage.has_valid(export_id, EXPORTS))  # kept for reuse
+        self.assertEqual(self.client.get("/exports/%s" % export_id).status_code, 404)
+        retry = self.export()
+        self.assertEqual(retry.status_code, 201)
+        self.assertEqual(retry.json()["export_id"], export_id)
+
+    def test_failed_overlapping_export_keeps_the_successful_file(self):
+        first = self.export().json()
+        with mock.patch.object(self.storage, "has_valid", return_value=False), \
+                mock.patch.object(self.repo, "add_export",
+                                  side_effect=RepositoryError("Database operation failed.")):
+            self.assertEqual(self.export().status_code, 503)
+        self.assertEqual(self.content(first["export_id"]).status_code, 200)
+
+    def test_missing_export_file_is_reported(self):
+        body = self.export().json()
+        os.remove(self.storage.path_for(body["export_id"], EXPORTS))
+        response = self.content(body["export_id"])
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"], "storage_inconsistent")
+
+    def test_export_logs_and_errors_hold_no_text(self):
+        secret = {"1#0": "{1}%s{2}" % SECRET_TEXT}
+        with self.assertLogs("document-service", level="DEBUG") as logs:
+            ok = self.export(translations=secret)
+            bad = self.export(translations={"77#7": SECRET_TEXT})
+            logging.getLogger("document-service").debug("end")
+        self.assertEqual(ok.status_code, 201)
+        self.assertNotIn(SECRET_TEXT, ok.text)
+        self.assertNotIn(SECRET_TEXT, bad.text)
+        self.assertNotIn(SECRET_TEXT, "\n".join(logs.output))
+
+
 class TestConfig(unittest.TestCase):
     URL = "postgresql://harness:Pa55-secret@db.internal:6543/harness_db?sslmode=require"
 
@@ -448,13 +744,24 @@ class TestConfig(unittest.TestCase):
 class TestMigrationFiles(unittest.TestCase):
     def test_versions_and_rendering(self):
         migrations = migrate.load_migrations()
-        self.assertEqual([v for v, _ in migrations], ["0001"])
-        self.assertEqual(migrate.latest_version(), "0001")
+        self.assertEqual([v for v, _ in migrations], ["0001", "0002"])
+        self.assertEqual(migrate.latest_version(), "0002")
         statements = migrate.split_statements(migrate.render(migrations[0][1], "doc_x"))
         self.assertEqual(len(statements), 3)
         self.assertTrue(all('"doc_x".' in s for s in statements))
         self.assertFalse(any("{schema}" in s for s in statements))
         self.assertIn("'^[0-9a-f]{64}$'", statements[0])  # regex braces untouched
+        exports = migrate.split_statements(migrate.render(migrations[1][1], "doc_x"))
+        self.assertEqual(len(exports), 2)
+        self.assertIn('REFERENCES "doc_x".originals', exports[0])
+        self.assertIn("'[]'::jsonb", exports[0])
+
+    def test_migration_0001_is_unchanged(self):
+        """0001 is committed and may already be applied; it must never change."""
+        sql = dict(migrate.load_migrations())["0001"]
+        self.assertEqual(
+            hashlib.sha256(sql.replace("\r\n", "\n").encode("utf-8")).hexdigest(),
+            MIGRATION_0001_SHA256)
 
     def test_split_ignores_comments_and_blank_statements(self):
         sql = "-- c1\nCREATE TABLE a (x int);\n\n-- c2\nCREATE INDEX i ON a (x);\n;\n"

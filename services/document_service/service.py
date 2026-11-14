@@ -34,15 +34,19 @@ from memoq_harness import mqxliff, tags as tagmod
 
 from . import SERVICE_NAME
 from .repository import (
-    DB_STATUS_OK, DocumentRecord, OriginalRecord, RepositoryError,
+    DB_STATUS_OK, DocumentRecord, ExportRecord, OriginalRecord, RepositoryError,
 )
-from .storage import FileStorage, StorageError
+from .storage import EXPORTS, ORIGINALS, FileStorage, StorageError
 
 log = logging.getLogger(SERVICE_NAME)
 
 _ID_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_FILENAME_CHARS = 200
 TAG_SOURCES = (tagmod.TAG_SOURCE_TARGET, tagmod.TAG_SOURCE_SOURCE)
+FILTER_FLAGS = ("skip_confirmed", "skip_locked", "use_status_attribute",
+                "use_target_state", "require_nonempty_source")
+EXPORT_REQUEST_FIELDS = ("translations", "tag_source", "filter", "mark_confirmed")
+MAX_LISTED_KEYS = 20
 
 
 # --------------------------------------------------------------------- errors
@@ -54,9 +58,11 @@ class ServiceError(Exception):
     status = 500
     code = "internal_error"
 
-    def __init__(self, message: str):
+    def __init__(self, message: str, details: Optional[Dict[str, object]] = None):
         super().__init__(message)
         self.message = message
+        self.details = details
+        """Identifiers only (segment keys, field names) - never document text."""
 
 
 class BadRequest(ServiceError):
@@ -83,6 +89,26 @@ class Inconsistent(ServiceError):
     status, code = 500, "storage_inconsistent"
 
 
+class UnknownSegment(ServiceError):
+    status, code = 422, "unknown_segment"
+
+
+class NonTranslatableSegment(ServiceError):
+    status, code = 422, "non_translatable_segment"
+
+
+class EmptyTranslation(ServiceError):
+    status, code = 422, "empty_translation"
+
+
+class ExportFailed(ServiceError):
+    status, code = 500, "export_failed"
+
+
+class ExportValidationFailed(ServiceError):
+    status, code = 500, "export_validation_failed"
+
+
 # ------------------------------------------------------------------ contracts
 
 
@@ -91,11 +117,27 @@ class DocumentRepository(Protocol):
     def add_original(self, record: OriginalRecord) -> Tuple[OriginalRecord, bool]: ...
     def get_original(self, original_id: str) -> Optional[OriginalRecord]: ...
     def get_document(self, document_id: str) -> Optional[DocumentRecord]: ...
+    def add_export(self, record: ExportRecord) -> Tuple[ExportRecord, bool]: ...
+    def get_export(self, export_id: str) -> Optional[ExportRecord]: ...
 
 
 @dataclass(frozen=True)
 class UploadResult:
     original: OriginalRecord
+    created: bool
+
+
+@dataclass(frozen=True)
+class ExportRequest:
+    translations: Dict[str, str]
+    tag_source: str
+    seg_filter: mqxliff.SegmentFilter
+    mark_confirmed: bool
+
+
+@dataclass(frozen=True)
+class ExportResult:
+    export: ExportRecord
     created: bool
 
 
@@ -108,6 +150,51 @@ def sanitize_filename(name: Optional[str]) -> str:
     cleaned = "".join(c for c in unicodedata.normalize("NFC", base)
                       if unicodedata.category(c)[0] != "C").strip()
     return cleaned[:MAX_FILENAME_CHARS] or "document.mqxliff"
+
+
+def _listed(keys) -> List[str]:
+    return sorted(keys)[:MAX_LISTED_KEYS]
+
+
+def parse_export_request(body: object) -> ExportRequest:
+    """Validate the JSON shape of an export request (not the segment keys)."""
+    if not isinstance(body, dict):
+        raise BadRequest("The request body must be a JSON object.")
+    unknown = set(body) - set(EXPORT_REQUEST_FIELDS)
+    if unknown:
+        raise BadRequest("Unknown request field(s).", {"fields": _listed(unknown)})
+
+    translations = body.get("translations")
+    if not isinstance(translations, dict) or not translations:
+        raise BadRequest("'translations' must be a non-empty object mapping segment "
+                         "keys to placeholder text.")
+    not_text = [k for k, v in translations.items() if not isinstance(v, str)]
+    if not_text:
+        raise BadRequest("Translation values must be strings.", {"keys": _listed(not_text)})
+
+    tag_source = body.get("tag_source", tagmod.TAG_SOURCE_TARGET)
+    if tag_source not in TAG_SOURCES:
+        raise BadRequest("tag_source must be one of: %s." % ", ".join(TAG_SOURCES))
+
+    flags = body.get("filter", {})
+    if not isinstance(flags, dict):
+        raise BadRequest("'filter' must be an object of boolean flags.")
+    unknown_flags = set(flags) - set(FILTER_FLAGS)
+    if unknown_flags:
+        raise BadRequest("Unknown filter flag(s).", {"fields": _listed(unknown_flags)})
+    if any(not isinstance(v, bool) for v in flags.values()):
+        raise BadRequest("Filter flags must be true or false.")
+
+    mark_confirmed = body.get("mark_confirmed", False)
+    if not isinstance(mark_confirmed, bool):
+        raise BadRequest("'mark_confirmed' must be true or false.")
+
+    return ExportRequest(
+        translations=dict(translations),
+        tag_source=tag_source,
+        seg_filter=mqxliff.SegmentFilter(**flags),
+        mark_confirmed=mark_confirmed,
+    )
 
 
 def require_id(value: str, label: str) -> str:
@@ -147,6 +234,21 @@ def original_to_dict(record: OriginalRecord) -> Dict[str, object]:
         "filename": record.filename,
         "size_bytes": record.size_bytes,
         "segment_count": record.segment_count,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
+
+
+def export_to_dict(record: ExportRecord) -> Dict[str, object]:
+    return {
+        "export_id": record.export_id,
+        "original_id": record.original_id,
+        "document_id": record.document_id,
+        "filename": record.filename,
+        "size_bytes": record.size_bytes,
+        "segments_written": record.segments_written,
+        "tag_source": record.tag_source,
+        "mark_confirmed": record.mark_confirmed,
+        "warnings": list(record.warnings),
         "created_at": record.created_at.isoformat() if record.created_at else None,
     }
 
@@ -210,9 +312,9 @@ class DocumentService:
                  segment_count)
         return UploadResult(stored, created)
 
-    def _store(self, original_id: str, raw: bytes) -> bool:
+    def _store(self, file_id: str, raw: bytes, kind: str = ORIGINALS) -> bool:
         try:
-            return self.storage.write(original_id, raw)
+            return self.storage.write(file_id, raw, kind)
         except StorageError as exc:
             raise Unavailable(str(exc)) from None
 
@@ -259,6 +361,107 @@ class DocumentService:
         except mqxliff.MqxliffError:
             raise Inconsistent("The stored original can no longer be parsed.") from None
         return record, [serialize_segment(s) for s in parsed]
+
+    # ----------------------------------------------------------------- export
+
+    def create_export(self, original_id: str, request: ExportRequest) -> ExportResult:
+        """Apply explicit translations to one original and store the result.
+
+        The caller supplies final placeholder text per segment key; this
+        service does not choose between suggestions and human edits. Segments
+        not named keep their stored target and metadata, exactly as memoQ
+        wrote them. Writing reuses ``MqxliffDocument.apply_translation`` (the
+        app's export path); tag damage is reported per segment as in the app.
+        The stored original is never modified: it is parsed into a fresh tree.
+        """
+        record, data = self.original_content(original_id)
+        try:
+            document = mqxliff.MqxliffDocument.from_bytes(data, record.filename)
+            segments = document.parse_segments(request.seg_filter, request.tag_source)
+        except mqxliff.MqxliffError:
+            raise Inconsistent("The stored original can no longer be parsed.") from None
+
+        by_key = {s.key: s for s in segments}
+        wanted = request.translations
+        unknown = [k for k in wanted if k not in by_key]
+        if unknown:
+            raise UnknownSegment("Translations name segment keys this original does not have.",
+                                 {"keys": _listed(unknown), "count": len(unknown)})
+        skipped = {k: by_key[k].skip_reason for k in wanted if by_key[k].skip_reason}
+        if skipped:
+            listed = _listed(skipped)
+            raise NonTranslatableSegment(
+                "Translations target segments the filter excludes from writing.",
+                {"keys": listed, "reasons": {k: skipped[k] for k in listed},
+                 "count": len(skipped)})
+        empty = [k for k, text in wanted.items() if not text.strip()]
+        if empty:
+            raise EmptyTranslation("Empty translations are not written; omit the segment instead.",
+                                   {"keys": _listed(empty), "count": len(empty)})
+
+        warnings: List[Dict[str, object]] = []
+        try:
+            for segment in segments:  # document order, independent of request order
+                if segment.key not in wanted:
+                    continue
+                report = document.apply_translation(
+                    segment, wanted[segment.key], mark_confirmed=request.mark_confirmed)
+                if not report.ok:
+                    warnings.append({"key": segment.key, "missing": list(report.missing),
+                                     "unknown": list(report.unknown),
+                                     "duplicated": list(report.duplicated)})
+            output = document.to_bytes()
+        except mqxliff.MqxliffError:
+            raise ExportFailed("The export could not be generated.") from None
+
+        # Validate before publishing: the result must parse and keep its source.
+        try:
+            check = mqxliff.MqxliffDocument.from_bytes(output, "verify")
+            check.parse_segments()
+            fingerprint = check.source_fingerprint()
+        except mqxliff.MqxliffError:
+            raise ExportValidationFailed("The generated export could not be re-parsed.") from None
+        if fingerprint != record.document_id:
+            raise ExportValidationFailed("The generated export changed the source document.")
+
+        export_id = hashlib.sha256(output).hexdigest()
+        self._store(export_id, output, EXPORTS)
+        candidate = ExportRecord(
+            export_id=export_id, original_id=record.original_id,
+            filename=sanitize_filename(mqxliff.export_filename(record.filename)),
+            size_bytes=len(output), segments_written=len(wanted),
+            tag_source=request.tag_source, mark_confirmed=request.mark_confirmed,
+            warnings=tuple(warnings),
+        )
+        try:
+            stored, created = self.repository.add_export(candidate)
+        except RepositoryError as exc:
+            # Keep the file: an overlapping identical export may own it.
+            log.warning("export failed at database insert; file %s kept for reuse",
+                        export_id[:12])
+            raise Unavailable(str(exc)) from None
+        log.info("export %s: %s from original %s (%d segments, %d tag warnings)",
+                 "stored" if created else "repeated", export_id[:12], original_id[:12],
+                 len(wanted), len(warnings))
+        return ExportResult(stored, created)
+
+    def get_export(self, export_id: str) -> ExportRecord:
+        require_id(export_id, "export_id")
+        record = self._repo(lambda: self.repository.get_export(export_id))
+        if record is None:
+            raise NotFound("Unknown export_id.")
+        return record
+
+    def export_content(self, export_id: str) -> Tuple[ExportRecord, bytes]:
+        record = self.get_export(export_id)
+        try:
+            data = self.storage.read(export_id, EXPORTS)
+        except StorageError as exc:
+            raise Unavailable(str(exc)) from None
+        if data is None or hashlib.sha256(data).hexdigest() != export_id:
+            log.error("stored file missing or altered for export %s", export_id[:12])
+            raise Inconsistent("The stored export file is missing or damaged.")
+        return record, data
 
     # -------------------------------------------------------------- readiness
 

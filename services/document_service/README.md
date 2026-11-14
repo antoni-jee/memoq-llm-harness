@@ -1,8 +1,9 @@
 # document-service
 
-Stores original memoQ MQXLIFF files, parses them and serves their segments.
-It is one of the backend services being extracted from the Streamlit app; the
-app does not call it yet (that comes in a later slice).
+Stores original memoQ MQXLIFF files, parses them, serves their segments and
+produces validated exports from explicit translations. It is one of the
+backend services being extracted from the Streamlit app; the app does not
+call it yet (that comes in a later slice).
 
 ## Identifiers
 
@@ -10,6 +11,8 @@ app does not call it yet (that comes in a later slice).
 | --- | --- |
 | `document_id` | The logical source document: `MqxliffDocument.source_fingerprint()`. Files whose fingerprinted source is identical share it, even if their targets differ. |
 | `original_id` | The exact uploaded bytes: SHA-256 of the file. |
+| `export_id` | The exact exported bytes: SHA-256 of the export file. |
+| segment `key` | Stable row identity within an original: `<trans-unit id>#<ordinal>` (as returned by `/segments`). |
 
 * An upload returns both. Uploading the same bytes again is idempotent
   (HTTP 200, `created: false`, the first upload's record is returned).
@@ -28,11 +31,79 @@ app does not call it yet (that comes in a later slice).
 | `GET /originals/{original_id}` | Metadata of one original. |
 | `GET /originals/{original_id}/content` | The stored bytes, unchanged. |
 | `GET /originals/{original_id}/segments` | Parsed segments. Query: `tag_source` (`target` default, or `source`) and the filter flags `skip_confirmed`, `skip_locked`, `use_status_attribute`, `use_target_state`, `require_nonempty_source` (`true`/`false`, default `true`). Every segment is returned with its `skip_reason`. |
+| `POST /originals/{original_id}/exports` | Export with explicit translations (JSON, see below). 201 new export, 200 identical bytes already exported. |
+| `GET /exports/{export_id}` | Metadata of one export. |
+| `GET /exports/{export_id}/content` | The exported bytes. |
 
-Errors are JSON: `{"error": "<code>", "message": "<text>"}`. Messages and logs
-never contain document text, the database URL or credentials. 503 means the
-database or storage is unavailable; 500 `storage_inconsistent` means a
+Errors are JSON: `{"error": "<code>", "message": "<text>"}`, plus `details`
+with identifiers only (segment keys, field names) where useful. Messages and
+logs never contain document text, the database URL or credentials. 503 means
+the database or storage is unavailable; 500 `storage_inconsistent` means a
 recorded file is missing or altered.
+
+## Export
+
+The caller supplies the final text; this service does not choose between
+model suggestions and human edits (that is workspace-service's job).
+
+```http
+POST /originals/{original_id}/exports
+Content-Type: application/json
+
+{
+  "translations": {"1#0": "Click {1}Save{2} to continue.", "12#11": "Export the report to PDF."},
+  "tag_source": "target",
+  "filter": {"skip_confirmed": true},
+  "mark_confirmed": false
+}
+```
+
+* `translations` (required): segment `key` -> placeholder text, as in the
+  segments returned for the **same** `tag_source`. Placeholder numbers are only
+  meaningful for that tag source. Segments are never identified by position
+  or source text.
+* `tag_source` (`target` default, or `source`), `filter` (the five flags of
+  `/segments`, default `true`) and `mark_confirmed` (default `false`) are
+  optional. Unknown fields are rejected.
+
+Response (201, or 200 for already exported identical bytes):
+
+```json
+{"export_id": "<sha256>", "original_id": "<sha256>", "document_id": "<fingerprint>",
+ "filename": "sample_harness_20261115-101500.mqxliff", "size_bytes": 3190,
+ "segments_written": 2, "tag_source": "target", "mark_confirmed": false,
+ "warnings": [{"key": "1#0", "missing": [2], "unknown": [], "duplicated": []}],
+ "created_at": "...", "created": true}
+```
+
+Behaviour, matching the app's existing export path
+(`MqxliffDocument.apply_translation`):
+
+* Only the named segments are written. All other rows keep their target and
+  metadata exactly as stored; the stored original itself is never modified.
+* Inline tags are restored from the original's XML. Tag damage (missing,
+  unknown, duplicated placeholders) does not block the export: it is listed
+  in `warnings`, and missing tags are appended, as in the app.
+* `mark_confirmed: true` sets `mq:status="Confirmed"` and
+  `state="translated"` on the written rows only.
+* Rejected (nothing stored): 400 invalid shape or unknown fields, 415 not
+  JSON, 413 body larger than `DOCUMENT_MAX_UPLOAD_BYTES`, 404 unknown
+  original, 422 `unknown_segment`, 422 `non_translatable_segment` (the filter
+  excludes the row, e.g. confirmed or locked - relax the filter to write it),
+  422 `empty_translation` (omit the key instead).
+* Before anything is published, the output is re-parsed and its source
+  fingerprint must equal the original's `document_id`. Otherwise 500
+  `export_validation_failed`; a generation error is 500 `export_failed`.
+* The export file is stored, then its row is inserted. A storage failure is
+  503 with no row. A database failure is 503 and the file is kept (same
+  reasoning as for originals below); no failure ever returns success.
+
+```sh
+curl -s -X POST "$BASE/originals/$ORIGINAL_ID/exports" \
+     -H "Content-Type: application/json" \
+     -d '{"translations": {"1#0": "Click {1}Save{2} to continue."}}'
+curl -s -o out.mqxliff "$BASE/exports/$EXPORT_ID/content"
+```
 
 ## Configuration
 
@@ -77,14 +148,25 @@ or invalid. Run `migrate` before starting a new version; until then
 
 ## Storage
 
-Originals are stored as `<DOCUMENT_STORAGE_DIR>/originals/<aa>/<original_id>.mqxliff`,
+Originals are stored as `<DOCUMENT_STORAGE_DIR>/originals/<aa>/<original_id>.mqxliff`
+and exports as `<DOCUMENT_STORAGE_DIR>/exports/<aa>/<export_id>.mqxliff`,
 written via a temporary file and an atomic rename. Client file names are kept
 as metadata only and never used in paths. A file is written before its
 database row. If the database insert fails, the file is **kept**: an
-overlapping upload of the same bytes may already own it, and no pre-delete
-check could rule that out without a race. Such a file is never served without
-a database record, and the next successful upload of the same bytes reuses it.
-There is no garbage collection of unreferenced files yet.
+overlapping request that produced the same bytes may already own it, and no
+pre-delete check could rule that out without a race. Such a file is never
+served without a database record, and the next successful request producing
+the same bytes reuses it. There is no garbage collection of unreferenced
+files yet.
+
+## Limitations
+
+* No garbage collection of unreferenced files after database failures.
+* An export's record keeps the metadata of the first request that produced
+  its bytes (file name with timestamp, warnings).
+* Exports are listed only by id; there is no "exports of an original" query.
+* A successful memoQ re-import of an export has not been manually confirmed;
+  validation is a re-parse plus a source-fingerprint check.
 
 ## Tests
 
@@ -97,5 +179,7 @@ python -m unittest -v tests.test_document_service_pg   # needs HARNESS_TEST_DATA
 The PostgreSQL tests are skipped unless `HARNESS_TEST_DATABASE_URL` names a
 disposable database. Per run they create one schema `doctest_<random hex>`
 per test class and drop exactly that schema at the end; nothing else is
-modified. The service-process test also starts the service twice as a
-separate process from an unrelated working directory.
+modified. They cover a fresh migration, an upgrade from 0001 to the latest
+version and a repeated run. The service-process test starts the service twice
+as a separate process from an unrelated working directory and checks that an
+upload and an export survive the restart.
