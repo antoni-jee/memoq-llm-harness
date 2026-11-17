@@ -37,6 +37,16 @@ Product enhancements are backlog unless a milestone below needs them.
   (HARNESS_BACKEND=remote) instead talks to the services over HTTP and renders a
   read-only projection of the saved workspace via harness_remote/view.py; in
   that mode it never builds a local ProjectState.
+- The remote slice's orchestration and UI are extracted from app.py into three
+  Streamlit-coupled modules at the repo root (kept out of harness_remote, which
+  stays Streamlit-free), a behavior-preserving refactor (uncommitted on top of
+  fdbd6a7): ui_common.py (UI helpers both paths share - APP_TITLE, notify,
+  flush_notice, upload_marker, upload_needs_load, _display), remote_workflow.py
+  (Open/Reload orchestration, the segments-envelope validation, the bind-payload
+  projection, and get_remote_clients with its call-time build_clients seam), and
+  remote_ui.py (the remote sidebar, grid and row). app.py re-imports every
+  shared name so its namespace and local behaviour are unchanged; no extracted
+  module imports app, so there is no circular import.
 - memoq_harness/: mqxliff.py (parse, fingerprint, export), tags.py
   (placeholders, target-canonical tags), state.py (state.json v5), llm.py
   (OpenAI-compatible and Anthropic adapters, bounded probe), prompts.py,
@@ -90,25 +100,30 @@ User-reported manual browser checks (not automated):
 - Local Qwen (Ollama) Test: inconclusive, finish_reason=length, 16 output
   tokens, reasoning present, no visible final text.
 
-## 5a. Remote-workflow read-only baseline (in progress, uncommitted; user-run acceptance complete)
+## 5a. Remote-workflow read-only baseline (committed as fdbd6a7; user-run acceptance complete)
 Starting baseline: 1483731 on feat/remote-workflow - the last commit at the
 start of this slice; it is NOT a commit containing the slice's work. Up to that
 point the history adds the three backend services and a Postgres data layer
 (9db7505, d19e5c7, f1f75cb, 59ca3ae) and the remote HTTP transport (1483731).
-On top, uncommitted, this slice adds a local/remote mode seam in app.py and a
-read-only remote UI built on harness_remote/view.py, plus
-tests/test_remote_view.py and tests/test_remote_app.py. The service-level test
-suites (tests/test_{document,workspace,processing}_service*.py) exist but were
-not run this session; only the four app/view/client suites were (148 passed,
-0 failed, 0 skipped - see SESSION_HANDOFF.md §3). The Open/Reload path unwraps
-and validates the document-service segments envelope via a narrow app.py helper,
-and the active selection is projected to the four fields the workspace bind
-parser accepts while present_keys carries every document key; a regression feeds
-the app's actual bind payload to the real parse_bind_request (see
-SESSION_HANDOFF.md §2). The Open/Reload and bind-contract fixes, and the remote read-only behaviors,
-were manually accepted by the user against the real backend services in a
-browser session (see SESSION_HANDOFF.md §3); this does not complete the remote
-workflow, which remains in progress.
+The slice itself (a local/remote mode seam in app.py, a read-only remote UI
+built on harness_remote/view.py, and tests/test_remote_view.py plus
+tests/test_remote_app.py) is committed as fdbd6a7 "feat: add read-only remote
+UI", which the user pushed to origin/feat/remote-workflow. The service-level
+test suites (tests/test_{document,workspace,processing}_service*.py) exist but
+were not run this session; only the four app/view/client suites were (148
+passed, 0 failed, 0 skipped - see SESSION_HANDOFF.md §3). The Open/Reload path
+unwraps and validates the document-service segments envelope via a narrow
+helper, and the active selection is projected to the four fields the workspace
+bind parser accepts while present_keys carries every document key; a regression
+feeds the app's actual bind payload to the real parse_bind_request (see
+SESSION_HANDOFF.md §2). The Open/Reload and bind-contract fixes, and the remote
+read-only behaviors, were manually accepted by the user against the real
+backend services in a browser session (see SESSION_HANDOFF.md §3); this does not
+complete the remote workflow, which remains in progress.
+On top of fdbd6a7, a behavior-preserving extraction refactor (uncommitted)
+splits app.py's remote responsibilities into ui_common.py, remote_workflow.py
+and remote_ui.py (§3); the four suites still pass at 148 with no test
+import/patch change.
 
 ## 6. Roadmap (proposed sequence; not an approved ADR)
 1. Completed working baseline (§5).
