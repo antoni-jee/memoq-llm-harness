@@ -36,6 +36,14 @@ from memoq_harness import (
     state as state_mod,
     xmlcompat,
 )
+from harness_remote import (
+    ConfigError,
+    RemoteError,
+    RemoteViewRecord,
+    RemoteWorkspaceView,
+    build_clients,
+    load_config,
+)
 
 APP_TITLE = "memoQ LLM Harness"
 WORKDIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +67,23 @@ def bootstrap() -> None:
     """Create the session objects exactly once per browser session."""
     ss = st.session_state
     if ss.get("_ready"):
+        return
+
+    # Mode seam: decide remote-vs-local before touching any local project state.
+    # A remote session never constructs a ProjectState, and a bad remote config
+    # never falls back to local - it is a hard stop.
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        ss._config_error = True
+        ss._config_error_text = str(exc)
+        ss._ready = True
+        return
+    ss.remote_config = config
+    ss.remote_mode = config.is_remote
+
+    if config.is_remote:
+        _bootstrap_remote()
         return
 
     ss.project = state_mod.ProjectState.load(STATE_PATH)
@@ -102,6 +127,209 @@ def bootstrap() -> None:
     ss.setdefault("termbase_source", "")
     ss.model_list: List[str] = []
     ss._ready = True
+
+
+def _bootstrap_remote() -> None:
+    """Session state for remote mode: no ProjectState, no local document.
+
+    The remote path reads through the cached remote clients and renders a
+    read-only view. Editing, saving, processing and exporting are out of scope
+    for this slice, so none of the local mutation/session state is created.
+    """
+    ss = st.session_state
+    ss.project = None
+    ss.document = None
+    ss.remote_view = None
+    ss.remote_open_marker = None
+    ss.remote_batch = 0
+    ss.remote_page = 0
+    ss.remote_page_size = 0
+    ss.remote_tag_source = mqxliff.tagmod.TAG_SOURCE_TARGET
+    ss._remote_clients = None
+    ss._ready = True
+
+
+def get_remote_clients():
+    """Lazily build and cache the remote clients for this session.
+
+    Cached under an explicit owner key so a rerun reuses the same session
+    objects instead of building a second set (and abandoning the first). The
+    construction import is resolved at call time so a test can substitute fake
+    clients at the ``harness_remote.build_clients`` seam.
+    """
+    ss = st.session_state
+    cached = ss.get("_remote_clients")
+    if cached is not None:
+        return cached
+    from harness_remote import build_clients as _build_clients
+    ss._remote_clients = _build_clients(ss.remote_config)
+    return ss._remote_clients
+
+
+def _remote_error_text(exc: RemoteError) -> str:
+    """Operator-safe text for a remote failure: the client's own message, plus
+    a revision hint for a 409 conflict. No raw body or URL ever reaches this."""
+    text = exc.message
+    if exc.is_conflict and exc.current_revision is not None:
+        text += " (current revision %d)" % exc.current_revision
+    return text
+
+
+# The fields the bind contract and the active-selection decision read. The other
+# serialized fields are presentation-only; a response that omits these as
+# strings, or that carries an item this workflow cannot read, is malformed.
+_BIND_REQUIRED_FIELDS = ("key", "unit_id", "source_text", "target_text")
+
+
+def _document_segments(response):
+    """Unwrap and validate the document-service ``/segments`` 2xx body.
+
+    That endpoint returns ``{"original_id", "document_id", "tag_source",
+    "filter", "segments": [...]}``. A 2xx that is not that object, that omits a
+    ``segments`` list, or that carries a segment this workflow cannot read - an
+    item that is not an object, that omits one of the required fields as a
+    string, or that has a non-boolean ``translatable`` - is a malformed success:
+    reject it with an explicit :class:`RemoteError` before the caller builds the
+    bind payload or the view, rather than let a caller iterate the envelope's
+    string keys (a bare ``AttributeError``), read a missing list as an empty
+    document, or index a field that is absent on one item.
+    """
+    if not isinstance(response, dict):
+        raise RemoteError(
+            service="document", status=None, code="bad_response",
+            message="The segments response was not the expected object.")
+    segments = response.get("segments")
+    if not isinstance(segments, list):
+        raise RemoteError(
+            service="document", status=None, code="bad_response",
+            message="The segments response did not carry a segments list.")
+    for index, item in enumerate(segments):
+        if not isinstance(item, dict):
+            raise RemoteError(
+                service="document", status=None, code="bad_response",
+                message="Segment %d of the segments response is not an object."
+                        % index)
+        for field in _BIND_REQUIRED_FIELDS:
+            if not isinstance(item.get(field), str):
+                raise RemoteError(
+                    service="document", status=None, code="bad_response",
+                    message="Segment %d is missing its %r field."
+                            % (index, field))
+        if not isinstance(item.get("translatable"), bool):
+            raise RemoteError(
+                service="document", status=None, code="bad_response",
+                message="Segment %d has an invalid 'translatable' field."
+                        % index)
+    return segments
+
+
+def _bind_payload(doc_segments):
+    """Split a validated segment list into the bind's two parts.
+
+    ``active`` is the translatable selection, each item projected to exactly the
+    four fields the workspace parser accepts (the full 16-field serialized
+    segment is not a valid bind item - its extra fields are rejected).
+    ``present_keys`` is every document key in order, so a row the filter
+    currently hides is not discarded from the saved workspace.
+    """
+    active = [{field: segment[field] for field in _BIND_REQUIRED_FIELDS}
+              for segment in doc_segments if segment["translatable"]]
+    present_keys = [segment["key"] for segment in doc_segments]
+    return active, present_keys
+
+
+def remote_open(raw: bytes, filename: str) -> None:
+    """Upload a document, read its segments and bind the saved workspace.
+
+    Builds a fresh read-only view and assigns it only on full success, so a
+    failed Open never leaves a half-merged view behind. No ProjectState is
+    touched. Any failure raises :class:`RemoteError`; the caller keeps the
+    live view and shows the safe message.
+    """
+    ss = st.session_state
+    clients = get_remote_clients()
+    tag_source = ss.get("remote_tag_source", "target")
+
+    upload_result = clients.document.upload(raw, filename=filename)
+    document_id = str(upload_result.get("document_id") or "")
+    original_id = str(upload_result.get("original_id") or "")
+    if not document_id or not original_id:
+        raise RemoteError(
+            service="document", status=None, code="bad_response",
+            message="The upload did not return a document and original id.",
+        )
+
+    doc_segments = _document_segments(
+        clients.document.segments(original_id, tag_source=tag_source))
+    active_segments, present_keys = _bind_payload(doc_segments)
+    # bind carries only the active (translatable) selection, projected to the four
+    # fields the workspace accepts; present_keys keeps every document key so the
+    # workspace prunes nothing it cannot see (a row the filter hides is not
+    # discarded).
+    clients.workspace.bind(
+        document_id, original_id, source_file=filename, tag_source=tag_source,
+        segments=active_segments, present_keys=present_keys,
+    )
+    snapshot = clients.workspace.get_workspace(document_id)
+    # The full canonical list drives the read-only view; the projected active
+    # selection above is a separate view of the same document.
+    view = RemoteWorkspaceView.from_remote(doc_segments, snapshot)
+
+    ss.remote_view = view
+    ss.remote_batch = 0
+    ss.remote_page = 0
+    counts = view.counts()
+    notify("success", "Opened **%s** - %d segment(s), %d batch(es) of %d."
+           % (filename, counts.get("active", 0), view.batch_count, view.batch_size))
+
+
+def maybe_remote_open(raw: bytes, filename: str) -> bool:
+    """Open only for a file version not yet opened.
+
+    Streamlit re-exposes the same upload on every rerun; the upload marker
+    keeps that from rebinding the document, so a rerender does not re-upload,
+    re-bind or clear the view. Returns True when an open happened.
+    """
+    ss = st.session_state
+    marker = upload_marker(filename, raw)
+    if not upload_needs_load(marker, ss.get("remote_open_marker")):
+        return False
+    ss.remote_open_marker = marker
+    remote_open(raw, filename)
+    return True
+
+
+def remote_reload() -> None:
+    """Re-read the saved workspace and refresh the view, checking identity.
+
+    A read only: no upload, no bind. If the reloaded workspace no longer names
+    the same original or the same tag source, the view we have shown cannot be
+    trusted and is cleared so the operator must open again explicitly, rather
+    than a silent merge of two different documents.
+    """
+    ss = st.session_state
+    view = ss.get("remote_view")
+    if view is None:
+        return
+    clients = get_remote_clients()
+    snapshot = clients.workspace.get_workspace(view.document_id)
+    reloaded = RemoteWorkspaceView.from_remote([], snapshot)
+    if (reloaded.original_id != view.original_id
+            or reloaded.tag_source != view.tag_source):
+        ss.remote_view = None
+        ss.remote_open_marker = None
+        notify("error",
+               "The saved workspace no longer matches the open document "
+               "(original or tag source changed). Re-open it to continue; no "
+               "changes were merged.")
+        return
+    # Refresh the document segments so source text and the original target are
+    # current, then rebuild the view over the refreshed read.
+    doc_segments = _document_segments(
+        clients.document.segments(view.original_id, tag_source=view.tag_source))
+    view = RemoteWorkspaceView.from_remote(doc_segments, snapshot)
+    ss.remote_view = view
+    notify("success", "Reloaded saved work - revision %d." % view.revision)
 
 
 def project() -> state_mod.ProjectState:
@@ -1394,12 +1622,184 @@ def _display(text: str) -> str:
     return text.replace("\n", " ")
 
 
+# -------------------------------------------------- remote read-only path
+
+
+def render_remote_sidebar() -> None:
+    """Remote-mode sidebar: read-only Open/Reload, no local controls.
+
+    This is an *initial read-only integration*: it opens a document through the
+    document service, binds the saved workspace and shows the segments. Editing,
+    processing, applying, analysis and export are not wired in this slice, so
+    no widget that writes to a segment exists here.
+    """
+    ss = st.session_state
+    with st.sidebar:
+        st.title(APP_TITLE)
+        st.caption("Remote mode - initial read-only integration")
+
+        st.header("1. Connection")
+        st.info("Backend: remote (document / workspace / processing services).")
+
+        st.header("2. Document")
+        upload = st.file_uploader("memoQ bilingual XLIFF",
+                                 type=["mqxliff", "xliff", "xlf", "xml"])
+        if upload is None:
+            # Emptying the uploader re-arms it, mirroring the local sidebar.
+            ss.remote_open_marker = None
+        else:
+            data = upload.getvalue()
+            try:
+                if maybe_remote_open(data, upload.name):
+                    st.rerun()
+            except RemoteError as exc:
+                # The marker is already recorded, so a bad file is not retried on
+                # every rerun. A failed Open leaves the live view untouched
+                # (remote_open only assigns on full success); just report it safely.
+                notify("error", _remote_error_text(exc))
+
+        view = ss.get("remote_view")
+        if view is not None:
+            counts = view.counts()
+            col_a, col_b = st.columns(2)
+            col_a.metric("Segments", counts.get("active", 0))
+            col_b.metric("Batches", view.batch_count)
+            if st.button("Reload saved work", width='stretch',
+                        help="Re-read the saved workspace and refresh the "
+                             "segments. Checks the document identity has not "
+                             "changed."):
+                try:
+                    remote_reload()
+                except RemoteError as exc:
+                    # A malformed or unavailable read keeps the live view
+                    # (remote_reload reassigns it only on full success); report
+                    # it safely, mirroring the Open path, instead of raising into
+                    # the run.
+                    notify("error", _remote_error_text(exc))
+                st.rerun()
+        else:
+            st.info("Upload a `.mqxliff` file to open its saved work "
+                    "read-only.")
+
+
+def render_remote_grid() -> None:
+    """Read-only segment grid for remote mode.
+
+    Presentation only: it shows the merged segments - source, the memoQ
+    original target, the model's proposal and the human's saved text - with
+    presentation-only batch navigation. No editable field, no
+    Process/Apply/Rerun/Analyze/Export, no tag injection.
+    """
+    ss = st.session_state
+    view = ss.get("remote_view")
+    if view is None:
+        st.info("Upload a `.mqxliff` file in the sidebar to open its saved "
+                "work read-only.")
+        return
+    if view.is_empty:
+        st.warning("No segments are saved for this workspace yet.")
+        return
+
+    batch_index = min(ss.get("remote_batch", 0), view.batch_count - 1)
+    ss.remote_batch = batch_index
+    records = view.batch_records(batch_index)
+    progress = view.progress(batch_index)
+
+    head_left, head_right = st.columns([3, 2])
+    with head_left:
+        st.subheader("Batch %d of %d" % (batch_index + 1, view.batch_count))
+        st.caption("%d segments - %d processed, %d applied, %d edited"
+                   % (progress.total, progress.processed, progress.applied,
+                      progress.edited))
+    with head_right:
+        st.progress(progress.applied / max(1, progress.total))
+
+    # Presentation-only navigation: it moves the batch but never runs a diff or
+    # a save, so nothing the operator sees can mutate a segment.
+    nav = st.columns([1, 1, 2])
+    target = batch_index
+    if nav[0].button("Previous", width='stretch', disabled=batch_index == 0):
+        target = batch_index - 1
+    if nav[1].button("Next", width='stretch',
+                     disabled=batch_index >= view.batch_count - 1):
+        target = batch_index + 1
+    jump = nav[2].number_input(
+        "Go to", 1, view.batch_count, value=batch_index + 1,
+        key="remote_batch_jump_%d" % batch_index,
+        label_visibility="collapsed",
+    )
+    if target == batch_index and int(jump) - 1 != batch_index:
+        target = int(jump) - 1
+    if target != batch_index:
+        ss.remote_batch = max(0, min(target, view.batch_count - 1))
+        ss.remote_page = 0
+        st.rerun()
+
+    page_size = ss.get("remote_page_size", 0) or len(records)
+    page_count = max(1, (len(records) + page_size - 1) // page_size)
+    page = min(ss.get("remote_page", 0), page_count - 1)
+    if page_count > 1:
+        page = st.radio(
+            "Page", range(page_count), index=page, horizontal=True,
+            format_func=lambda p: "%d-%d" % (p * page_size + 1,
+                                             min((p + 1) * page_size, len(records))),
+        )
+    ss.remote_page = page
+    visible = records[page * page_size: (page + 1) * page_size]
+
+    st.divider()
+
+    header = st.columns([1, 3, 3, 4, 3])
+    for col, label in zip(header, ("ID", "Source", "memoQ target",
+                                   "Model proposal", "Your saved text")):
+        col.markdown("**%s**" % label)
+
+    for record in visible:
+        _render_remote_row(record)
+
+
+def _render_remote_row(record: RemoteViewRecord) -> None:
+    """One read-only segment row: four text columns, no editable field.
+
+    The memoQ original target, the model's proposal and the human's saved text
+    are kept in their own columns so the operator can see which side produced
+    which text.
+    """
+    cols = st.columns([1, 3, 3, 4, 3])
+    with cols[0]:
+        st.markdown("`%s`" % record.segment_id)
+        if record.edited_by_human:
+            st.caption("edited")
+        if record.status in ("processed", "applied"):
+            st.caption(record.status)
+        if record.tag_report:
+            st.caption(":red[tags]")
+    cols[1].markdown(_display(record.source_text) or ":grey[(empty)]")
+    cols[2].markdown(_display(record.mt_target) or ":grey[(empty)]")
+    cols[3].markdown(_display(record.llm_suggestion) or ":grey[(none)]")
+    cols[4].markdown(_display(record.user_final) or ":grey[(none)]")
+
+
 # ---------------------------------------------------------------- entrypoint
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide", initial_sidebar_state="expanded")
     bootstrap()
+    flush_notice()
+
+    # Remote mode is a read-only path with its own sidebar and grid, and it
+    # must never run the local mutation widgets.
+    if st.session_state.get("_config_error"):
+        st.error("Remote configuration is invalid or incomplete: %s"
+                 % st.session_state.get("_config_error_text", ""))
+        return
+    if st.session_state.get("remote_mode"):
+        render_remote_sidebar()
+        flush_notice()
+        render_remote_grid()
+        return
+
     render_sidebar()
     flush_notice()
 

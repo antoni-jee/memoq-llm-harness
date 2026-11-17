@@ -16,6 +16,11 @@ from .client import (
     WorkspaceClient,
     build_clients,
 )
+from .view import (
+    BatchProgress,
+    RemoteViewRecord,
+    RemoteWorkspaceView,
+)
 from .config import (
     ENV_BACKEND,
     ENV_DOCUMENT_URL,
@@ -45,4 +50,7 @@ __all__ = [
     "ProcessingClient",
     "RemoteClients",
     "build_clients",
+    "RemoteWorkspaceView",
+    "RemoteViewRecord",
+    "BatchProgress",
 ]

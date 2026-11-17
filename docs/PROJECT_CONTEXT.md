@@ -24,12 +24,19 @@ Product enhancements are backlog unless a milestone below needs them.
 - Commercial-use claims and performance figures must be based on specific
   user-confirmed facts. Do not attribute future portfolio infrastructure
   to earlier commercial use.
-- All infrastructure in §6 is future portfolio work; the proposed services,
-  database and containers are not implemented.
+- On feat/remote-workflow (up to the 1483731 baseline) the three backend
+  services (document, workspace, processing) and a Postgres data layer
+  (migrations, services/common/db.py) plus the remote HTTP transport
+  (harness_remote/) now exist as committed code. Containers, Helm/Kubernetes,
+  GitLab CI/CD, IaC, DNS/TLS, FluxCD and observability (§6 steps 3-6) are still
+  not implemented.
 
 ## 3. Current architecture (single application)
 - app.py: Streamlit UI AND orchestration (load, document switching, batch
-  processing, Rerun, apply/diff, export, model Test handling).
+  processing, Rerun, apply/diff, export, model Test handling). A remote mode
+  (HARNESS_BACKEND=remote) instead talks to the services over HTTP and renders a
+  read-only projection of the saved workspace via harness_remote/view.py; in
+  that mode it never builds a local ProjectState.
 - memoq_harness/: mqxliff.py (parse, fingerprint, export), tags.py
   (placeholders, target-canonical tags), state.py (state.json v5), llm.py
   (OpenAI-compatible and Anthropic adapters, bounded probe), prompts.py,
@@ -37,7 +44,9 @@ Product enhancements are backlog unless a milestone below needs them.
 - Generated, never hand-edited: defaults.py, prompt_templates.py
   (generator: tools/build_defaults.py).
 - Data: config/termbase.csv. Local state: state.json. Exports: exports/.
-- No services, database, containers or CI exist yet.
+- Backend services and a Postgres data layer exist (see §2); the frontend now
+  has a remote mode that talks to them over HTTP. Containers, CI/CD and
+  deployment do not exist yet.
 
 ## 4. Persistence (implemented)
 - state.py: schema v5 with migrations; save via sibling .tmp + os.replace;
@@ -81,18 +90,41 @@ User-reported manual browser checks (not automated):
 - Local Qwen (Ollama) Test: inconclusive, finish_reason=length, 16 output
   tokens, reasoning present, no visible final text.
 
+## 5a. Remote-workflow read-only baseline (in progress, uncommitted; user-run acceptance complete)
+Starting baseline: 1483731 on feat/remote-workflow - the last commit at the
+start of this slice; it is NOT a commit containing the slice's work. Up to that
+point the history adds the three backend services and a Postgres data layer
+(9db7505, d19e5c7, f1f75cb, 59ca3ae) and the remote HTTP transport (1483731).
+On top, uncommitted, this slice adds a local/remote mode seam in app.py and a
+read-only remote UI built on harness_remote/view.py, plus
+tests/test_remote_view.py and tests/test_remote_app.py. The service-level test
+suites (tests/test_{document,workspace,processing}_service*.py) exist but were
+not run this session; only the four app/view/client suites were (148 passed,
+0 failed, 0 skipped - see SESSION_HANDOFF.md §3). The Open/Reload path unwraps
+and validates the document-service segments envelope via a narrow app.py helper,
+and the active selection is projected to the four fields the workspace bind
+parser accepts while present_keys carries every document key; a regression feeds
+the app's actual bind payload to the real parse_bind_request (see
+SESSION_HANDOFF.md §2). The Open/Reload and bind-contract fixes, and the remote read-only behaviors,
+were manually accepted by the user against the real backend services in a
+browser session (see SESSION_HANDOFF.md §3); this does not complete the remote
+workflow, which remains in progress.
+
 ## 6. Roadmap (proposed sequence; not an approved ADR)
 1. Completed working baseline (§5).
 2. Incrementally extract at least three backend services, keeping the
    existing frontend; add PostgreSQL and storage for original/export files.
+   In progress on feat/remote-workflow: the three services and a Postgres data
+   layer exist (see §5a); the frontend remote mode renders them read-only.
 3. Reproducible containers and Docker Compose, introduced alongside step 2.
 4. DO14: Helm/Kubernetes; GitLab CI/CD with exactly the stages build, test,
    staging, prod; GitLab Runner in Kubernetes.
 5. Server provisioning/IaC, DNS/TLS and FluxCD GitOps.
 6. Observability, tested backup/restore, failure/recovery demonstrations.
 7. Portfolio packaging.
-Service boundaries and the deployment stack are proposals only. One bounded
-ADR is to be written after the exact DO14 requirements are reviewed.
+The deployment stack (containers, DO14, IaC, observability - steps 3-6) remains
+a proposal; the service boundaries and the Postgres data layer are already
+implemented and committed.
 
 ## 7. Known limitations (carried into later phases)
 - Original files are not stored; reload them after a restart.
