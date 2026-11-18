@@ -120,17 +120,65 @@ SESSION_HANDOFF.md §2). The Open/Reload and bind-contract fixes, and the remote
 read-only behaviors, were manually accepted by the user against the real
 backend services in a browser session (see SESSION_HANDOFF.md §3); this does not
 complete the remote workflow, which remains in progress.
-On top of fdbd6a7, a behavior-preserving extraction refactor (uncommitted)
-splits app.py's remote responsibilities into ui_common.py, remote_workflow.py
-and remote_ui.py (§3); the four suites still pass at 148 with no test
-import/patch change.
+On top of fdbd6a7, a behavior-preserving extraction refactor splits app.py's
+remote responsibilities into ui_common.py, remote_workflow.py and remote_ui.py
+(§3); committed and pushed as 5258ffc "refactor: split remote UI and
+workflow" (148 passing in the four suites).
+
+## 5b. Remote edit/save slice (uncommitted on top of 5258ffc; user browser acceptance recorded)
+- Editable "Your text" (text_area) and comment (text_input) cells per row feed a
+  session-scoped draft store in remote_workflow.py:
+  {document_id: {key: {text, comment, base_text, base_comment}}}. Original
+  target, model suggestion, saved user text and the unsaved draft stay
+  distinct (the saved value is shown under an edited cell). Drafts survive
+  reruns and batch/page navigation; they do not survive a browser refresh.
+- Explicit Save sends only edited fields (an explicit "" is sent as "") through
+  the existing PATCH /workspaces/{id}/segments contract with the view's
+  revision as expected_revision; no edited field means no request. No backend
+  or client code changed.
+- Dirty Open/Reload is held for an explicit answer: Save and open/reload,
+  Discard and open/reload, Reload keeping changes, or Cancel. A failed or
+  stale Save stops the transition and keeps the drafts. A successful Open
+  starts with an empty draft store, so drafts never move between documents.
+- Conflicts: after a 409 stale_revision the app re-reads (read only) and
+  rebases the drafts per field; an edited field whose saved value changed
+  elsewhere is a conflict that disables Save until the operator picks Keep
+  mine or Use server on that row. Nothing is replayed automatically.
+- Ambiguous failures (transport error, 5xx, malformed 2xx): no "saved" claim;
+  the app re-reads to reconcile and marks clean only changes the server holds.
+  If the re-read fails, drafts stay unsaved and a later Save at the old
+  revision is refused by the server, so nothing is overwritten.
+- Fix pass after the first browser test: Save/Discard moved to the sidebar
+  above Reload (always visible; disabled when not applicable; Save primary
+  when an eligible draft exists) with a "drafts until Save; a browser refresh
+  can lose them" note. A Conflicts panel above the grid lists every conflict
+  (any batch/page) with draft / now-saved / started-from values and Keep
+  mine / Use server / Show row; choices only change the draft. While a
+  conflict is unresolved, Save, Save-and-open and Save-and-reload are disabled
+  and refused. The sidebar shows the open document (name, revision, id)
+  apart from the uploader's selection; Cancel empties the uploader (fresh
+  widget key). Reselecting the open file version (same name and bytes) does
+  nothing - no upload, bind or prompt.
+- Widget re-keying is per row: within one document a handler re-keys only
+  the cells whose shown value changes (Use server, Discard, a saved value that
+  moved); kept drafts (after a 409/re-read, Keep mine, a just-saved edit) keep
+  their widget and are not remounted in the browser. Open re-keys everything.
+- UI follow-ups (deferred, not started): compact conflict layout; Show row
+  behaviour on the same page (it only switches batch/page, no scroll);
+  network-error dialog UX; copy-to-draft buttons.
+- Tests: tests/test_remote_edit.py (29) drives the app against the real
+  WorkspaceClient + workspace Starlette app + WorkspaceService over an
+  in-memory repository; final-code results (177 across five suites) and the
+  user's browser acceptance are in SESSION_HANDOFF.md §3. Not confirmed in the
+  browser: Save -> Reload after a workspace tunnel reconnects.
 
 ## 6. Roadmap (proposed sequence; not an approved ADR)
 1. Completed working baseline (§5).
 2. Incrementally extract at least three backend services, keeping the
    existing frontend; add PostgreSQL and storage for original/export files.
    In progress on feat/remote-workflow: the three services and a Postgres data
-   layer exist (see §5a); the frontend remote mode renders them read-only.
+   layer exist (see §5a); the frontend remote mode opens, renders, edits and
+   saves through them (§5b); Process/Apply/Export are not wired yet.
 3. Reproducible containers and Docker Compose, introduced alongside step 2.
 4. DO14: Helm/Kubernetes; GitLab CI/CD with exactly the stages build, test,
    staging, prod; GitLab Runner in Kubernetes.
@@ -147,7 +195,9 @@ implemented and committed.
 - No revision matching or automatic transfer across changed source XML.
 - Identical source identity can share state despite different translations.
 - Successful memoQ re-import/round-trip not manually confirmed.
-- Browser uploader: only helper logic is tested. No concurrency safety.
+- Browser uploader: only helper logic is tested. No concurrency safety in
+  local mode; remote saves are revision-checked (§5b).
+- Remote drafts are session-only: a browser refresh or app restart loses them.
 - parse_segments selects `seg-source or source` (element truthiness).
 - Other save() call sites do not catch StateBackupError/OSError.
 - Empty-text semantics and prompt block order vs. declared authority remain

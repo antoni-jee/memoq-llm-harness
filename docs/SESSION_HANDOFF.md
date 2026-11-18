@@ -3,11 +3,10 @@
 ## 1. Environment
 - Worktree: C:\memoq-harness\memoq-harness-qwen (git worktree; do not cd to
   the main checkout). Branch: feat/remote-workflow.
-- HEAD: fdbd6a7 "feat: add read-only remote UI", which lands the remote
-  read-only slice (Open/Reload, envelope unwrap, bind-contract projection, the
-  read-only UI and its tests). The branch tracks origin/feat/remote-workflow
-  (the user pushed fdbd6a7). On top of it the current extraction refactor
-  (§2) is uncommitted working-tree work.
+- HEAD: 5258ffc "refactor: split remote UI and workflow" (pushed to
+  origin/feat/remote-workflow), on top of fdbd6a7 "feat: add read-only remote
+  UI". The remote edit/save slice (§2) is uncommitted working-tree work on top
+  of 5258ffc; no commit or push of it has happened.
 - History up to and including fdbd6a7 holds the document-, workspace- and
   processing-services plus the remote HTTP transport (9db7505, d19e5c7,
   f1f75cb, 59ca3ae, 1483731) and the remote read-only slice (fdbd6a7).
@@ -15,100 +14,98 @@
   WindowsApps stub; do not use it.
 
 ## 2. State
+- Remote edit/save slice (uncommitted, on top of 5258ffc; behaviour in
+  PROJECT_CONTEXT.md §5b). Automated checks pass and the user's browser
+  acceptance is recorded in §3; ready for the user's commit decision.
+  - Taken over from an interrupted agent whose WIP had a per-document draft
+    store, Save/Discard and a dirty-Open block. Kept that shape and corrected:
+    drafts record their base values (only edited fields are sent; a concurrent
+    change to an edited field is a conflict); dirty Open and Reload both ask
+    save/discard(/keep)/cancel; drafts are synced from widget state at the top
+    of every run; 409 and ambiguous failures re-read and reconcile; the in-file
+    fake's save mirror keeps the revision on a no-op and rejects unknown keys.
+  - Fix pass 1 (after first browser test): Save/Discard in the sidebar above
+    Reload (always visible, disabled when not applicable, drafts note);
+    Conflicts panel with draft / now-saved / started-from values and Keep mine
+    / Use server / Show row; write embargo while a conflict is open; open
+    document shown apart from the uploader selection; Cancel empties the
+    uploader; reselecting the open file version is a no-op.
+  - Fix pass 2 (two-tab mixed case): widgets are re-keyed per row, only where
+    the shown value changes, so kept drafts are never remounted after a 409 or
+    re-read. Offline tracing did not reproduce the live loss (see §3); the
+    user's browser retest after this change succeeded.
+  - Files: remote_workflow.py, remote_ui.py, tests/test_remote_app.py (fake
+    fidelity, Save-disabled assertion), new tests/test_remote_edit.py,
+    docs/PROJECT_CONTEXT.md, docs/SESSION_HANDOFF.md. No backend, client,
+    schema or generated-file change.
+- Extraction refactor (ui_common.py, remote_workflow.py, remote_ui.py split out
+  of app.py; behaviour-preserving): committed and pushed as 5258ffc.
+- Remote open + read-only rendering, including the Open/Reload envelope-unwrap
+  and bind-contract projection fixes: committed as fdbd6a7 (user-accepted;
+  see §3).
 - Phase 1 is closed as a bounded working baseline (PROJECT_CONTEXT.md §5).
-- Remote open + read-only rendering: committed as fdbd6a7 on
-  feat/remote-workflow.
-  - app.py (at fdbd6a7): a local/remote mode seam - remote mode loads the
-    config first and never builds a ProjectState; a config error shows a
-    sanitized message and stops with no local fallback; a read-only remote
-    branch renders the saved workspace with editing, Save, Apply, Process,
-    Rerun, Analyse and Export all absent or disabled, and batch/page
-    navigation is presentation-only.
-  - harness_remote/view.py: RemoteWorkspaceView, a presentation adapter that
-    merges document segments over the workspace snapshot while keeping the three
-    fields distinct (original target vs. user_final vs. llm_suggestion);
-    exported from harness_remote/__init__.py.
-  - tests/test_remote_view.py and tests/test_remote_app.py: focused adapter
-    tests and headless AppTest over the read-only UI path.
-- Extraction refactor (this session, uncommitted, on feat/remote-workflow on
-  top of fdbd6a7): app.py's remote responsibilities were split into three new
-  Streamlit-coupled modules at the repo root (kept out of harness_remote, which
-  stays Streamlit-free). ui_common.py holds the UI helpers both paths share
-  (APP_TITLE, notify, flush_notice, upload_marker, upload_needs_load, _display);
-  remote_workflow.py owns the Open/Reload orchestration, the segments-envelope
-  validation, the bind-payload projection and get_remote_clients (with its
-  call-time build_clients seam); remote_ui.py owns the remote sidebar, grid and
-  row. app.py re-imports every shared name, so its namespace and local behaviour
-  are unchanged; no extracted module imports app, so there is no circular
-  import. Behaviour-preserving: session_state/widget keys, bootstrap order, the
-  client lifecycle and the three distinct text fields are untouched, and no test
-  import/patch changed.
-- Fixed a user-reported Open/Reload integration bug (uncommitted): the
-  document-service /segments 2xx is the envelope
-  {original_id, document_id, tag_source, filter, segments: [...]}, but
-  app.py's remote_open/remote_reload iterated that dict as a bare list of
-  segment dicts, so it read the envelope's string keys and raised
-  AttributeError. A narrow helper _document_segments in app.py now unwraps the
-  list and validates each item - an object, the four required string fields, and
-  a boolean translatable - at those two call sites (not the HTTP client, not the
-  view adapter), raising an explicit RemoteError on a malformed 2xx instead of
-  an AttributeError or a silent empty view. The Reload caller catches that
-  RemoteError too, mirroring the Open caller, so both paths report a safe,
-  explicit error and keep the live view.
-- A second defect the same review found: remote_open passed the full 16-field
-  serialized segments as the bind's active selection, which the workspace parser
-  rejects - it accepts exactly the four fields key/unit_id/source_text/
-  target_text per segment and requires every document key in present_keys. A
-  narrow _bind_payload in app.py now projects the translatable selection to those
-  four fields and passes every document key as present_keys, while the full
-  canonical list still drives the read-only view (a row the filter hides is not
-  discarded). The fake client was corrected to return the real envelope and to
-  record the full projected items; regression tests were added (Open unwrap,
-  Open/Reload malformed-safe, a malformed-item case, and a projection test that
-  feeds the app's actual bind payload to the real parse_bind_request). Manual
-  acceptance of these fixes is complete: the user confirmed the Open/Reload and
-  bind-contract behaviors against the real backend services in a live browser
-  session (see §3); this does not complete the remote workflow, which remains in
-  progress.
 - Unrelated, left untouched and uncommitted: .claude/settings.local.json,
-  Start-Claude-Ollama.ps1, tests/fixtures/sample1.mqxliff,
-  tests/fixtures/21133_242441_en.html_rus.mqxliff.
+  Start-Claude-Ollama.ps1, .agents/, .claude/skills/,
+  tests/fixtures/sample1.mqxliff,
+  tests/fixtures/21133_242441_en.html_rus.mqxliff,
+  tests/fixtures/invalid-remote-test.mqxliff.
 - DO14 and the DevOps portfolio remain later, manual work
   (PROJECT_CONTEXT.md §1, §6).
 
 ## 3. Latest evidence
-- After the extraction refactor (this session, agent-run, offline, on top of
-  fdbd6a7): the four app/view/client suites unchanged - `tests\test_remote_view.py`
-  8 OK, `tests\test_remote_app.py` 14 OK, `tests\test_remote_client.py` 50 OK,
-  `tests\test_app.py` 76 OK - 148 total, 0 failed, 0 skipped. The four modules
-  (`app.py`, `ui_common.py`, `remote_workflow.py`, `remote_ui.py`) byte-compile
-  and import cleanly (no circular import). `git diff --check` and `git status`
-  were attempted but blocked by a transient model-classifier outage; the
-  equivalent was verified by read-only means instead (no trailing whitespace or
-  tabs in the four files; the edits were pure deletions plus a clean import
-  block; the four excluded worktree items were not written to).
-- Remote read-only slice (this session, agent-run, offline), after the
-  Open/Reload envelope-unwrap fix and the bind-contract projection fix (see §2):
-  `tests\test_remote_view.py` 8 OK, `tests\test_remote_app.py` 14 OK
-  (11 + 3 new regression tests), `tests\test_remote_client.py` 50 OK,
-  `tests\test_app.py` 76 OK - 148 total, 0 failed, 0 skipped.
+### Automated (agent-run, offline)
+- Final code of the edit/save slice (after fix pass 2; run after the last code
+  change): `tests\test_remote_view.py` 8 OK, `tests\test_remote_app.py` 14 OK,
+  `tests\test_remote_client.py` 50 OK, `tests\test_app.py` 76 OK,
+  `tests\test_remote_edit.py` 29 OK - 177 total, 0 failed, 0 skipped.
+  `git diff --check` clean. test_remote_edit drives the app through the real
+  WorkspaceClient into the real workspace Starlette app / WorkspaceService
+  (in-memory repository, no DB). Deliberate mutations (conflict detection off,
+  "" edits dropped, same-file no-op off, conflict embargo off, per-row re-key
+  reverted) were each caught and reverted. Service suites not run (no service
+  code changed). Not run: run_tests.py, test_live.py, any live endpoint.
+- Two-tab mixed-case investigation (fix pass 2): the live loss of segment 9
+  was not reproduced offline. AppTest traces showed both edits captured, both
+  in the rejected PATCH, both drafts kept after the 409 with only 10
+  conflicted. No browser automation was available, so the live root cause is
+  unproven; the per-row re-key change removed the one browser-specific step
+  found (remounting every cell after a re-read). The user's retest after the
+  change passed (below).
+- Earlier counts (166, then 173) belong to earlier code states and are
+  superseded by the 177 above.
+
+### User-run browser acceptance of the edit/save slice (NOT agent-run, real services)
+- Save then Reload persisted text and comments, including a deliberate empty
+  text.
+- Drafts survived batch navigation and "Reload, keep my changes".
+- Dirty Open -> Cancel kept the open document (and its draft) and cleared the
+  uploader. Earlier: Discard and open did not persist the draft; Save and open
+  did.
+- Discard and reload dropped only the draft and kept the same saved revision.
+- Two-tab conflict: 409, nothing written, draft kept; both Keep mine and Use
+  server worked. The mixed case (two drafts, one conflicted) was retested
+  successfully after fix pass 2.
+- Workspace tunnel outage during Save did not lose the draft. The final Save
+  -> Reload after reconnection was NOT confirmed (no result was supplied).
+- During a live conflict, sidebar Save and Save and reload were confirmed
+  disabled. Save and open was not separately verified in the browser.
+- Show row was tried for a segment on the current page; it did not scroll
+  to the row or produce a visible change. Tracked as a deferred UI issue.
+- Reselecting the same file after Save preserved the saved text. Whether
+  reselection avoided upload/bind was not independently verified in the
+  browser.
+
+### Earlier, for the committed read-only slice
+- After the extraction refactor (5258ffc) and the read-only slice (fdbd6a7):
+  the four suites 148 total, 0 failed (agent-run, offline).
 - Phase 1 baseline (historical, agent-run, offline, at 2ec77cf):
   `-m unittest -v tests.test_core` 268 OK; `tests\test_app.py` 76 OK.
-- Not run: run_tests.py, test_live.py, any live endpoint.
-- User-run manual acceptance (this session, against the real backend services,
-  NOT agent-run and NOT part of the 148 offline count): the user confirmed in a
-  live browser session that - (1) Open sample.mqxliff works; (2) reopening the
-  same file shows no duplicate rows; (3) Reload twice issues successful
-  workspace/segments GET requests with no repeated upload or bind; (4)
-  disconnecting the SSH tunnel yields a handled 'Could not connect to
-  workspace.' error while the displayed table remains; (5) restoring the tunnel
-  lets Reload succeed without restarting Streamlit or the backend; (6) switching
-  document A -> B -> A works; (7) a 400+ segment document renders across five
-  batches with working batch navigation; (8) an unsupported file extension is
-  rejected without losing the table; and (9) a .mqxliff with invalid non-XML
-  text produces a handled error, preserves the previous table, and a valid file
-  can be opened afterward.
-- User-reported browser checks: document A/B isolation and restoration
+- User-run read-only acceptance against the real backend: Open, reopen without
+  duplicate rows, Reload without re-upload/bind, handled tunnel outage with the
+  table kept and recovery without restart, document A -> B -> A, a 400+
+  segment document across five batches, unsupported extension and invalid XML
+  rejected safely.
+- User-reported local-mode checks: document A/B isolation and restoration
   (including a real process restart), Rerun edit preservation, Rerun layout,
   local Qwen Test inconclusive (finish_reason=length, 16 tokens, reasoning
   present). Details: PROJECT_CONTEXT.md §5.
@@ -116,26 +113,24 @@
 ## 4. Known limitations
 See PROJECT_CONTEXT.md §7 (reload originals after restart, no recovery UI,
 no revision matching, shared state for identical source XML, memoQ re-import
-unconfirmed, no uploader automation or concurrency safety).
+unconfirmed, session-only remote drafts).
 
 ## 5. Next steps (each needs explicit approval)
-0. Manual acceptance: the user confirmed the Open/Reload and bind-contract
-   fixes, plus the remote read-only behaviors, in a live browser session against
-   the real backend. Complete (see §3).
-1. Commit the remote read-only slice on feat/remote-workflow. Done: fdbd6a7
-   "feat: add read-only remote UI", pushed by the user to
-   origin/feat/remote-workflow.
-2. Bounded refactoring of the accepted slice. Done this session (uncommitted,
-   on top of fdbd6a7): the three-module extraction into ui_common.py,
-   remote_workflow.py and remote_ui.py (see §2). Awaiting an approved commit.
-3. Remote saving / conflict handling as the next bounded mutation slice, with
-   snapshot-consistency checks. Kept out of this read-only slice by design.
-Process/Apply wiring and any publication step are deferred behind the above: the
-exact DO14 requirements and a publication-safety review all remain later.
+1. Optional: confirm Save -> Reload after the workspace tunnel reconnects.
+2. Commit the edit/save slice on feat/remote-workflow (user decision; not done).
+3. UI follow-ups (deferred, not started): compact conflict layout; Show row
+   behaviour when the row is already on the current page (and scrolling to
+   it); network-error dialog UX; copy-to-draft buttons (original target /
+   model suggestion into the draft).
+4. Later remote slices: Process/Rerun, Apply, corrections/feedback,
+   Analyze and Export. Then run end-to-end acceptance, review publication
+   safety, and publish the completed application on GitHub. The work on
+   DO14 will start manually only after that.
 
 ## 6. Constraints carried forward
 - No commits, pushes, deploys, installs, live or paid calls, external service
   contact, or subagents without approval. Do not edit generated files by
   hand. Write files as UTF-8. Do not read the original worktree.
-- Leave .claude/settings.local.json, Start-Claude-Ollama.ps1 and
-  tests/fixtures/sample1.mqxliff untouched and uncommitted.
+- Leave .claude/settings.local.json, Start-Claude-Ollama.ps1, .agents/,
+  .claude/skills/ and the untracked fixtures listed in §2 untouched and
+  uncommitted.

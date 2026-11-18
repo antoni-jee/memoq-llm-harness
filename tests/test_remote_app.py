@@ -20,6 +20,7 @@ Run with:  python tests/test_remote_app.py
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import unittest
@@ -31,12 +32,17 @@ from streamlit.testing.v1 import AppTest
 # repo root must be importable before we import harness_remote.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import remote_workflow  # noqa: E402
 from harness_remote import RemoteError, RemoteWorkspaceView  # noqa: E402
 from memoq_harness import llm, mqxliff, state as state_mod  # noqa: E402
-# The real workspace request parser: a pure function, offline and without a
-# database. Feeding the app's actual bind payload to it proves the projection is
-# server-acceptable, not just internally consistent.
-from services.workspace_service.service import parse_bind_request  # noqa: E402
+# The real workspace request parsers: pure functions, offline and without a
+# database. Feeding the app's actual bind payload to parse_bind_request proves
+# the projection is server-acceptable; feeding the app's actual save payload to
+# parse_patch_request proves the save request is server-acceptable too - neither
+# is just internally consistent.
+from services.workspace_service.service import (  # noqa: E402
+    parse_bind_request, parse_patch_request,
+)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -108,43 +114,69 @@ def snapshot(document_id, original_id, tag_source, revision, order, segments,
 
 class _FakeDocument:
     def __init__(self, upload_resp, segments_resp):
+        # A list is a queue of upload responses (one per Open, so a test can
+        # drive document A then B through one fake); a single dict/exception is
+        # the one-document case, returned every call.
         self._upload = upload_resp
+        # A callable returns each document's own segments envelope, keyed by
+        # original_id; a dict is a fixed envelope (a malformed one too), and a
+        # list is a segment sequence wrapped into that envelope.
         self._segments = segments_resp
         self.upload_calls = []
         self.segments_calls = []
 
     def upload(self, raw, filename="document.mqxliff", content_type="application/xml"):
         self.upload_calls.append((raw, filename))
-        if isinstance(self._upload, BaseException):
-            raise self._upload
-        return self._upload
+        if isinstance(self._upload, list):
+            if not self._upload:
+                raise IndexError("no more upload responses queued")
+            response = self._upload.pop(0)
+        else:
+            response = self._upload
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
     def segments(self, original_id, *, tag_source="target", filters=None):
         self.segments_calls.append((original_id, tag_source))
-        if isinstance(self._segments, BaseException):
-            raise self._segments
+        if callable(self._segments):
+            response = self._segments(original_id, tag_source=tag_source,
+                                     filters=filters)
+        else:
+            response = self._segments
+        if isinstance(response, BaseException):
+            raise response
         # Reproduce the document-service /segments 2xx body exactly: a 2xx
         # carries {original_id, document_id, tag_source, filter, segments}.
         # A dict is returned as-is so a test can inject a malformed envelope;
         # a list is the segment sequence and is wrapped into that envelope.
         # (The old fake returned the bare list, which is what hid the bug.)
-        if isinstance(self._segments, dict):
-            return self._segments
+        if isinstance(response, dict):
+            return response
         return {
             "original_id": original_id,
             "document_id": "doc-1",
             "tag_source": tag_source,
             "filter": {},
-            "segments": self._segments,
+            "segments": response,
         }
 
 
 class _FakeWorkspace:
-    def __init__(self, bind_resp, get_resp):
+    def __init__(self, bind_resp, get_resp, *, server=None, save_resp=None):
+        # server, when set, is a {document_id: snapshot} dict the workspace owns
+        # and mutates on save; get_workspace then returns the live snapshot, so a
+        # save that advances the revision is visible to a following read - the
+        # post-save refresh and the 409/conflict tests need exactly that.
+        # save_resp, when a server is not set, is a single configured response
+        # (dict / exception / callable(document_id, expected_revision, updates)).
         self._bind = bind_resp
         self._get = get_resp
+        self._server = server
+        self._save = save_resp
         self.bind_calls = []
         self.get_calls = []
+        self.save_calls = []
 
     def bind(self, document_id, original_id, *, source_file="", tag_source="target",
              segments=None, present_keys=None):
@@ -168,9 +200,91 @@ class _FakeWorkspace:
 
     def get_workspace(self, document_id):
         self.get_calls.append(document_id)
-        if isinstance(self._get, BaseException):
-            raise self._get
-        return self._get
+        if self._server is not None:
+            # A copy, like a JSON body: later server writes must not mutate a
+            # snapshot the app already read.
+            return copy.deepcopy(self._server[document_id])
+        response = self._get
+        if callable(response):
+            response = response(document_id)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    def save_segments(self, document_id, expected_revision, updates):
+        """Mirror the workspace save contract closely enough to test against.
+
+        With a live server it behaves like service.save_segments: a revision
+        mismatch is a 409 stale_revision (drafts must be kept), a match applies
+        the fields each update carries and advances the revision by one. The
+        mirror honours two service details the save flow depends on: a text edit
+        runs the capture_edits rule (user_final is the raw text, so an explicit
+        "" stays ""; edited_by_human is set only when the stripped text is
+        non-empty and differs from the baseline - the model suggestion, else the
+        original target), while a comment-only update sets user_comment and never
+        touches edited_by_human. Without a server, a single configured response
+        stands in (a transport error, a fixed dict, or a callable).
+        """
+        self.save_calls.append({
+            "document_id": document_id,
+            "expected_revision": expected_revision,
+            "updates": {key: dict(upd) for key, upd in updates.items()},
+        })
+        if self._server is not None:
+            snap = self._server[document_id]
+            if snap["revision"] != expected_revision:
+                raise RemoteError(
+                    service="workspace", status=409, code="stale_revision",
+                    current_revision=snap["revision"],
+                    message="The document changed since it was read; reload and "
+                            "retry.")
+            # The service rejects the whole request when it names a key the
+            # workspace does not have (422 unknown_segment, nothing applied).
+            if any(key not in snap["segments"] for key in updates):
+                raise RemoteError(
+                    service="workspace", status=422, code="unknown_segment",
+                    message="The request named a segment key this original "
+                            "does not have.")
+            before = {key: (snap["segments"][key]["user_final"],
+                            snap["segments"][key]["user_comment"],
+                            snap["segments"][key]["edited_by_human"])
+                      for key in updates}
+            for key, upd in updates.items():
+                record = snap["segments"][key]
+                if "text" in upd:
+                    text = upd["text"]
+                    record["user_final"] = text
+                    final = (text or "").strip()
+                    baseline = ((record.get("llm_suggestion") or "").strip()
+                               or (record.get("mt_target") or "").strip())
+                    if final and final != baseline:
+                        record["edited_by_human"] = True
+                if "comment" in upd:
+                    record["user_comment"] = upd["comment"]
+            changed = sorted(
+                key for key in updates
+                if (snap["segments"][key]["user_final"],
+                    snap["segments"][key]["user_comment"],
+                    snap["segments"][key]["edited_by_human"]) != before[key])
+            # Identical content at the current revision is a no-op that keeps
+            # the revision, exactly as the service does.
+            if changed:
+                snap["revision"] += 1
+                snap["updated_at"] = "2026-01-02T00:00:00"
+            return {
+                "document_id": document_id,
+                "revision": snap["revision"],
+                "updated_keys": changed,
+                "changed": bool(changed),
+            }
+        if isinstance(self._save, BaseException):
+            raise self._save
+        response = self._save
+        if callable(response):
+            response = response(document_id, expected_revision, updates)
+            if isinstance(response, BaseException):
+                raise response
+        return response if response is not None else {}
 
 
 class _FakeProcessing:
@@ -227,10 +341,11 @@ class RemoteAppTestCase(unittest.TestCase):
     # ---------------------------------------------------------------- helpers
 
     def _install_fakes(self, *, upload_resp, segments_resp,
-                       bind_resp=None, get_resp=None):
+                       bind_resp=None, get_resp=None, server=None, save_resp=None):
         document = _FakeDocument(upload_resp, segments_resp)
         workspace = _FakeWorkspace(bind_resp if bind_resp is not None else {},
-                                   get_resp if get_resp is not None else {})
+                                   get_resp if get_resp is not None else {},
+                                   server=server, save_resp=save_resp)
         processing = _FakeProcessing()
         self.fake = _FakeClients(document, workspace, processing)
 
@@ -436,8 +551,12 @@ class RemoteAppTestCase(unittest.TestCase):
         app = self.run_app()
         self._open(app, fake)
 
-        # No editable field of any kind: the grid is read-only.
-        self.assertEqual(len(app.text_area), 0)
+        # The two editable cells exist now (human-text text_area + comment
+        # text_input, one pair per visible row); they are not mutation controls
+        # - they hold an unsaved draft in session state and write only through
+        # Save.
+        self.assertEqual(len(app.text_area), 2)
+        self.assertEqual(len(app.text_input), 2)
 
         # The finished-mutation controls must be absent from every scope.
         labels = self._button_labels(app)
@@ -448,6 +567,12 @@ class RemoteAppTestCase(unittest.TestCase):
 
         # The only control that remains is the read-only Reload.
         self.assertIn("Reload saved work", labels)
+
+        # A freshly opened document is clean: Save and Discard are shown in the
+        # sidebar but disabled, and no save call is made.
+        for label in ("Save", "Discard"):
+            self.assertTrue(self._button(app.sidebar, label).disabled)
+        self.assertEqual(fake.workspace.save_calls, [])
 
     # ----------------------- 7. local mutation entry points are never reached
 
@@ -503,7 +628,9 @@ class RemoteAppTestCase(unittest.TestCase):
         view = app.session_state.remote_view
         self.assertIsNotNone(view)
         self.assertTrue(view.is_empty)
+        # No rows, so neither editable cell renders.
         self.assertEqual(len(app.text_area), 0)
+        self.assertEqual(len(app.text_input), 0)
         self.assertNotIn("Process Current Batch", self._button_labels(app))
 
     # -------- 9. the Open/Reload envelope-unwrap regression (the acceptance bug)
