@@ -28,11 +28,29 @@ from services.document_service.service import DocumentService  # noqa: E402
 from services.document_service.storage import FileStorage  # noqa: E402
 from services.processing_service import config, engines  # noqa: E402
 from services.processing_service.app import create_app  # noqa: E402
-from services.processing_service.service import ProcessingService  # noqa: E402
+from services.processing_service.service import (ModelConfig,  # noqa: E402
+                                                 ProcessingService)
 from tests.test_document_service import SAMPLE, FakeRepository  # noqa: E402
 
 SECRET_TEXT = "TOPSECRET-PROCESSING-TEXT"
 FAKE_KEY = "sk-test-processing-key-000000000000"
+
+
+def config_block(preset="OpenAI API", **overrides):
+    """A per-request config block as the Streamlit app sends it.
+
+    The default is a key-required OpenAI preset pointed at a dead local port;
+    the request, not the service environment, selects this backend/endpoint/model.
+    """
+    block = {
+        "preset": preset,
+        "backend": "openai",
+        "base_url": "http://127.0.0.1:9/v1",
+        "api_key": FAKE_KEY,
+        "model": "test-model",
+    }
+    block.update(overrides)
+    return block
 
 
 def segments_from(raw=SAMPLE, tag_source="target"):
@@ -305,6 +323,178 @@ class TestRealEngine(ProcessingTestCase):
             self.assertEqual(ready.status_code, 503)
             self.assertEqual(ready.json()["checks"], {"engine": "sdk_missing"})
             self.assertEqual(self.client.get("/healthz").status_code, 200)
+
+
+class TestPerRequestConfig(ProcessingTestCase):
+    """A per-request model config selects the backend/endpoint/model.
+
+    The service's own environment is the offline stub here, so a request that
+    carries a config and comes back as that config's backend proves the config
+    won and the stub/env were not used as a fallback. Real calls are patched
+    (``LLMClient._chat``, ``LLMClient.list_models``, ``llm.probe_model``), so no
+    test reaches a provider.
+    """
+
+    def capture_config(self):
+        """Capture the ClientConfig a real client was built from.
+
+        Per-request config is not built through ``client_factory``; the service
+        constructs ``llm.LLMClient`` directly, so we spy its ``__init__`` to see
+        exactly which backend/endpoint/model/key the request resolved to.
+        """
+        box: dict = {}
+        real_init = llm.LLMClient.__init__
+
+        def spy(self, cfg):
+            box["config"] = cfg
+            return real_init(self, cfg)
+
+        patcher = mock.patch.object(llm.LLMClient, "__init__", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return box
+
+    def test_process_honors_explicit_config_over_service_env(self):
+        # Service env is the default stub; the request's config must win.
+        one = segments_from()[:1]
+        box = self.capture_config()
+        with mock.patch.object(llm.LLMClient, "_chat",
+                               return_value='{"segments": [{"id": "1#0", "target": "Hallo"}]}'):
+            response = self.client.post("/process", json={
+                "segments": one, "config": config_block()})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["engine"], "openai")       # config backend, not "stub"
+        self.assertEqual(body["suggestions"], {"1#0": {"text": "Hallo"}})
+        self.assertEqual(body["missing"], [])
+        cfg = box["config"]
+        self.assertEqual(cfg.preset, "OpenAI API")
+        self.assertEqual(cfg.model, "test-model")
+        self.assertEqual(cfg.base_url, "http://127.0.0.1:9/v1")
+        self.assertEqual(cfg.api_key, FAKE_KEY)
+        self.assertEqual(cfg.backend, "openai")
+
+    def test_omitted_config_uses_the_configured_engine(self):
+        # A legacy caller with no config block keeps the service's engine.
+        one = segments_from()[:1]
+        response = self.process(segments=one)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["engine"], "stub")
+
+    def test_missing_api_key_fails_safely_for_key_required_preset(self):
+        one = segments_from()[:1]
+        with mock.patch.object(llm.LLMClient, "__init__") as ctor:
+            response = self.client.post("/process", json={
+                "segments": one, "config": config_block(api_key="")})
+        self.assertEqual(response.status_code, 400, response.text)
+        body = response.json()
+        self.assertEqual(body["error"], "missing_api_key")
+        self.assertEqual(body["details"], {"preset": "OpenAI API"})
+        self.assertNotIn(FAKE_KEY, response.text)
+        ctor.assert_not_called()  # no client built, so no provider call
+
+    def test_ollama_preset_needs_no_key(self):
+        one = segments_from()[:1]
+        with mock.patch.object(llm.LLMClient, "_chat",
+                               return_value='{"segments": [{"id": "1#0", "target": "Hallo"}]}'):
+            response = self.client.post("/process", json={
+                "segments": one,
+                "config": {"preset": "Local Engine (Ollama)", "api_key": ""}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["engine"], "openai")
+
+    def test_config_and_engine_are_mutually_exclusive(self):
+        one = segments_from()[:1]
+        response = self.client.post("/process", json={
+            "segments": one, "config": config_block(), "engine": "stub"})
+        self.assertEqual(response.status_code, 400, response.text)
+
+    def test_unknown_nested_config_field_is_rejected(self):
+        one = segments_from()[:1]
+        bad = config_block()
+        bad["bogus_field"] = 1
+        for path in ("/process", "/probe", "/models"):
+            with self.subTest(path=path):
+                body = {"segments": one, "config": bad} if path == "/process" \
+                    else {"config": bad}
+                self.assertEqual(self.client.post(path, json=body).status_code, 400)
+
+    def test_probe_honors_config_and_writes_no_suggestion(self):
+        seen: dict = {}
+
+        def fake_probe(client_config):
+            seen["config"] = client_config
+            return llm.ProbeResult(status="ok", requested_model=client_config.model,
+                                   endpoint=client_config.base_url,
+                                   credential_source="sidebar key", elapsed_ms=12.0,
+                                   preview="hello")
+
+        with mock.patch.object(llm, "probe_model", fake_probe):
+            response = self.client.post("/probe", json={"config": config_block()})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual((body["ok"], body["status"]), (True, "ok"))
+        self.assertIn("hello", body["message"])
+        self.assertNotIn(FAKE_KEY, response.text)
+        self.assertEqual(seen["config"].model, "test-model")
+        self.assertEqual(seen["config"].api_key, FAKE_KEY)
+
+    def test_list_models_honors_config(self):
+        box = self.capture_config()
+        with mock.patch.object(llm.LLMClient, "list_models", return_value=["m-a", "m-b"]):
+            response = self.client.post("/models", json={"config": config_block()})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["models"], ["m-a", "m-b"])
+        self.assertEqual(box["config"].model, "test-model")
+        self.assertEqual(box["config"].api_key, FAKE_KEY)
+
+    def test_probe_and_models_require_a_config(self):
+        for path in ("/probe", "/models"):
+            with self.subTest(path=path):
+                # No config block, an explicit null, or an unknown top-level
+                # field (anything other than "config") are all rejected.
+                self.assertEqual(self.client.post(path, json={}).status_code, 400)
+                self.assertEqual(self.client.post(path, json={"config": None}).status_code, 400)
+                self.assertEqual(self.client.post(path, json={"segments": []}).status_code, 400)
+
+    def test_explicit_config_with_missing_sdk_is_503(self):
+        one = segments_from()[:1]
+        with mock.patch.object(llm, "OpenAI", None):
+            response = self.client.post("/process", json={
+                "segments": one, "config": config_block()})
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(response.json()["error"], "engine_unavailable")
+
+    def test_config_validation_bounds_and_types(self):
+        one = segments_from()[:1]
+        for override in ({"temperature": 5}, {"temperature": "x"}, {"temperature": True},
+                         {"max_tokens": 200001}, {"max_tokens": 1.5},
+                         {"chunk_size": 0}, {"chunk_size": 999}, {"timeout": 0},
+                         {"timeout": 99999}, {"max_retries": 0}, {"max_retries": 99},
+                         {"preset": "No such preset"}, {"backend": "magic"},
+                         {"model": "   "}):
+            with self.subTest(override=override):
+                block = config_block(**override)
+                self.assertEqual(self.client.post("/process", json={
+                    "segments": one, "config": block}).status_code, 400)
+
+    def test_key_never_leaks_in_repr_response_or_logs(self):
+        # repr of the request config suppresses the key field entirely.
+        cfg = ModelConfig(preset="OpenAI API", backend="openai",
+                          base_url="http://127.0.0.1:9/v1", model="test-model",
+                          api_key=FAKE_KEY)
+        self.assertNotIn(FAKE_KEY, repr(cfg))
+        self.assertNotIn(FAKE_KEY, str(cfg))
+
+        one = segments_from()[:1]
+        with mock.patch.object(llm.LLMClient, "_chat",
+                               return_value='{"segments": [{"id": "1#0", "target": "Hallo"}]}'):
+            with self.assertLogs("processing-service", level="DEBUG") as logs:
+                response = self.client.post("/process", json={
+                    "segments": one, "config": config_block()})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn(FAKE_KEY, response.text)
+        self.assertNotIn(FAKE_KEY, "\n".join(logs.output))
 
 
 class TestHealthLogsConfig(ProcessingTestCase):

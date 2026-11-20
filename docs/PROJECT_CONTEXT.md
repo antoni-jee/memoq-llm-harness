@@ -125,7 +125,7 @@ remote responsibilities into ui_common.py, remote_workflow.py and remote_ui.py
 (§3); committed and pushed as 5258ffc "refactor: split remote UI and
 workflow" (148 passing in the four suites).
 
-## 5b. Remote edit/save slice (uncommitted on top of 5258ffc; user browser acceptance recorded)
+## 5b. Remote edit/save slice (committed as fcba7a3 on top of 5258ffc; user browser acceptance recorded)
 - Editable "Your text" (text_area) and comment (text_input) cells per row feed a
   session-scoped draft store in remote_workflow.py:
   {document_id: {key: {text, comment, base_text, base_comment}}}. Original
@@ -166,19 +166,192 @@ workflow" (148 passing in the four suites).
 - UI follow-ups (deferred, not started): compact conflict layout; Show row
   behaviour on the same page (it only switches batch/page, no scroll);
   network-error dialog UX; copy-to-draft buttons.
-- Tests: tests/test_remote_edit.py (29) drives the app against the real
+- Tests: tests/test_remote_edit.py (30) drives the app against the real
   WorkspaceClient + workspace Starlette app + WorkspaceService over an
-  in-memory repository; final-code results (177 across five suites) and the
-  user's browser acceptance are in SESSION_HANDOFF.md §3. Not confirmed in the
+  in-memory repository. These are headless/mocked-app tests (a real HTTP
+  transport over a Starlette app, but no live model and no real browser); they
+  are NOT a substitute for real-service browser acceptance. Final-code results
+  (193 across the five agreed suites: test_remote_view 8, test_remote_app 29,
+  test_remote_client 50, test_app 76, test_remote_edit 30) and the user's
+  separate browser acceptance are in SESSION_HANDOFF.md §3. Not confirmed in the
   browser: Save -> Reload after a workspace tunnel reconnects.
+
+## 5c. Remote model / process-one-batch slice (uncommitted on top of fcba7a3; live-HTTP smoke passed; browser acceptance FAILED on automatic human-text acceptance - not ready to commit)
+- The remote sidebar now mirrors the LOCAL model configuration and selection
+  workflow (the earlier restriction not to duplicate it is withdrawn): a "Check
+  service readiness" button (a GET /readyz service/SDK check that reports the
+  service's own configured engine; it is NOT a model test and never calls the
+  model), a "Provider preset" selectbox defaulting to the local default preset
+  "Local Engine (Ollama)" (the offline "Test backend (stub)" is an explicit,
+  labelled option alongside it, not the default), an editable Base URL (noted as
+  reachable FROM the processing service), a password API-key field shown only for
+  key-requiring presets, a Model selectbox/entry, and "Test model" / "List models"
+  actions. The operator chooses the model in the UI; they never edit an
+  environment variable, start a service or change a port. It reads nothing from
+  Qwen Code's config (~/.qwen, agent credentials).
+- Per-request model selection: the sidebar edits a live `llm.ClientConfig` and
+  builds from it a validated "config" block (preset, backend, base URL, the
+  session-only key, model, and the generation controls) that the processing
+  service selects the real backend/endpoint/model from on POST /process,
+  POST /probe and POST /models. A real preset sends the config (no engine); the
+  explicit stub sends engine "stub" instead - the two are mutually exclusive on
+  the client and enforced again by the service (both = 400). A call that omits
+  config falls back to the service's own configured engine (backward compatible),
+  but an explicit config is always used as given and never falls back to the
+  service environment or the stub; an invalid explicit config fails safely
+  (400/503). "Test model" runs one bounded probe and stores nothing; "List
+  models" runs one list call whose result is cached and invalidated (the provider
+  is not called) when the connection settings change.
+- Credential scope: the key is held in the Streamlit browser session only. It is
+  sent to the processing service for one request and is never written to
+  state.json, a tracked file or a log, and never echoed in an error or exception
+  repr; a key-requiring preset with an empty key fails with an actionable
+  sanitized "Enter an API key in the sidebar" error. Local Ollama (no key) still
+  works; a legacy no-config request keeps the service's own environment behavior.
+- One gated mutation is offered in the grid: "Process Current Batch" sends the
+  currently selected batch's *eligible* rows to the model through the processing
+  service with the current config (context=None, so the service builds the prompt
+  from its shipped defaults and the batch stage) and persists the proposals
+  through the existing workspace contract. A row is eligible on its own effective
+  'Your text' - a held draft (including one the operator cleared to blank) when
+  one is held, otherwise the saved human text - judged blank after trimming; a
+  filled neighbour, a prior model proposal or an edited status never blocks an
+  otherwise-eligible row, and a row is sent at most once. The grid shows the
+  eligible count and sends no request when it is zero. There is no direct
+  Streamlit->LLM call and no local workflow fallback.
+- Proposals are persisted as the model's llm_suggestion via the existing
+  POST /workspaces/{id}/suggestions (record_suggestions) with prefill OFF, NOT
+  as user_final: the four data kinds stay distinct (original target / model
+  suggestion / saved human text / draft), and a Reload shows the persisted
+  proposals in the "Model proposal" column. The human's saved text, comments,
+  edited_by_human flag and the original target are never touched by Process -
+  a model proposal is not a human acceptance. Putting a proposal into "Your
+  text" therefore requires an explicit user action (manual editing, already
+  available) that creates an ordinary unsaved draft; only Save persists that
+  human-text change, and Discard before Save restores the prior saved human text
+  while keeping the model proposal. (This corrects a browser-acceptance
+  finding: the slice previously prefilled user_final on Process, so the
+  model's text appeared as accepted human text, advanced the revision and could
+  not be rejected by Discard.) The response is validated before any workspace
+  write: a
+  non-object envelope or a non-object `suggestions` map is rejected, a non-string
+  or empty `text` is dropped, and the write proceeds only on a confirmed 2xx.
+  Only keys sent in the current batch are accepted: the proposals are filtered to
+  the batch's sent keys before persistence, so a key from
+  another batch in the same document is never recorded, and malformed items (a
+  non-dict entry, or a "text" that is empty/whitespace) are dropped. The
+  processing service returns text-only proposals (no tag_report), so the
+  record-suggestions path persists text and a row's tag_report ends as '' - which
+  is correct because the service sends none; the builder does not fabricate or
+  overwrite a tag_report.
+- Guards (UI disabled-state via process_block_reason, re-checked inside
+  process_remote_batch as a click-time backstop, in this order): an unresolved
+  conflict blocks; an uncertain prior Process (remote_process_uncertain) must be
+  reconciled by a successful Reload or Open; an incompatible/stale workspace
+  predating the prefill contract blocks (so a paid model call is not wasted on a
+  write that would 400); a batch with no translatable segment is a no-op; and a
+  batch whose every translatable row already has text is a no-op. The blanket
+  "already worked" block and the "save or discard unsaved drafts first" block are
+  REMOVED (item 4): a row is eligible on its own effective 'Your text', so an
+  unsaved draft, a filled neighbour, a previous proposal or an edited status never
+  suppresses an eligible row. Unrelated rows and held drafts are left untouched
+  (the prefill-off write never touches a human's saved text), so a Process never
+  auto-saves or discards a draft. A full Rerun UX is deferred.
+- Uncertain-outcome handling deliberately diverges from save_remote_drafts. After
+  a 409 stale_revision, a transport/5xx/malformed write response, a failed
+  post-write refresh, or a bind-to-a-different-original result, the outcome is
+  UNCERTAIN (the proposals may or may not have been stored): the app makes no
+  "nothing was stored" claim and no claim that the server prevents another model
+  call. Instead it sets ss.remote_process_uncertain, which blocks another Process
+  (the button is disabled and a click-time backstop refuses the click) until a
+  successful Reload or Open reconciles the saved state and clears the flag. There
+  is no automatic model retry and no write replay. On a confirmed 2xx the view is
+  re-read and adopted to refresh the column; a model-call failure (before any
+  write) does not set the flag. No false success, no fabricated proposals, no raw
+  tracebacks, no leaked secrets, no background job.
+- Files: remote_workflow.py (the model/process section now edits a live
+  `llm.ClientConfig` via `_model_config_block` and routes it per request:
+  `remote_invalidate_stale_model_list`, `remote_model_test` (one bounded probe,
+  stores nothing), `remote_model_list` (one list call, cached), `_process_target`
+  (config XOR "stub" engine), `_effective_your_text` / `_eligible_records` /
+  `eligible_count` (per-row eligibility: a translatable row whose effective 'Your
+  text' is blank after trim), `process_block_reason` (the conflict / uncertain /
+  stale / no-translatable / nothing-eligible guards, in order; the "already
+  worked" and "save unsaved drafts first" guards are gone) and `process_remote_batch`
+  (builds its segment inputs from the eligible rows only, with the sent-keys filter
+  and the uncertain-flag branches; the `_batch_already_processed` helper it used
+  is removed); bootstrap adds
+  `ss.remote_model_config` (defaulting to the local default preset, NOT the
+  stub), `ss.remote_model_preset`, `ss.remote_model_list`, `ss.remote_engine_rev`
+  and `ss._remote_model_sig`, and keeps `ss.remote_ready` and
+  `ss.remote_process_uncertain`), remote_ui.py (a "Model" subsection in the
+  sidebar: the readiness check, the preset / Base URL / key / model controls and
+  the Test / List actions, plus the gated Process button in the grid),
+  services/processing_service/service.py + app.py (a per-request "config" block:
+  `ModelConfig`, `_parse_config`, `_client_config_from_block`, `parse_config_request`
+  and `parse_process_request` (config XOR engine); a key-required preset with an
+  empty key raises `MissingApiKey` -> 400 `missing_api_key` before any client
+  build; an explicit config always wins over the service engine; /probe and
+  /models now take a config), services/processing_service/engines.py
+  (`sdk_available_for_config` with no stub branch), harness_remote/client.py
+  (`process` / `probe` / `list_models` send a `config` block; `missing_api_key`
+  allowlisted to a client-owned message; a key never reaches a `RemoteError`
+  view), tests/test_remote_app.py (35 tests incl. the per-request-config
+  process/probe/list tests, the sent-keys test, the stale-revision no-replay
+  test, the confirmed-write-then-refresh-failure uncertain test, and the
+  uncertain-flag block-until-reload test), tests/test_processing_service.py
+  (36 tests incl. 12 new per-request-config tests: config-over-env,
+  omitted-config-uses-engine, missing-key 400, Ollama-needs-no-key,
+  config-XOR-engine, unknown-nested-field rejected, /probe & /models honor and
+  require a config, missing-SDK 503, bounds/types, and a no-key-leak check),
+  tests/test_remote_client.py (57 tests incl. 6 new: `process`/`probe`/
+  `list_models` send the config to the right endpoint, and a key-bearing config
+  never surfaces in a `RemoteError`). A real-path record_suggestions contract
+  test (prefill, human-edited protection, and no-op on identical content) was
+  added to tests/test_remote_edit.py. This slice DID change the processing
+  service and the client (the per-request config), in addition to the
+  state/workspace prefill-off change in the prior pass; no schema or
+  generated-file change.
+- Evidence, kept in three distinct categories: (a) offline / mocked-app tests -
+  210 across the five agreed suites (test_remote_view 8, test_remote_app 35,
+  test_remote_client 57, test_app 76, test_remote_edit 34) plus 36 in the
+  affected processing-service suite; a real HTTP transport over a Starlette app
+  but no live model and no real browser. (b) a live-HTTP smoke of the real
+  processing path from the prior pass: a real processing service
+  (`PROCESSING_ENGINE=openai`, OpenAI-compatible backend, model
+  `qwen3:4b-instruct` via a reachable local Ollama at `http://10.211.55.2:11434/v1`)
+  processed a 3-segment EN->RU batch and the proposals persisted; this predates
+  the per-request-config change and was NOT re-run against the new shape. (c) a
+  real-service browser acceptance of the slice FAILED earlier (Process auto-
+  accepted the model's proposal into user_final), now corrected by the
+  prefill-off write; the new per-request model-configuration UI has NOT yet been
+  browser-accepted, so the slice is not ready to commit. See SESSION_HANDOFF.md
+  §3 for the full report.
+- Parity item 4 (Process Current Batch, uncommitted on top of the above): the
+  blanket "already worked" block and the "save or discard unsaved drafts first"
+  block were removed so a Process no longer skips a row that an edited status, a
+  previous model proposal, a filled neighbour or an unsaved (even cleared) draft
+  would have suppressed. Eligibility is judged per row on its *effective* 'Your
+  text' (`_effective_your_text`, the held draft when one is held, otherwise the
+  saved human text), blank after trimming; the grid shows the eligible count
+  (`eligible_count`) and `process_remote_batch` builds its segment inputs from the
+  eligible rows only, so a row is sent at most once and no request goes out when
+  the count is zero. The conflict, uncertain-outcome and stale-workspace guards
+  are retained, and the prefill-off write still leaves a human's saved text,
+  comments and the original target untouched (so a Process never auto-saves or
+  discards a draft). The now-removed `_batch_already_processed` helper and its
+  guards are gone; `process_block_reason` and `process_remote_batch` carry the new
+  per-row logic. See SESSION_HANDOFF.md §5 (Step 2 mapping + backlog) for the
+  local->remote mapping and the five new process-eligibility tests.
 
 ## 6. Roadmap (proposed sequence; not an approved ADR)
 1. Completed working baseline (§5).
 2. Incrementally extract at least three backend services, keeping the
    existing frontend; add PostgreSQL and storage for original/export files.
    In progress on feat/remote-workflow: the three services and a Postgres data
-   layer exist (see §5a); the frontend remote mode opens, renders, edits and
-   saves through them (§5b); Process/Apply/Export are not wired yet.
+   layer exist (see §5a); the frontend remote mode opens, renders, edits, saves
+   and processes the selected batch through them (§5b, §5c); Apply/Rerun/Export
+   are not wired yet (a full Rerun UX is deferred).
 3. Reproducible containers and Docker Compose, introduced alongside step 2.
 4. DO14: Helm/Kubernetes; GitLab CI/CD with exactly the stages build, test,
    staging, prod; GitLab Runner in Kubernetes.

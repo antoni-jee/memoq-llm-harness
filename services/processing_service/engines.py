@@ -77,6 +77,17 @@ def sdk_available(settings: EngineSettings) -> bool:
     return llm.OpenAI is not None
 
 
+def sdk_available_for_config(client_config) -> bool:
+    """Whether the SDK for a per-request config's backend is importable.
+
+    The per-request model config names a backend (``openai`` or ``anthropic``),
+    never the stub, so the stub's always-True branch is absent here.
+    """
+    if client_config.backend == ENGINE_ANTHROPIC:
+        return llm.anthropic is not None
+    return llm.OpenAI is not None
+
+
 def real_client(settings: EngineSettings) -> llm.LLMClient:
     """An LLMClient for the configured engine. Never called for the stub."""
     if not sdk_available(settings):

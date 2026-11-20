@@ -24,15 +24,18 @@ from memoq_harness import state as state_mod
 
 from . import SERVICE_NAME
 from .config import ENGINE_STUB, Settings
-from .engines import EngineUnavailable, StubClient, real_client, sdk_available
+from .engines import (EngineUnavailable, StubClient, real_client,
+                      sdk_available, sdk_available_for_config)
 
 log = logging.getLogger(SERVICE_NAME)
 
 OPERATIONS = ("batch", "rerun")
 TAG_SOURCES = ("target", "source")
 STAGES = ("auto",) + tuple(prompt_templates.STAGE_KEYS)
-PROCESS_FIELDS = ("operation", "engine", "tag_source", "batch", "context", "segments")
+PROCESS_FIELDS = ("operation", "engine", "tag_source", "batch", "context", "segments", "config")
 BATCH_FIELDS = ("index", "count")
+CONFIG_FIELDS = ("preset", "backend", "base_url", "api_key", "model",
+                 "temperature", "chunk_size", "max_tokens", "timeout", "max_retries")
 CONTEXT_FIELDS = ("source_lang", "target_lang", "hard_rules_text", "vibe", "termbase",
                   "corrections_block", "directive", "stage", "template")
 CONTEXT_TEXT_FIELDS = ("source_lang", "target_lang", "hard_rules_text", "vibe",
@@ -75,6 +78,16 @@ class EngineFailed(ServiceError):
     status, code = 502, "engine_failed"
 
 
+class MissingApiKey(ServiceError):
+    """A key-required preset was given with no session key.
+
+    A distinct, allowlisted code so the client can surface an actionable,
+    sanitized message ("enter a key in the sidebar") instead of a generic 400.
+    The provider's configured key is never offered as a fallback.
+    """
+    status, code = 400, "missing_api_key"
+
+
 # ------------------------------------------------------------------ request
 
 
@@ -100,6 +113,28 @@ class Context:
 
 
 @dataclass(frozen=True)
+class ModelConfig:
+    """A per-request model configuration (a :class:`llm.ClientConfig` subset).
+
+    Selected in the Streamlit sidebar and sent with the request so the user -
+    not the service's environment - chooses the backend, endpoint and model for
+    this one operation. The key is the operator's session key, sent only for this
+    request and never the service's configured-engine key; it is repr-suppressed
+    so it can appear in no request repr, log line or error.
+    """
+    preset: str
+    backend: str
+    base_url: str
+    model: str
+    temperature: float = 0.2
+    max_tokens: int = 4096
+    chunk_size: int = 20
+    timeout: float = 300.0
+    max_retries: int = 3
+    api_key: str = field(default="", repr=False)
+
+
+@dataclass(frozen=True)
 class ProcessRequest:
     operation: str
     engine: Optional[str]
@@ -108,6 +143,7 @@ class ProcessRequest:
     batch_count: int
     context: Context = field(default_factory=Context)
     segments: Tuple[SegmentInput, ...] = ()
+    config: Optional[ModelConfig] = None
 
 
 def _listed(items) -> List[str]:
@@ -155,6 +191,86 @@ def _parse_context(raw: object) -> Context:
     return Context(termbase=tuple(terms), stage=stage, template=template, **values)
 
 
+def _config_number(raw: object, name: str, default, low, high, *, ints: bool):
+    """One optional numeric config field, with type and bound checks.
+
+    Absent -> the preset/service default. Present -> the right numeric type and
+    a sane bound. Booleans are rejected as numbers (``True`` is an ``int``).
+    """
+    if name not in raw:
+        return default
+    value = raw[name]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BadRequest("'config.%s' must be a number." % name)
+    if ints and not isinstance(value, int):
+        raise BadRequest("'config.%s' must be an integer." % name)
+    if not (low <= value <= high):
+        raise BadRequest("'config.%s' must be between %s and %s." % (name, low, high))
+    return int(value) if ints else float(value)
+
+
+def _parse_config(raw: object) -> Optional[ModelConfig]:
+    """Validate an optional per-request model config block.
+
+    Returns a :class:`ModelConfig`, or ``None`` when the caller sent no config (a
+    legacy caller: the service's configured engine then applies). When a block is
+    present it is a :class:`llm.ClientConfig` subset - which preset/backend, the
+    endpoint, the model and the inference settings a real call needs. Unknown
+    fields and out-of-bounds values are rejected, so an invalid explicit config
+    fails safely: it never falls back to the service's environment or the stub.
+    Strings fall back to the named preset's defaults when omitted.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise BadRequest("'config' must be an object.")
+    unknown = set(raw) - set(CONFIG_FIELDS)
+    if unknown:
+        raise BadRequest("Unknown config field(s).", {"fields": _listed(unknown)})
+
+    preset = raw.get("preset", llm.DEFAULT_PRESET)
+    if not isinstance(preset, str) or preset not in llm.PRESETS:
+        raise BadRequest("'config.preset' must be a known preset name.",
+                         {"presets": _listed(sorted(llm.PRESETS))})
+    preset_def = llm.PRESETS[preset]
+    backend = raw.get("backend", preset_def.backend)
+    if not isinstance(backend, str) or backend not in (llm.BACKEND_OPENAI, llm.BACKEND_ANTHROPIC):
+        raise BadRequest("'config.backend' must be 'openai' or 'anthropic'.",
+                         {"backends": [llm.BACKEND_OPENAI, llm.BACKEND_ANTHROPIC]})
+
+    base_url = raw.get("base_url", preset_def.base_url)
+    api_key = raw.get("api_key", "")
+    model = raw.get("model", preset_def.default_model)
+    for name, value in (("base_url", base_url), ("api_key", api_key), ("model", model)):
+        if not isinstance(value, str):
+            raise BadRequest("'config.%s' must be a string." % name)
+    if not model.strip():
+        raise BadRequest("'config.model' must be a non-empty model name.")
+
+    return ModelConfig(
+        preset=preset, backend=backend, base_url=base_url, model=model,
+        temperature=_config_number(raw, "temperature", 0.2, 0, 2, ints=False),
+        max_tokens=_config_number(raw, "max_tokens", 4096, 0, 200000, ints=True),
+        chunk_size=_config_number(raw, "chunk_size", 20, 1, 200, ints=True),
+        timeout=_config_number(raw, "timeout", 300.0, 1, 3600, ints=False),
+        max_retries=_config_number(raw, "max_retries", 3, 1, 10, ints=True),
+        api_key=api_key,
+    )
+
+
+def parse_config_request(body: object) -> ModelConfig:
+    """Validate the config block of a /probe or /models request (required)."""
+    if not isinstance(body, dict):
+        raise BadRequest("The request body must be a JSON object.")
+    unknown = set(body) - {"config"}
+    if unknown:
+        raise BadRequest("Unknown request field(s).", {"fields": _listed(unknown)})
+    config = _parse_config(body.get("config"))
+    if config is None:
+        raise BadRequest("'config' is required for this request.")
+    return config
+
+
 def parse_process_request(body: object, max_segments: int) -> ProcessRequest:
     """Validate the whole request before any work is done."""
     if not isinstance(body, dict):
@@ -169,6 +285,9 @@ def parse_process_request(body: object, max_segments: int) -> ProcessRequest:
     engine = body.get("engine")
     if engine is not None and (not isinstance(engine, str) or not engine):
         raise BadRequest("'engine' must be a non-empty string when given.")
+    config = _parse_config(body.get("config"))
+    if engine is not None and config is not None:
+        raise BadRequest("Provide either a model config or an engine, not both.")
     tag_source = body.get("tag_source", "target")
     if tag_source not in TAG_SOURCES:
         raise BadRequest("'tag_source' must be one of: %s." % ", ".join(TAG_SOURCES))
@@ -211,7 +330,7 @@ def parse_process_request(body: object, max_segments: int) -> ProcessRequest:
 
     return ProcessRequest(operation=operation, engine=engine, tag_source=tag_source,
                           batch_index=index, batch_count=count, context=context,
-                          segments=tuple(segments))
+                          segments=tuple(segments), config=config)
 
 
 # ------------------------------------------------------------------ helpers
@@ -266,11 +385,51 @@ class ProcessingService:
         except EngineUnavailable as exc:
             raise EngineNotReady(str(exc)) from None
 
-    def process(self, request: ProcessRequest) -> Dict[str, object]:
+    def _client_config_from_block(self, config: ModelConfig) -> llm.ClientConfig:
+        """Build a real ClientConfig from a per-request config block.
+
+        Uses only the operator's session key, never the service's configured-engine
+        key. A key-required preset with an empty key fails fast with an actionable,
+        sanitized error instead of silently borrowing a provider key or falling
+        back to the stub. The Ollama preset needs no key (local placeholder).
+        """
+        preset = llm.PRESETS[config.preset]
+        if preset.requires_key and not config.api_key.strip():
+            raise MissingApiKey(
+                "Enter an API key in the sidebar to use the %s provider." % config.preset,
+                {"preset": config.preset})
+        return llm.ClientConfig(
+            preset=config.preset, base_url=config.base_url, api_key=config.api_key,
+            model=config.model, temperature=config.temperature,
+            max_tokens=config.max_tokens, chunk_size=config.chunk_size,
+            timeout=config.timeout, max_retries=config.max_retries,
+            backend=config.backend)
+
+    def _real_client_from_config(self, config: ModelConfig):
+        client_config = self._client_config_from_block(config)
+        if not sdk_available_for_config(client_config):
+            raise EngineNotReady("The SDK for the selected backend is not installed.")
+        try:
+            return llm.LLMClient(client_config)
+        except llm.LLMError as exc:
+            raise EngineNotReady(str(exc)) from None
+
+    def _resolve_client(self, request: ProcessRequest, tag_source: str):
+        """The client for this request, plus the engine string to report for it.
+
+        An explicit model config always wins: it builds a real client from the
+        block and never falls back to the service's environment or the stub. With
+        no config the legacy path applies - a named engine, else the service's
+        configured engine - which is what unconfigured callers rely on.
+        """
+        if request.config is not None:
+            return self._real_client_from_config(request.config), request.config.backend
         engine = request.engine or self.configured_engine
         if engine not in self.available_engines():
             raise BadRequest("Unknown engine.", {"available": self.available_engines()})
+        return self._client(engine, tag_source), engine
 
+    def process(self, request: ProcessRequest) -> Dict[str, object]:
         records = [
             state_mod.SegmentRecord(
                 key=s.key, segment_id=s.key.split("#", 1)[0], ordinal=position,
@@ -279,7 +438,7 @@ class ProcessingService:
             for position, s in enumerate(request.segments)
         ]
         stage, system_prompt = build_prompt(request, records)
-        client = self._client(engine, request.tag_source)
+        client, engine = self._resolve_client(request, request.tag_source)
 
         start = time.time()
         failed = 0
@@ -327,3 +486,36 @@ class ProcessingService:
         return {"status": "ready" if ok else "not_ready",
                 "engine": self.configured_engine,
                 "checks": {"engine": "ok" if ok else "sdk_missing"}}
+
+    def probe(self, config: ModelConfig) -> Dict[str, object]:
+        """One bounded, user-initiated generation probe for the selected model.
+
+        Reuses the local :func:`llm.probe_model` exactly; the result is returned
+        as a sanitized dict (its ``message()`` already strips credentials). No
+        suggestion is written. Transport/API/shape failures become a 502.
+        """
+        client_config = self._client_config_from_block(config)
+        if not sdk_available_for_config(client_config):
+            raise EngineNotReady("The SDK for the selected backend is not installed.")
+        try:
+            result = llm.probe_model(client_config)
+        except llm.LLMError:
+            raise EngineFailed("The model probe failed.") from None
+        log.info("model probe via %s: %s", client_config.model, result.status)
+        return {"ok": result.ok, "status": result.status, "message": result.message()}
+
+    def list_models(self, config: ModelConfig) -> Dict[str, object]:
+        """Model ids the selected endpoint advertises, for the List-models action.
+
+        Reuses :meth:`llm.LLMClient.list_models`; no suggestion is written and no
+        generation happens. SDK-missing and connection failures become safe 503/502.
+        """
+        client_config = self._client_config_from_block(config)
+        if not sdk_available_for_config(client_config):
+            raise EngineNotReady("The SDK for the selected backend is not installed.")
+        try:
+            client = llm.LLMClient(client_config)
+            models = client.list_models()
+        except llm.LLMError:
+            raise EngineFailed("Could not list models.") from None
+        return {"models": list(models)}

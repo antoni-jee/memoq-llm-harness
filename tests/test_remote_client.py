@@ -718,5 +718,103 @@ class TestBuildClients(unittest.TestCase):
         self.assertFalse(session.closed)  # injected session is not owned/closed
 
 
+class TestPerRequestConfigPaths(ClientTestCase):
+    """A per-request model config travels on the same endpoints as the stub, to
+    the right path, and a key-bearing config never surfaces in a RemoteError."""
+
+    KEY = "sk-secret-key-DO-NOT-LEAK-7f3b9c"
+    CONFIG = {"preset": "OpenAI API", "backend": "openai",
+              "base_url": "http://127.0.0.1:9/v1", "api_key": KEY, "model": "test-model"}
+
+    def test_process_sends_config_to_process_endpoint(self):
+        client, session = self.client_for("processing", responses=[
+            FakeResponse(200, json_body={"suggestions": {"1#0": {"text": "Hallo"}}})])
+        out = client.process(segments=[{"key": "1#0", "source_text": "a", "mt_target": "b"}],
+                             config=self.CONFIG)
+        self.assertEqual(out["suggestions"], {"1#0": {"text": "Hallo"}})
+        method, url, kwargs = session.last
+        self.assertEqual((method, url), ("POST", "http://proc:8103/process"))
+        self.assertEqual(kwargs["json"]["config"], self.CONFIG)
+        self.assertEqual(kwargs["json"]["segments"],
+                         [{"key": "1#0", "source_text": "a", "mt_target": "b"}])
+
+    def test_process_without_config_sends_no_config_block(self):
+        client, session = self.client_for("processing", responses=[
+            FakeResponse(200, json_body={"suggestions": {}})])
+        client.process(segments=[{"key": "1#0", "source_text": "a", "mt_target": "b"}])
+        self.assertNotIn("config", session.last[2]["json"])
+
+    def test_probe_sends_config_to_probe_endpoint(self):
+        client, session = self.client_for("processing", responses=[
+            FakeResponse(200, json_body={"ok": True, "status": "ok", "message": "ok"})])
+        client.probe(self.CONFIG)
+        method, url, kwargs = session.last
+        self.assertEqual((method, url), ("POST", "http://proc:8103/probe"))
+        self.assertEqual(kwargs["json"], {"config": self.CONFIG})
+
+    def test_list_models_sends_config_to_models_endpoint(self):
+        client, session = self.client_for("processing", responses=[
+            FakeResponse(200, json_body={"models": ["m-a", "m-b"]})])
+        out = client.list_models(self.CONFIG)
+        self.assertEqual(out["models"], ["m-a", "m-b"])
+        method, url, kwargs = session.last
+        self.assertEqual((method, url), ("POST", "http://proc:8103/models"))
+        self.assertEqual(kwargs["json"], {"config": self.CONFIG})
+
+    @staticmethod
+    def views_of(err):
+        return (str(err), repr(err), err.message, err.code,
+                " ".join(str(v) for v in err.details.values()))
+
+    def test_key_in_request_echoed_by_400_is_dropped(self):
+        # A hostile service that echoes the operator's key back must not win:
+        # the safe mapping drops any non-allowlisted body content.
+        client, session = self.client_for("processing", responses=[
+            FakeResponse(400, json_body={
+                "error": "bad_request",
+                "message": "the key was %s" % self.KEY,
+                "details": {"token": self.KEY, "nested": {"k": self.KEY}}})])
+        with self.assertRaises(RemoteError) as ctx:
+            client.process(segments=[{"key": "1#0", "source_text": "a", "mt_target": "b"}],
+                           config={"preset": "OpenAI API", "api_key": self.KEY,
+                                   "model": "test-model"})
+        err = ctx.exception
+        self.assertEqual(err.status, 400)
+        self.assertEqual(err.code, "http_400")
+        self.assertEqual(err.details, {})
+        for view in self.views_of(err):
+            self.assertNotIn(self.KEY, view)
+
+    def test_missing_api_key_error_is_allowlisted_and_safe(self):
+        client, session = self.client_for("processing", responses=[
+            FakeResponse(400, json_body={
+                "error": "missing_api_key",
+                "message": "leak: %s" % self.KEY,
+                "details": {"preset": "OpenAI API", "token": self.KEY}})])
+        with self.assertRaises(RemoteError) as ctx:
+            client.process(segments=[{"key": "1#0", "source_text": "a", "mt_target": "b"}],
+                           config={"preset": "OpenAI API", "api_key": "", "model": "m"})
+        err = ctx.exception
+        self.assertEqual(err.status, 400)
+        self.assertEqual(err.code, "missing_api_key")
+        self.assertEqual(err.message, "Enter an API key in the sidebar to use this provider.")
+        self.assertEqual(err.details, {})  # non-409 details are always dropped
+        for view in self.views_of(err):
+            self.assertNotIn(self.KEY, view)
+
+    def test_key_bearing_request_to_a_down_service_leaks_nothing(self):
+        # The request carries the key but no response comes back; a transport
+        # error must not surface it.
+        client, session = self.client_for(
+            "processing", exc=requests.exceptions.ConnectionError("boom"))
+        with self.assertRaises(RemoteError) as ctx:
+            client.probe({"preset": "OpenAI API", "api_key": self.KEY, "model": "m"})
+        err = ctx.exception
+        self.assertEqual(err.code, "connection_error")
+        self.assertEqual(len(session.calls), 1)  # no automatic retry
+        for view in self.views_of(err):
+            self.assertNotIn(self.KEY, view)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

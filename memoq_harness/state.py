@@ -764,8 +764,21 @@ class ProjectState:
 
     # --------------------------------------------------------- feedback loop
 
-    def record_suggestions(self, suggestions: Dict[str, str], tag_reports: Optional[Dict[str, str]] = None) -> int:
-        """Store model output for a batch and pre-fill the editable field."""
+    def record_suggestions(self, suggestions: Dict[str, str],
+                           tag_reports: Optional[Dict[str, str]] = None,
+                           prefill: bool = True) -> int:
+        """Store model output and optionally pre-fill the editable field.
+
+        Always writes ``llm_suggestion`` (the model's latest proposal) and marks
+        the row processed. When ``prefill`` is true (the local, default
+        behaviour) it also copies the suggestion into ``user_final`` for a row
+        the user has not edited, so the output column shows the model's text; a
+        row the user has already edited keeps the human's text and just gains the
+        suggestion, so re-running a batch never silently discards their work.
+        When ``prefill`` is false the proposal is stored without populating
+        ``user_final``: a model suggestion is not a human acceptance, so the
+        remote Process path must not present it as the user's saved text.
+        """
         tag_reports = tag_reports or {}
         count = 0
         for key, text in suggestions.items():
@@ -775,8 +788,10 @@ class ProjectState:
             record.llm_suggestion = text
             record.tag_report = tag_reports.get(key, "")
             # Only pre-fill when the human has not already typed something, so
-            # re-running a batch never silently discards their work.
-            if not record.edited_by_human:
+            # re-running a batch never silently discards their work. A model
+            # suggestion is not a human acceptance, so the remote Process path
+            # calls this with prefill=False to store the proposal only.
+            if prefill and not record.edited_by_human:
                 record.user_final = text
             record.status = "processed"
             count += 1

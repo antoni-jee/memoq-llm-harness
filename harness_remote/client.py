@@ -53,6 +53,7 @@ _ALLOWED_ERROR_MESSAGES = {
     "unknown_segment": "The request named a segment key this original does not have.",
     "unavailable": "The service is not ready or is unavailable.",
     "engine_unavailable": "The translation engine is not available.",
+    "missing_api_key": "Enter an API key in the sidebar to use this provider.",
 }
 
 
@@ -333,13 +334,21 @@ class WorkspaceClient(BaseClient):
         return self.patch_json("/workspaces/%s/segments" % document_id, body)
 
     def record_suggestions(self, document_id: str, expected_revision: int,
-                           suggestions: Mapping[str, Mapping[str, str]]):
-        body = {"expected_revision": expected_revision, "suggestions": dict(suggestions)}
+                           suggestions: Mapping[str, Mapping[str, str]],
+                           prefill: bool = True):
+        body = {"expected_revision": expected_revision, "suggestions": dict(suggestions),
+                "prefill": prefill}
         return self.post_json("/workspaces/%s/suggestions" % document_id, body)
 
 
 class ProcessingClient(BaseClient):
-    """processing-service: one stateless batch or rerun, plus readiness."""
+    """processing-service: one stateless batch or rerun, model probe/list, readiness.
+
+    A real model is selected per request via a validated ``config`` block, sent to
+    the same endpoints the stub path uses. The block carries the operator's
+    session key; it never lands in a RemoteError (the mapping drops any non-
+    allowlisted detail/body), and the service never borrows its own env key.
+    """
 
     service = "processing"
 
@@ -350,7 +359,8 @@ class ProcessingClient(BaseClient):
         return self.get("/readyz")
 
     def process(self, *, segments, operation: str = "batch", engine: Optional[str] = None,
-                tag_source: str = "target", batch=None, context=None):
+                tag_source: str = "target", batch=None, context=None,
+                config: Optional[Mapping[str, object]] = None):
         body: Dict[str, object] = {
             "operation": operation, "tag_source": tag_source, "segments": list(segments),
         }
@@ -360,8 +370,18 @@ class ProcessingClient(BaseClient):
             body["batch"] = batch
         if context is not None:
             body["context"] = context
+        if config is not None:
+            body["config"] = dict(config)
         # Processing is slow: a long read, but the connect phase stays short.
         return self.post_json("/process", body, timeout=self.process_timeout)
+
+    def probe(self, config: Mapping[str, object]):
+        """One bounded, user-initiated model probe for a config block."""
+        return self.post_json("/probe", {"config": dict(config)}, timeout=self.process_timeout)
+
+    def list_models(self, config: Mapping[str, object]):
+        """Model ids the config's endpoint advertises, for the List-models action."""
+        return self.post_json("/models", {"config": dict(config)}, timeout=self.process_timeout)
 
 
 class RemoteClients:

@@ -30,7 +30,7 @@ the caller supplies segment records it obtained from document-service.
 | `POST /workspaces/{document_id}/bind` | Open or create the workspace and merge segment records. 201 created, 200 otherwise. |
 | `GET /workspaces/{document_id}` | The saved workspace (`revision`, `order`, `segments` with every record field). 404 if unknown. |
 | `PATCH /workspaces/{document_id}/segments` | Save manual text and/or comments. |
-| `POST /workspaces/{document_id}/suggestions` | Record model suggestions; prefills rows not protected by a human edit. |
+| `POST /workspaces/{document_id}/suggestions` | Record model suggestions; prefills unprotected rows unless `"prefill": false` (proposal only). |
 
 Errors are JSON `{"error", "message"}` plus `details` with identifiers only.
 Messages and logs never contain segment text, the database URL or
@@ -90,10 +90,13 @@ POST /workspaces/{document_id}/suggestions
 Recorded with `ProjectState.record_suggestions`, the rule the app uses after
 Process Current Batch and Rerun. For every named segment it sets
 `llm_suggestion`, `tag_report` (the supplied text, or empty) and
-`status: "processed"`, and copies the suggestion into `user_final` unless the
-row is protected by `edited_by_human`. A row with only a comment is not
-protected: its text is prefilled and its comment kept. This slice does not
-create corrections or mark rows applied.
+`status: "processed"`. By default it also copies the suggestion into
+`user_final` unless the row is protected by `edited_by_human`; a row with only
+a comment is not protected: its text is prefilled and its comment kept. A
+request may set `"prefill": false` to store the proposal only, without
+populating `user_final` - a model suggestion is not a human acceptance, so the
+remote Process path does so. This slice does not create corrections or mark
+rows applied.
 
 ```json
 {"document_id": "...", "revision": 5, "changed": true,

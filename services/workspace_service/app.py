@@ -7,7 +7,7 @@ Endpoints
 ``POST  /workspaces/{document_id}/bind``    open/create and merge segment records
 ``GET   /workspaces/{document_id}``         the saved workspace
 ``PATCH /workspaces/{document_id}/segments`` save manual text and/or comments
-``POST  /workspaces/{document_id}/suggestions`` record suggestions (prefills unprotected rows)
+``POST  /workspaces/{document_id}/suggestions`` record suggestions (prefill off stores the proposal only)
 
 Errors are JSON ``{"error": <code>, "message": <safe text>}`` plus, where
 useful, ``"details"`` with identifiers only.

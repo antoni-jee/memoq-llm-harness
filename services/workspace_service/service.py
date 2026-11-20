@@ -48,7 +48,7 @@ BIND_FIELDS = ("original_id", "source_file", "tag_source", "segments", "present_
 SEGMENT_FIELDS = ("key", "unit_id", "source_text", "target_text")
 PATCH_FIELDS = ("expected_revision", "segments")
 UPDATE_FIELDS = ("text", "comment")
-SUGGESTION_FIELDS = ("expected_revision", "suggestions")
+SUGGESTION_FIELDS = ("expected_revision", "suggestions", "prefill")
 SUGGESTION_ITEM_FIELDS = ("text", "tag_report")
 MAX_TAG_REPORT_CHARS = 1000
 MAX_LISTED = 20
@@ -280,6 +280,7 @@ class Suggestion:
 class SuggestionRequest:
     expected_revision: int
     suggestions: Dict[str, Suggestion]
+    prefill: bool = True
 
 
 def _expected_revision(body: dict) -> int:
@@ -322,10 +323,14 @@ def parse_suggestions_request(body: object) -> SuggestionRequest:
     if empty:
         raise BadRequest("Suggestion text must not be empty or whitespace-only; omit the "
                          "segment instead.", {"keys": _listed(empty)})
+    prefill = body.get("prefill", True)
+    if not isinstance(prefill, bool):
+        raise BadRequest("'prefill' must be a boolean when supplied.")
     return SuggestionRequest(
         expected_revision=expected,
         suggestions={k: Suggestion(text=v["text"], tag_report=v.get("tag_report", ""))
                      for k, v in raw.items()},
+        prefill=prefill,
     )
 
 
@@ -521,11 +526,16 @@ class WorkspaceService:
         """Store externally produced suggestions with the app's own rule.
 
         ``ProjectState.record_suggestions`` sets ``llm_suggestion``,
-        ``tag_report`` and ``status="processed"`` and copies the suggestion
-        into ``user_final`` unless ``edited_by_human`` protects the row. The
-        response names which rows were prefilled and which were protected.
+        ``tag_report`` and ``status="processed"``; when the request asks for it
+        (``prefill``, the default) the suggestion is also copied into
+        ``user_final`` for a row the human has not edited. A human's saved text
+        is protected by ``edited_by_human`` and never overwritten. With
+        ``prefill`` off the proposal is stored only, so a model suggestion is
+        not presented as the user's accepted text. The response names which
+        rows were prefilled and which were protected.
         """
         require_id(document_id)
+        prefill = request.prefill
 
         def decide(current: Optional[WorkspaceRow]) -> Decision:
             if current is None:
@@ -551,11 +561,13 @@ class WorkspaceService:
                     {"keys": _listed(inactive), "count": len(inactive)})
 
             protected = sorted(k for k in keys if state.segments[k].edited_by_human)
-            prefilled = sorted(k for k in keys if not state.segments[k].edited_by_human)
+            prefilled = sorted(k for k in keys
+                               if prefill and not state.segments[k].edited_by_human)
             before = _comparable(state.document_snapshot())
             state.record_suggestions(
                 {k: s.text for k, s in request.suggestions.items()},
-                {k: s.tag_report for k, s in request.suggestions.items()})
+                {k: s.tag_report for k, s in request.suggestions.items()},
+                prefill=prefill)
             payload = {"recorded_keys": sorted(keys), "prefilled_keys": prefilled,
                        "protected_keys": protected}
             if _comparable(state.document_snapshot()) == before:

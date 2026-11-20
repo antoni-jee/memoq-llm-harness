@@ -18,11 +18,24 @@ exactly as it did when this code lived in ``app.py``.
 
 from __future__ import annotations
 
+import os
 import streamlit as st
 
-from memoq_harness import mqxliff
+from memoq_harness import llm, mqxliff
 from harness_remote import RemoteError, RemoteWorkspaceView
 from ui_common import notify, upload_marker, upload_needs_load
+
+# The one explicit "use the offline stub" option, shown alongside the real
+# presets. It maps to the processing service's "stub" engine, which returns
+# the stored machine translation instead of calling a model.
+STUB_PRESET_LABEL = "Test backend (stub)"
+
+# A per-item "tag_report" the workspace suggestion write accepts is at most this
+# many characters (services/workspace_service/service.py MAX_TAG_REPORT_CHARS).
+# The real Process path mirrors it so a valid tag report is forwarded through the
+# write rather than cleared, and an over-long one is dropped (text only) instead
+# of triggering a 422 that would block the whole batch as an uncertain write.
+_MAX_TAG_REPORT_CHARS = 1000
 
 
 def _bootstrap_remote() -> None:
@@ -60,6 +73,40 @@ def _bootstrap_remote() -> None:
     ss.remote_uploader_gen = 0
     ss._remote_clients = None
     ss._ready = True
+    # Model configuration the remote UI exposes, mirroring the local sidebar:
+    # one preset/provider + editable base URL + password key + model selection
+    # and generation controls. The config is built into a per-request "config"
+    # block and sent to the processing service, which selects the real backend,
+    # endpoint and model. The key is held here in the browser session only; it
+    # is never written to state.json, tracked files or logs.
+    #
+    # remote_model_config is the live ClientConfig the controls edit in place
+    # (exactly like the local ss.config). It defaults to the local default
+    # preset, NOT the stub.
+    ss.remote_model_config = llm.ClientConfig()
+    ss.remote_model_preset = llm.DEFAULT_PRESET
+    # Models the last "List models" call returned for the current config; a stale
+    # list is cleared whenever the connection settings change (never refreshed by
+    # calling the provider).
+    ss.remote_model_list = []
+    # Widget re-key counter, bumped on a preset switch so the new preset's base
+    # URL / key / model values take over the text inputs instead of the old
+    # preset's stale widget values.
+    ss.remote_engine_rev = 0
+    # A connection-test result cache, kept distinct from the per-request config:
+    # it reports the service's own configured engine / readiness, not the model
+    # the operator has selected.
+    ss.remote_ready = None
+    # Set when a Process ends in an uncertain outcome (a stale write, a
+    # transport/5xx/malformed write, a failed confirming read, or a bound-to-
+    # a-different-original read). It blocks another Process until a successful
+    # Reload or Open reconciles the view, so a clean read must precede the next
+    # batch. Cleared by a successful Open or Reload.
+    ss.remote_process_uncertain = False
+    # Cached result of the non-mutating workspace compatibility probe
+    # ("ok" / "stale" / "unknown"). Cleared on a successful Open or Reload so a
+    # restarted workspace is re-checked before the next Process.
+    ss._remote_workspace_compat = None
 
 
 def get_remote_clients():
@@ -195,6 +242,10 @@ def remote_open(raw: bytes, filename: str) -> None:
     # earlier version of this one) survives, and every cell re-seeds.
     ss.remote_drafts = {}
     ss.remote_pending = None
+    # A fresh open reconciles any prior uncertain Process; it no longer blocks.
+    ss.remote_process_uncertain = False
+    # The workspace may have been restarted between opens; re-check compatibility.
+    ss._remote_workspace_compat = None
     ss.remote_open_file = {"name": filename, "marker": upload_marker(filename, raw)}
     _bump_widgets()
     counts = view.counts()
@@ -283,6 +334,13 @@ def remote_reload() -> None:
     before = view.revision
     view = RemoteWorkspaceView.from_remote(doc_segments, snapshot)
     note = _adopt_view(view)  # rebases any kept drafts; marks conflicts
+    # A successful Reload is the reconciliation that unblocks a Process left in
+    # an uncertain state: the view now reflects the saved work the operator must
+    # trust before processing again.
+    ss.remote_process_uncertain = False
+    # The workspace may have been restarted between reloads; re-check
+    # compatibility before the next Process.
+    ss._remote_workspace_compat = None
     message = "Reloaded saved work - revision %d." % view.revision
     if unsaved_count():
         message += " " + _state_text(view, before)
@@ -397,6 +455,34 @@ def cell_seed(record) -> tuple:
     if draft:
         return draft["text"], draft["comment"]
     return record.user_final, record.user_comment
+
+
+def _effective_your_text(record) -> str:
+    """The 'Your text' a row shows right now: the held draft when one is, else
+    the saved human text. An explicitly cleared draft counts as blank, so a row
+    the operator cleared (or a neighbour they filled) is judged by its current
+    text, not by an older saved value.
+    """
+    return cell_seed(record)[0]
+
+
+def _eligible_records(view, batch_index) -> list:
+    """This batch's rows a Process should send: the translatable rows whose
+    effective 'Your text' (draft when held, else saved) is blank after trimming.
+
+    Eligibility is judged per row, so a previous model proposal, an edited
+    status or a filled neighbour never blocks an otherwise-eligible row. Rows
+    the operator cleared into an unsaved draft are eligible again, and unrelated
+    rows are left untouched.
+    """
+    return [record for record in view.batch_records(batch_index)
+            if record.translatable
+            and not _effective_your_text(record).strip()]
+
+
+def eligible_count(view, batch_index) -> int:
+    """How many rows in this batch a Process would send to the model."""
+    return len(_eligible_records(view, batch_index))
 
 
 def _store_cell(document_id: str, record, text: str, comment: str) -> None:
@@ -793,3 +879,465 @@ def resolve_pending(choice: str) -> None:
     if saved_notice and saved_notice[0] == "success":
         kind, message = ss.get("notice") or ("success", "")
         notify(kind, saved_notice[1] + " " + message)
+
+
+# --------------------------------------------------------------- model / process
+#
+# The remote UI exposes a narrow slice of model configuration - the engine to
+# send the selected batch to, plus a connection test - and one mutation, the
+# "process the currently selected batch" action. Both the connection test and
+# the processing go through the processing service's clients: the model endpoint
+# lives in that service's environment, never in this app and never in Qwen
+# Code's own config, so this code reads no ~/.qwen settings and no agent
+# credentials, and there is no direct Streamlit-to-model call and no local
+# workflow fallback. A processed batch's proposals are persisted through the
+# workspace contract (``record_suggestions`` stores the model's last proposal as
+# the row's ``llm_suggestion`` with a proposal-only write - prefill off - so it
+# survives a Reload); the human's saved text (``user_final``), comments and the
+# original target (``mt_target``) are never touched, keeping the four data kinds
+# distinct. A model proposal is not a human acceptance.
+
+
+def remote_test_connection() -> None:
+    """Probe the processing service's readiness without calling a model.
+
+    ``ready()`` is a GET ``/readyz``: it checks that the service is up and that
+    the configured engine's SDK is importable - it never runs a model, sends no
+    segment text and carries no credential. It is a *service/SDK readiness*
+    check, not a real model probe: success proves the engine is available, not
+    that a translation succeeded. On success the result is cached so the engine
+    list and the UI can show it; on any failure the cache is cleared so a stale
+    "ready" is never shown, and the safe message (no URL or secret) is queued.
+    """
+    ss = st.session_state
+    clients = get_remote_clients()
+    try:
+        ready = clients.processing.ready()
+    except RemoteError as exc:
+        ss.remote_ready = None
+        notify("error", "Service readiness check failed: %s"
+               % _remote_error_text(exc))
+        return
+    ss.remote_ready = ready
+    if isinstance(ready, dict) and ready.get("status") == "ready":
+        engine = ready.get("engine")
+        notify("success",
+               "Processing service is ready: the %s engine's SDK is available. "
+               "This checks service readiness; it does not call the model."
+               % (engine if engine else "stub"))
+    else:
+        notify("warning", "Processing service is not ready yet (its engine SDK "
+               "or configuration is unavailable). Try again when it is up.")
+
+
+def _model_config_block(config) -> dict:
+    """The per-request "config" block the processing service selects a model by.
+
+    It carries the operator's session selection (preset, backend, base URL, the
+    session-only key, model and the generation controls). The key is sent only to
+    the processing service for this one request; the service never writes it to
+    a log, response or tracked file, and the client never echoes it in an error.
+    """
+    return {
+        "preset": config.preset,
+        "backend": config.backend,
+        "base_url": config.base_url,
+        "api_key": config.api_key,
+        "model": config.model,
+        "temperature": config.temperature,
+        "max_tokens": config.max_tokens,
+        "chunk_size": config.chunk_size,
+        "timeout": config.timeout,
+        "max_retries": config.max_retries,
+    }
+
+
+def _model_connection_signature(config) -> tuple:
+    """The connection identity that decides which models an endpoint serves.
+
+    A change to any of these makes a previously fetched model list stale, so the
+    UI clears the cache rather than showing models that no longer apply.
+    """
+    return (config.preset, config.backend, config.base_url, config.model,
+            config.api_key)
+
+
+def remote_invalidate_stale_model_list(config) -> None:
+    """Clear the cached model list when the connection settings changed.
+
+    The provider is never called to refresh it: the list is simply emptied so the
+    model selector falls back to the preset's suggestions until the operator runs
+    "List models" again for the new settings.
+    """
+    ss = st.session_state
+    signature = _model_connection_signature(config)
+    if ss.get("_remote_model_sig") != signature:
+        ss.remote_model_list = []
+        ss._remote_model_sig = signature
+
+
+def remote_model_test() -> None:
+    """Run one bounded, user-initiated probe of the selected config.
+
+    The probe runs in the processing service (it imports the model SDK and talks
+    to the endpoint); this app only sends the config and shows the result. It is
+    a readiness check, not a translation: it stores nothing and never becomes a
+    model proposal or user text. A failure is a safe notice (no key or URL); it
+    also clears a stale model list so the selector reflects the new settings.
+    """
+    ss = st.session_state
+    config = ss.remote_model_config
+    clients = get_remote_clients()
+    try:
+        result = clients.processing.probe(_model_config_block(config))
+    except RemoteError as exc:
+        ss.remote_model_list = []
+        notify("error", "Model test failed: %s" % _remote_error_text(exc))
+        return
+    if isinstance(result, dict):
+        message = result.get("message", "Probe finished.")
+        notify("success" if result.get("ok") else "warning", message)
+    else:
+        notify("warning", "The model test returned an unexpected response.")
+
+
+def remote_model_list() -> None:
+    """Fetch the models the selected config's endpoint advertises.
+
+    Only this explicit action calls the provider to list models; nothing else in
+    the UI does. The result is cached for the selector and tied to the current
+    connection settings, so a later settings change clears it.
+    """
+    ss = st.session_state
+    config = ss.remote_model_config
+    clients = get_remote_clients()
+    try:
+        result = clients.processing.list_models(_model_config_block(config))
+    except RemoteError as exc:
+        ss.remote_model_list = []
+        notify("error", "Could not list models: %s" % _remote_error_text(exc))
+        return
+    models = result.get("models") if isinstance(result, dict) else None
+    if isinstance(models, list):
+        ss.remote_model_list = models
+        ss._remote_model_sig = _model_connection_signature(config)
+        notify("success", "Found %d model(s)." % len(models))
+    else:
+        ss.remote_model_list = []
+        notify("warning", "Could not list models: unexpected response.")
+
+
+def _process_target(ss) -> tuple:
+    """What the Process call sends to the processing service.
+
+    Returns ``(config, engine)``: a real preset yields the per-request config
+    (``engine`` is None, so the service selects the backend/endpoint/model from
+    it); the explicit stub sentinel yields ``(None, "stub")`` so the service
+    returns the stored machine translation. The two are mutually exclusive, both
+    on the client (one or the other, never both) and enforced again by the
+    service.
+    """
+    if ss.get("remote_model_preset") == STUB_PRESET_LABEL:
+        return None, "stub"
+    return _model_config_block(ss.remote_model_config), None
+
+
+def _probe_workspace_compat(clients) -> str:
+    """Non-mutatingly check that the workspace accepts the prefill=false write.
+
+    The Process path stores model proposals as the model's ``llm_suggestion``
+    with ``prefill=False`` (a proposal-only write that never touches a human's
+    saved text). The ``prefill`` field was added to the workspace's suggestion
+    contract; a service that predates it rejects the field at parse time with a
+    400, which the client maps to the generic "rejected as malformed" message
+    that previously wasted a paid model call with no stored result. This probe
+    detects that staleness *before* any model call.
+
+    It writes to a fresh 64-hex ``document_id`` that nothing is bound to, so no
+    DB write can happen: a stale service 400s at parse (the unknown ``prefill``
+    field) and a fresh service accepts the field and 404s later ("unknown
+    workspace; bind the document first"). Both paths leave the database
+    untouched. A 400 means "stale"; a 404 means "ok"; any other outcome
+    (transport error, a 5xx, or an unexpected success) is "unknown" and
+    proceeds without bypassing prefill or switching to the stub.
+    """
+    probe_id = os.urandom(32).hex()
+    try:
+        clients.workspace.record_suggestions(
+            probe_id, 1, {"1#1": {"text": "probe"}}, prefill=False)
+    except RemoteError as exc:
+        status = getattr(exc, "status", None)
+        if status == 400:
+            return "stale"
+        if status == 404:
+            return "ok"
+        return "unknown"
+    # A success or an unexpected non-RemoteError is not a clean discriminator;
+    # treat it as "unknown" rather than assume the workspace is compatible.
+    return "unknown"
+
+
+def remote_check_workspace_compat(clients) -> str:
+    """Return the workspace-compatibility verdict, probing once and caching it.
+
+    The result ("ok"/"stale"/"unknown") is cached on
+    ``ss._remote_workspace_compat`` and reused until the next successful Open or
+    Reload clears it, so a Process never re-probes per rerender. A "stale"
+    verdict blocks the model call with a restart instruction instead of paying
+    for inference that cannot be stored; "ok" and "unknown" both proceed
+    (prefill is never removed, retried without, or swapped for the stub).
+    """
+    ss = st.session_state
+    cached = ss.get("_remote_workspace_compat")
+    if cached is not None:
+        return cached
+    verdict = _probe_workspace_compat(clients)
+    ss._remote_workspace_compat = verdict
+    return verdict
+
+
+def process_block_reason(view, batch_index) -> str:
+    """The first reason processing is blocked, or "" when it is allowed.
+
+    The guards, in order: an unresolved conflict (never over-written silently),
+    an uncertain prior Process (a successful Reload or Open must reconcile it
+    first, so no batch is processed over a view whose saved state is unverified),
+    an incompatible workspace (a known-stale service that predates the prefill
+    contract, which would 400 the proposal write - so a paid model call is
+    blocked before it is spent), a batch with no translatable segment, and a
+    batch whose every translatable row already has text (so there is nothing to
+    send). A batch is no longer blocked by a blanket "already worked" check nor
+    by unsaved drafts: a row is eligible on its own effective 'Your text' (a
+    held draft, including a cleared one, otherwise the saved text), so a filled
+    neighbour or a prior proposal never suppresses an eligible row. The same
+    guards are re-checked inside ``process_remote_batch`` as a backstop, so a
+    click can never bypass them.
+    """
+    if conflicted_keys(view):
+        return "Resolve the conflicts in the Conflicts panel first."
+    if st.session_state.get("remote_process_uncertain"):
+        return ("The last process did not complete cleanly; Reload to reconcile "
+                "the saved state before processing again.")
+    if st.session_state.get("_remote_workspace_compat") == "stale":
+        return ("The workspace service is incompatible with this client and "
+                "cannot store proposals (a paid model call would be wasted). "
+                "Restart the workspace service, then Reload and try again.")
+    records = view.batch_records(batch_index)
+    if not any(record.translatable for record in records):
+        return "This batch has no translatable segments to process."
+    if not _eligible_records(view, batch_index):
+        return ("Every translatable row in this batch already has text; nothing "
+                "to process.")
+    return ""
+
+
+def process_remote_batch() -> None:
+    """Send the currently selected batch to the model and store its proposals.
+
+    The model call goes through the processing service (no local fallback). The
+    proposals are persisted through the workspace's ``record_suggestions`` as the
+    model's ``llm_suggestion`` with a proposal-only write (prefill off): a
+    human's saved text, comments and the original target are left untouched, so a
+    model proposal is never presented as the user's accepted text. Only the
+    eligible rows are sent - the translatable rows whose effective 'Your text'
+    (a held draft, including a cleared one, otherwise the saved text) is blank
+    after trimming - so a filled neighbour, a prior proposal or an edited status
+    never blocks an eligible row, and no row is sent twice. Unrelated rows and
+    any held drafts are left untouched (the proposal write is prefill-off, so it
+    never touches a human's saved text), and a Process never auto-saves or
+    discards a draft. Uncertain-outcome handling is deliberately conservative: a
+    stale write (409), a transport/5xx/malformed write, a failed confirming read,
+    or a read that no longer names the same original are recorded as
+    ``remote_process_uncertain`` so another Process is blocked until a successful
+    Reload or Open reconciles the view. None of these are rebased, overwritten,
+    rerun or auto-retried, and the wordings never claim that nothing was stored
+    or that the server refuses a repeat - a successful read/reconciliation must
+    precede the next batch.
+    """
+    ss = st.session_state
+    view = ss.get("remote_view")
+    if view is None or view.is_empty:
+        notify("info", "Open a document and select a batch to process.")
+        return
+    if conflicted_keys(view):
+        notify("error", "Resolve the conflicts in the Conflicts panel before "
+               "processing.")
+        return
+    if ss.get("remote_process_uncertain"):
+        notify("warning", "The last process did not complete cleanly; Reload to "
+               "reconcile the saved state before processing again.")
+        return
+    batch_index = min(ss.get("remote_batch", 0), view.batch_count - 1)
+    records = view.batch_records(batch_index)
+    if not any(record.translatable for record in records):
+        notify("info", "This batch has no translatable segments to process.")
+        return
+    eligible = _eligible_records(view, batch_index)
+    if not eligible:
+        notify("info", "Every translatable row in this batch already has text; "
+               "nothing to process.")
+        return
+
+    clients = get_remote_clients()
+
+    # Before paying for a model call, verify the workspace can store the
+    # proposal-only write (prefill=false). A stale workspace predates the
+    # prefill contract and 400s the write - that is the "rejected as malformed"
+    # failure that wasted a paid request before. The probe is non-mutating and
+    # blocks on "stale" so no inference is sent to an incompatible workspace;
+    # prefill is never removed, retried without, or swapped for the stub.
+    if remote_check_workspace_compat(clients) == "stale":
+        notify("error",
+               "The workspace service is incompatible with this client and "
+               "cannot store proposals. No model call was made. Restart the "
+               "workspace service (it predates the prefill contract), then "
+               "Reload and try again.")
+        return
+
+    # Only the eligible rows of this batch go to the model; each carries its key,
+    # source text, original target and saved comment. Eligible rows are judged
+    # per row by their effective 'Your text', so a row the operator cleared into
+    # an unsaved draft is processed again rather than skipped, while a filled or
+    # already-proposed row is not re-sent. context is left to the service's
+    # shipped defaults and the stage derived from the batch index.
+    segment_inputs = [
+        {"key": record.key, "source_text": record.source_text,
+         "mt_target": record.mt_target, "user_comment": record.user_comment}
+        for record in eligible
+    ]
+    if not segment_inputs:
+        notify("info", "This batch has no translatable segments to process.")
+        return
+
+    try:
+        config, engine = _process_target(ss)
+        result = clients.processing.process(
+            segments=segment_inputs,
+            engine=engine,
+            tag_source=view.tag_source,
+            batch={"index": batch_index, "count": view.batch_count},
+            context=None,
+            config=config,
+        )
+    except RemoteError as exc:
+        # The model call failed or was uncertain; no proposal is claimed and
+        # nothing is stored. A 502/503/400 from the service is mapped by the
+        # client to a safe RemoteError; no raw body, URL or secret reaches here.
+        notify("error", "Processing failed: %s" % _remote_error_text(exc))
+        return
+
+    # The model call is stateless (it persists nothing): a response that is not
+    # the expected object, or whose "suggestions" is not an object, carries no
+    # usable proposal, so nothing is stored and the operator may process again.
+    # This is a read-side failure, not an uncertain write, so the flag is left
+    # clear and the next Process is not blocked.
+    if not isinstance(result, dict):
+        notify("error", "The process response was not the expected object; no "
+               "proposals were stored. Try processing this batch again.")
+        return
+    suggestions = result.get("suggestions")
+    if not isinstance(suggestions, dict):
+        notify("error", "The process response did not carry a valid suggestions "
+               "object; no proposals were stored. Try processing this batch "
+               "again.")
+        return
+    missing = result.get("missing")
+    if not isinstance(missing, list):
+        missing = []
+    # Only this batch's keys may be accepted: a suggestion for a segment in
+    # another batch of the same document (one the service returned but the app
+    # never sent this request) must not be persisted. sent_keys is the exact set
+    # the model call carried. Each accepted item keeps only a non-empty string
+    # "text" (the workspace requires a string), and, when the service supplies
+    # one, a string "tag_report" no longer than the workspace allows, so a valid
+    # tag report is preserved through the real Process path rather than cleared.
+    sent_keys = {seg["key"] for seg in segment_inputs}
+    updates = {}
+    for key, item in suggestions.items():
+        if key not in sent_keys or not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        entry = {"text": text}
+        tag_report = item.get("tag_report")
+        if (isinstance(tag_report, str) and tag_report
+                and len(tag_report) <= _MAX_TAG_REPORT_CHARS):
+            entry["tag_report"] = tag_report
+        updates[key] = entry
+    if not updates:
+        if missing:
+            notify("warning", "No proposals were returned for this batch; %d "
+                   "segment(s) had none. Nothing was stored." % len(missing))
+        else:
+            notify("warning", "No proposals were returned for this batch. "
+                   "Nothing was stored.")
+        return
+
+    before = view.revision
+    try:
+        # Proposal-only write: the model's text is stored as the row's
+        # llm_suggestion (so it survives a Reload), but prefill is off, so it is
+        # never copied into user_final. A model proposal is not a human
+        # acceptance; putting a proposal into "Your text" is an explicit,
+        # separately-saved edit, and Discard before Save restores the prior saved
+        # human text while keeping the proposal.
+        clients.workspace.record_suggestions(
+            view.document_id, view.revision, updates, prefill=False)
+    except RemoteError as exc:
+        if exc.is_conflict and exc.code == "stale_revision":
+            # The workspace moved since it was read. Do not rebase, overwrite,
+            # rerun or retry: leave the proposals un-persisted and let the
+            # operator reload, so a stale write is never replayed. The flag
+            # blocks another Process until the reload reconciles.
+            ss.remote_process_uncertain = True
+            notify("error", "The workspace was changed elsewhere since it was "
+                   "read (current revision %d). The proposals may or may not "
+                   "have been stored; Reload to reconcile, then process again."
+                   % (exc.current_revision or before))
+            return
+        if _definitely_not_applied(exc):
+            # A 3xx/4xx is a rejection before any write: nothing was stored. The
+            # flag blocks another Process until a successful Reload.
+            ss.remote_process_uncertain = True
+            notify("error", "The proposals could not be stored (%s). Reload and "
+                   "process again." % _remote_error_text(exc))
+            return
+        # Transport failure, 5xx or malformed 2xx: the outcome is unknown - the
+        # write may have applied or not. Do not re-read or retry, and do not
+        # claim nothing was stored or that the server refuses a repeat: a
+        # successful read/reconciliation must precede another Process. The flag
+        # blocks it; the wording tells the operator to Reload.
+        ss.remote_process_uncertain = True
+        notify("error", "The outcome of storing the proposals is uncertain (%s). "
+               "Reload to see the current saved state, then process again."
+               % exc.message)
+        return
+
+    # Confirmed by a 2xx: re-read and adopt so the view shows the stored
+    # proposals in the "Model proposal" column. The write is prefill-off, so it
+    # touched only llm_suggestion; any held draft is re-anchored (kept, since its
+    # base and value are unchanged), so a Process never drops or auto-saves a
+    # human's unsaved text.
+    try:
+        fresh = _read_view(view.document_id, view.original_id, view.tag_source)
+    except RemoteError as exc:
+        # The write confirmed (a 2xx) but the confirming read failed: the saved
+        # state is uncertain. Do not claim nothing was stored or that a repeat
+        # is refused; require a read/reconciliation before another Process.
+        ss.remote_process_uncertain = True
+        notify("warning", "Stored %d proposal(s), but the confirming read failed "
+               "(%s). Reload to see the current saved state, then process again."
+               % (len(updates), exc.message))
+        return
+    if fresh is None:
+        ss.remote_process_uncertain = True
+        notify("warning", "Stored %d proposal(s), but the workspace is now bound "
+               "to a different original; re-open the document." % len(updates))
+        return
+    _adopt_view(fresh)
+    missing_note = (" %d segment(s) had no proposal." % len(missing)
+                    if missing else "")
+    notify("success", "Stored %d proposal(s) in batch %d of %d - revision %d.%s"
+           % (len(updates), batch_index + 1, view.batch_count, fresh.revision,
+              missing_note))

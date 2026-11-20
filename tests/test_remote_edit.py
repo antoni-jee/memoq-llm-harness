@@ -276,6 +276,198 @@ class RemoteEditTestCase(unittest.TestCase):
         self.assertTrue(any(k == "success" and "Saved 1 segment" in m
                             for k, m in self.messages(app)))
 
+    def test_record_suggestions_real_contract_prefill_protection_no_op(self):
+        # The real WorkspaceClient -> workspace app -> WorkspaceService ->
+        # repository contract for a model write: a clean row is prefilled, a
+        # human-protected row keeps its text and flag, the original target is
+        # left untouched, a change advances the revision, and an identical write
+        # is a no-op that keeps it.
+        self.install()
+        app = self.start()
+        # A human already saved k2, so its row is protected (edited_by_human).
+        self.other_writer({"k2": {"text": "Human text."}})
+        rev = self.revision()
+
+        result = self.fake.workspace.record_suggestions(
+            DOC_A, rev,
+            {"k1": {"text": "Le chat (LLM)."},
+             "k2": {"text": "Le chien (LLM)", "tag_report": "gloss term"}})
+
+        # k1 is clean: the suggestion prefills user_final and marks it
+        # processed, with the original target left untouched.
+        self.assertEqual(self.stored("k1")["llm_suggestion"], "Le chat (LLM).")
+        self.assertEqual(self.stored("k1")["user_final"], "Le chat (LLM).")
+        self.assertEqual(self.stored("k1")["status"], "processed")
+        self.assertEqual(self.stored("k1")["tag_report"], "")
+        self.assertEqual(self.stored("k1")["mt_target"], "Le chat.")
+        # k2 is protected: the suggestion sets llm_suggestion and tag_report, but
+        # the human's user_final and the edited_by_human flag are kept.
+        self.assertEqual(self.stored("k2")["llm_suggestion"], "Le chien (LLM)")
+        self.assertEqual(self.stored("k2")["user_final"], "Human text.")
+        self.assertEqual(self.stored("k2")["tag_report"], "gloss term")
+        self.assertTrue(self.stored("k2")["edited_by_human"])
+        # The change advanced the revision and the response named the rows.
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["revision"], rev + 1)
+        self.assertEqual(result["recorded_keys"], ["k1", "k2"])
+        self.assertEqual(result["prefilled_keys"], ["k1"])
+        self.assertEqual(result["protected_keys"], ["k2"])
+        self.assertEqual(self.revision(), rev + 1)
+        # A reload shows the stored proposal on the clean row; the protected row
+        # keeps the human's text.
+        self.click(app, "Reload saved work")
+        self.assertEqual(app.session_state.remote_view.record("k1").llm_suggestion,
+                         "Le chat (LLM).")
+        self.assertEqual(app.session_state.remote_view.record("k2").user_final,
+                         "Human text.")
+
+        # An identical write at the new revision changes nothing: a no-op keeps
+        # the revision and the protected row's text.
+        no_op = self.fake.workspace.record_suggestions(
+            DOC_A, rev + 1,
+            {"k1": {"text": "Le chat (LLM)."},
+             "k2": {"text": "Le chien (LLM)", "tag_report": "gloss term"}})
+        self.assertFalse(no_op["changed"])
+        self.assertEqual(no_op["revision"], rev + 1)
+        self.assertEqual(self.revision(), rev + 1)
+        self.assertEqual(self.stored("k1")["user_final"], "Le chat (LLM).")
+        self.assertEqual(self.stored("k2")["user_final"], "Human text.")
+
+    def test_process_proposal_only_does_not_accept_human_text(self):
+        # The remote Process path writes a proposal only (prefill off): on a
+        # clean row it stores the model text as llm_suggestion without ever
+        # populating user_final, so the proposal is not accepted as the user's
+        # text. The proposal survives a Reload, and a later manual Save is the
+        # only thing that may make it the user's text.
+        self.install()
+        app = self.start()
+        rev = self.revision()
+
+        result = self.fake.workspace.record_suggestions(
+            DOC_A, rev, {"k1": {"text": "Le chat (LLM)."}}, prefill=False)
+
+        # The proposal is stored, but user_final is untouched: no automatic
+        # acceptance. The original target and source stay distinct and the row
+        # is only marked processed.
+        self.assertEqual(self.stored("k1")["llm_suggestion"], "Le chat (LLM).")
+        self.assertEqual(self.stored("k1")["user_final"], "")
+        self.assertEqual(self.stored("k1")["status"], "processed")
+        self.assertEqual(self.stored("k1")["tag_report"], "")
+        self.assertEqual(self.stored("k1")["mt_target"], "Le chat.")
+        self.assertEqual(self.stored("k1")["source_text"], "The cat.")
+        self.assertFalse(self.stored("k1")["edited_by_human"])
+        # The write advanced the revision (the proposal is persisted), so it
+        # survives a Reload; nothing was prefilled or protected.
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["revision"], rev + 1)
+        self.assertEqual(result["recorded_keys"], ["k1"])
+        self.assertEqual(result["prefilled_keys"], [])
+        self.assertEqual(result["protected_keys"], [])
+        self.assertEqual(self.revision(), rev + 1)
+        # Reload preserves the proposal without fabricating human text.
+        self.click(app, "Reload saved work")
+        view = app.session_state.remote_view
+        self.assertEqual(view.record("k1").llm_suggestion, "Le chat (LLM).")
+        self.assertEqual(view.record("k1").user_final, "")
+        self.assertEqual(view.record("k1").mt_target, "Le chat.")
+
+    def test_process_proposal_only_keeps_human_text_and_comment(self):
+        # A proposal-only write over a row the human already saved leaves the
+        # human's text, comment and edited_by_human flag untouched - only the
+        # proposal (and its tag report) is recorded.
+        self.install()
+        app = self.start()
+        # The human already saved k1 with a comment.
+        self.other_writer({"k1": {"text": "Le chat humain.", "comment": "tone note"}})
+        rev = self.revision()
+
+        result = self.fake.workspace.record_suggestions(
+            DOC_A, rev,
+            {"k1": {"text": "Le chat (LLM).", "tag_report": "gloss term"}},
+            prefill=False)
+
+        # The proposal and its report are recorded; the human's saved text and
+        # comment, the protected flag and the original target stay.
+        self.assertEqual(self.stored("k1")["llm_suggestion"], "Le chat (LLM).")
+        self.assertEqual(self.stored("k1")["user_final"], "Le chat humain.")
+        self.assertEqual(self.stored("k1")["user_comment"], "tone note")
+        self.assertTrue(self.stored("k1")["edited_by_human"])
+        self.assertEqual(self.stored("k1")["tag_report"], "gloss term")
+        self.assertEqual(self.stored("k1")["mt_target"], "Le chat.")
+        self.assertEqual(result["prefilled_keys"], [])
+        self.assertEqual(result["protected_keys"], ["k1"])
+        self.assertTrue(result["changed"])
+        self.assertEqual(self.revision(), rev + 1)
+        # Reload preserves the proposal; the human text and comment stay.
+        self.click(app, "Reload saved work")
+        view = app.session_state.remote_view
+        self.assertEqual(view.record("k1").llm_suggestion, "Le chat (LLM).")
+        self.assertEqual(view.record("k1").user_final, "Le chat humain.")
+        self.assertEqual(view.record("k1").user_comment, "tone note")
+
+    def test_manual_save_after_proposal_only_persists_human_text(self):
+        # Putting a proposal into "Your text" is an explicit edit that creates
+        # an unsaved draft; only Save persists it. The model proposal
+        # (llm_suggestion) is kept through the save, so the four data kinds stay
+        # distinct.
+        self.install()
+        app = self.start()
+        rev = self.revision()
+        # Store the proposal only - user_final stays empty (no automatic accept).
+        self.fake.workspace.record_suggestions(
+            DOC_A, rev, {"k1": {"text": "Le chat (LLM)."}}, prefill=False)
+        self.click(app, "Reload saved work")
+        view = app.session_state.remote_view
+        self.assertEqual(view.record("k1").llm_suggestion, "Le chat (LLM).")
+        self.assertEqual(view.record("k1").user_final, "")
+
+        # The user edits "Your text": an unsaved draft, not yet persisted.
+        self.edit_text(app, 0, "Le chat humain.")
+        self.assertEqual(self.drafts(app)["k1"]["text"], "Le chat humain.")
+        self.assertTrue(self.save_enabled(app))
+        self.assertEqual(app.session_state.remote_view.record("k1").user_final, "")
+        self.assertEqual(self.session.patches(), [])
+
+        # Save persists the human text; the proposal is kept.
+        self.click(app, "Save")
+        self.assertEqual(self.session.patches()[-1][2]["segments"],
+                         {"k1": {"text": "Le chat humain."}})
+        self.assertEqual(self.stored("k1")["user_final"], "Le chat humain.")
+        self.assertTrue(self.stored("k1")["edited_by_human"])
+        self.assertEqual(self.stored("k1")["llm_suggestion"], "Le chat (LLM).")
+        self.assertEqual(self.drafts(app), {})
+        self.assertFalse(self.save_enabled(app))
+
+    def test_discard_before_save_keeps_proposal_restores_human(self):
+        # A proposal stored on a row the human already saved does not move the
+        # human text. A manual edit creates a draft; Discard (before Save)
+        # restores the prior saved human text and keeps the model proposal.
+        self.install()
+        app = self.start()
+        # The human already saved k1.
+        self.other_writer({"k1": {"text": "Le chat humain."}})
+        rev = self.revision()
+        # Process stores a new proposal only - the human text is left untouched.
+        self.fake.workspace.record_suggestions(
+            DOC_A, rev, {"k1": {"text": "Le chat (LLM)."}}, prefill=False)
+        self.click(app, "Reload saved work")
+        view = app.session_state.remote_view
+        self.assertEqual(view.record("k1").llm_suggestion, "Le chat (LLM).")
+        self.assertEqual(view.record("k1").user_final, "Le chat humain.")
+        # A manual edit creates a draft; the saved human text and the proposal
+        # are both still on the server (the draft is session-only).
+        self.edit_text(app, 0, "Le chat (LLM).")
+        self.assertEqual(self.drafts(app)["k1"]["text"], "Le chat (LLM).")
+        self.assertEqual(self.stored("k1")["user_final"], "Le chat humain.")
+        self.assertEqual(self.stored("k1")["llm_suggestion"], "Le chat (LLM).")
+        # Discard (before Save) drops the draft; no write happens, so the prior
+        # saved human text and the proposal both remain.
+        self.click(app, "Discard")
+        self.assertEqual(self.session.patches(), [])
+        self.assertEqual(self.drafts(app), {})
+        self.assertEqual(self.stored("k1")["user_final"], "Le chat humain.")
+        self.assertEqual(self.stored("k1")["llm_suggestion"], "Le chat (LLM).")
+
     def test_empty_string_edit_is_saved_as_empty(self):
         self.install()
         app = self.start()

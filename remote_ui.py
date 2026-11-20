@@ -1,14 +1,21 @@
 """Remote-mode UI: the sidebar, grid and row.
 
 The sidebar shows the open document (apart from the uploader's selection) and
-offers Save, Discard and Reload through the workflow module. The grid shows the
-merged segments with presentation-only batch navigation and editable human-text
-and comment cells. Those cells feed a session-scoped draft store (owned by
-``remote_workflow``) and reach the workspace only through the explicit Save
-action. A dirty Open/Reload is held for an explicit save/discard/cancel answer,
-and rows changed elsewhere since they were edited are listed in a Conflicts
-panel with Keep mine / Use server / Show row. There is no
-Process/Apply/Rerun/Analyse/Export and no tag injection.
+offers Save, Discard and Reload through the workflow module, plus the per-request
+model configuration the remote operator chooses - a preset/provider, an editable
+base URL, a session-only key, a model selection, a Test/List-models action and
+the inference settings - which is sent to the processing service that calls the
+model (the app never talks to the provider and never reads Qwen Code's own
+config). The grid shows the merged segments with
+presentation-only batch navigation and editable human-text and comment cells.
+Those cells feed a session-scoped draft store (owned by ``remote_workflow``) and
+reach the workspace only through the explicit Save action. A dirty Open/Reload is
+held for an explicit save/discard/cancel answer, and rows changed elsewhere since
+they were edited are listed in a Conflicts panel with Keep mine / Use server /
+Show row. One gated mutation is offered - "Process Current Batch", which sends
+the selected batch to the model through the processing service and persists the
+proposals - blocked while the document is dirty or conflicted or the batch is
+already worked. There is no Apply/Rerun/Analyse/Export and no tag injection.
 
 It depends on ``ui_common`` (the shared UI helpers) and ``remote_workflow``
 (the orchestration it calls), but never on ``app``. The
@@ -21,12 +28,18 @@ import streamlit as st
 
 from harness_remote import RemoteError, RemoteViewRecord
 from ui_common import APP_TITLE, notify, _display, upload_marker
+from memoq_harness import llm
+
 from remote_workflow import (
     maybe_remote_open, request_reload, _remote_error_text,
     save_remote_drafts, discard_remote_drafts, resolve_conflict, resolve_pending,
     sync_drafts_from_widgets, unsaved_count, conflicted_keys, conflict_fields,
     edited_fields, cell_seed, _drafts_for, row_location,
     remote_text_widget_key, remote_comment_widget_key,
+    remote_test_connection,
+    remote_model_test, remote_model_list, remote_invalidate_stale_model_list,
+    STUB_PRESET_LABEL, process_remote_batch,
+    process_block_reason, eligible_count,
 )
 
 
@@ -46,6 +59,129 @@ def render_remote_sidebar() -> None:
 
         st.header("1. Connection")
         st.info("Backend: remote (document / workspace / processing services).")
+
+        # Model configuration the remote operator chooses per request. It mirrors
+        # the local sidebar: a preset/provider, an editable base URL, a password
+        # key (held in this browser session only), a selectable or entered model,
+        # a Test action, a List-models action and the inference settings. The
+        # selection is sent to the processing service, which calls the model - the
+        # app never talks to the provider and never falls back to a local
+        # workflow. "Test backend (stub)" is the only offline option; it maps to
+        # the service's stub engine and returns the stored machine translation.
+        # This is independent of the open document, so it is offered before the
+        # document section.
+        st.subheader("Model")
+        st.caption("Choose the provider and model a batch is sent to. The model "
+                   "is called by the processing service for this one request; the "
+                   "key is held in this browser session only and is never written "
+                   "to disk or logged.")
+        # Service readiness is a separate check from the model selection: it
+        # confirms the service is up and its SDK is importable, but it does not
+        # call the model.
+        if st.button("Check service readiness", width='stretch'):
+            remote_test_connection()
+            st.rerun()
+        ready = ss.get("remote_ready")
+        if isinstance(ready, dict):
+            state = "ready" if ready.get("status") == "ready" else "not ready"
+            engine = ready.get("engine") or "(none configured)"
+            st.caption("Service readiness: %s - configured engine %s (a "
+                       "service/SDK check; it does not call the model)."
+                       % (state, engine))
+        else:
+            st.caption("Service readiness: no check yet. Run one to confirm the "
+                       "service is up (a service/SDK check, not a model call).")
+
+        config = ss.remote_model_config
+        rev = ss.get("remote_engine_rev", 0)
+        preset_options = [STUB_PRESET_LABEL] + list(llm.PRESETS)
+        current_preset = ss.get("remote_model_preset", llm.DEFAULT_PRESET)
+        chosen = st.selectbox(
+            "Provider preset", preset_options,
+            index=preset_options.index(current_preset),
+            key="remote_preset_select",
+            help="The provider and model selection sent to the processing "
+                 "service. 'Test backend (stub)' returns the machine "
+                 "translation instead of calling a model.")
+        # A preset switch resets the connection to the preset's defaults and
+        # gives the following inputs a fresh key so the previous preset's stale
+        # values cannot linger; the new preset's values take over on the rerun.
+        if chosen != ss.remote_model_preset:
+            ss.remote_model_preset = chosen
+            if chosen != STUB_PRESET_LABEL:
+                preset_def = llm.PRESETS[chosen]
+                config.preset = chosen
+                config.backend = preset_def.backend
+                config.base_url = preset_def.base_url
+                config.model = preset_def.default_model
+                config.api_key = ""
+            ss.remote_model_list = []
+            ss.remote_engine_rev = rev + 1
+            rev = rev + 1
+            st.rerun()
+        if ss.remote_model_preset == STUB_PRESET_LABEL:
+            st.caption("The stub returns the stored machine translation; it does "
+                       "not call a model. The service must still be reachable "
+                       "for the request.")
+        else:
+            preset_def = llm.PRESETS[ss.remote_model_preset]
+            config.base_url = st.text_input(
+                "Base URL", value=config.base_url,
+                key="remote_base_url_%d" % rev,
+                help="The model endpoint. It must be reachable FROM the "
+                     "processing service, which may run on a different host or "
+                     "container than this app.")
+            key_label = "API key"
+            if preset_def.backend == llm.BACKEND_ANTHROPIC:
+                key_label = "Anthropic API key"
+            if not preset_def.requires_key:
+                key_label += " (optional)"
+            config.api_key = st.text_input(
+                key_label, value=config.api_key, type="password",
+                key="remote_api_key_%d" % rev,
+                help="Held in this browser session only - never written to "
+                     "state.json. Cleared when you switch the provider preset.")
+            model_options = list(ss.remote_model_list
+                                or preset_def.model_suggestions)
+            if config.model not in model_options:
+                model_options = [config.model] + model_options
+            config.model = st.selectbox(
+                "Model", model_options,
+                index=model_options.index(config.model),
+                accept_new_options=True,
+                key="remote_model_%d" % rev,
+                help="The model id sent to the endpoint. Run 'List models' to "
+                     "fill the options from the endpoint, or type a model id.")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("Test model", width='stretch'):
+                    remote_model_test()
+                    st.rerun()
+            with col_b:
+                if st.button("List models", width='stretch'):
+                    remote_model_list()
+                    st.rerun()
+            st.caption(llm.connection_summary(config))
+            with st.expander("Inference settings"):
+                config.temperature = st.slider(
+                    "Temperature", 0.0, 1.5, float(config.temperature), 0.05,
+                    key="remote_temperature_%d" % rev)
+                config.chunk_size = st.number_input(
+                    "Context chunks", min_value=1, max_value=100,
+                    value=int(config.chunk_size), step=1,
+                    key="remote_chunk_size_%d" % rev)
+                config.max_tokens = st.number_input(
+                    "Max tokens", min_value=0, max_value=32000,
+                    value=int(config.max_tokens), step=1,
+                    key="remote_max_tokens_%d" % rev)
+                config.timeout = st.number_input(
+                    "Timeout (seconds)", min_value=10, max_value=3600,
+                    value=int(config.timeout), step=1,
+                    key="remote_timeout_%d" % rev)
+            # A change to the connection settings (base URL, key, model, preset)
+            # makes a previously fetched model list stale; clear it without
+            # calling the provider to refresh it.
+            remote_invalidate_stale_model_list(config)
 
         st.header("2. Document")
         upload = st.file_uploader("memoQ bilingual XLIFF",
@@ -231,7 +367,12 @@ def render_remote_grid() -> None:
     proposal and the editable human text (with the saved value shown beside an
     unsaved edit) - with presentation-only batch navigation. The pending
     Open/Reload question and the Conflicts panel sit above the rows; Save and
-    Discard live in the sidebar and act on every draft, rendered or not.
+    Discard live in the sidebar and act on every draft, rendered or not. A
+    gated "Process Current Batch" button sends the batch's eligible rows to the
+    model and persists their proposals; it is disabled while a conflict is open,
+    a prior Process must be reconciled, the workspace is incompatible, or no row
+    is eligible (a row is eligible on its own effective 'Your text', so a filled
+    neighbour or a prior proposal never blocks an eligible row).
     """
     ss = st.session_state
     view = ss.get("remote_view")
@@ -279,6 +420,28 @@ def render_remote_grid() -> None:
         ss.remote_batch = max(0, min(target, view.batch_count - 1))
         ss.remote_page = 0
         st.rerun()
+
+    # One gated mutation: send this batch's eligible rows to the model through
+    # the processing service and persist their proposals. The same guards that
+    # disable the button are re-checked inside process_remote_batch, so a click
+    # can never bypass them. A row is eligible on its own effective 'Your text'
+    # (a held draft, including a cleared one, otherwise the saved text), so a
+    # filled neighbour or a prior proposal never suppresses an eligible row; the
+    # button is disabled only when the batch is conflicted, an uncertain Process
+    # must be reconciled, the workspace is incompatible, or no row is eligible.
+    eligible = eligible_count(view, batch_index)
+    block = process_block_reason(view, batch_index)
+    st.caption("Process sends this batch's %d eligible segment(s) - the "
+               "translatable rows still without text - to the model and stores "
+               "their proposals under 'Model proposal'. If the store outcome is "
+               "uncertain, Reload to reconcile before processing again."
+               % eligible)
+    if st.button("Process Current Batch", type="primary",
+                 width='stretch', disabled=bool(block)):
+        process_remote_batch()
+        st.rerun()
+    if block:
+        st.caption(":orange[%s]" % block)
 
     page_size = ss.get("remote_page_size", 0) or len(records)
     page_count = max(1, (len(records) + page_size - 1) // page_size)

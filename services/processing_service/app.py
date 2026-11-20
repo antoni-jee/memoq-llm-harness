@@ -5,6 +5,8 @@ Endpoints
 ``GET  /healthz``  liveness; no dependency checks
 ``GET  /readyz``   readiness; the configured engine is usable (never calls a model)
 ``POST /process``  build the prompt and return suggestions for explicit segments
+``POST /probe``    one bounded model probe for a per-request config (no suggestions)
+``POST /models``   model ids the per-request config's endpoint advertises
 
 Errors are JSON ``{"error", "message"}`` plus ``details`` with identifiers or
 counts only. Nothing from a provider (error text, raw response) and no
@@ -25,7 +27,8 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from . import SERVICE_NAME
-from .service import BadRequest, ProcessingService, ServiceError, TooLarge, parse_process_request
+from .service import (BadRequest, ProcessingService, ServiceError, TooLarge,
+                      parse_config_request, parse_process_request)
 
 log = logging.getLogger(SERVICE_NAME)
 
@@ -77,6 +80,14 @@ def create_app(service: ProcessingService) -> Starlette:
                                      service.max_segments)
         return JSONResponse(await run_in_threadpool(service.process, body))
 
+    async def probe(request: Request) -> Response:
+        config = parse_config_request(await _read_json(request, service.max_body_bytes))
+        return JSONResponse(await run_in_threadpool(service.probe, config))
+
+    async def models(request: Request) -> Response:
+        config = parse_config_request(await _read_json(request, service.max_body_bytes))
+        return JSONResponse(await run_in_threadpool(service.list_models, config))
+
     async def service_error(request: Request, exc: ServiceError) -> Response:
         if exc.status >= 500:
             log.warning("%s %s -> %d %s", request.method, request.url.path, exc.status, exc.code)
@@ -98,6 +109,8 @@ def create_app(service: ProcessingService) -> Starlette:
         Route("/healthz", healthz, methods=["GET"]),
         Route("/readyz", readyz, methods=["GET"]),
         Route("/process", process, methods=["POST"]),
+        Route("/probe", probe, methods=["POST"]),
+        Route("/models", models, methods=["POST"]),
     ]
     handlers: Dict[object, object] = {
         ServiceError: service_error,
