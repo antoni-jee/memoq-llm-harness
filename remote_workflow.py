@@ -2,9 +2,10 @@
 
 This module owns the orchestration a remote session performs - opening a
 document through the document service, projecting the active selection to the
-workspace bind contract, re-reading the saved workspace on Reload, and the
+workspace bind contract, re-reading the saved workspace on Reload, the
 session-scoped draft store with its explicit Save/Discard, conflict resolution
-and dirty Open/Reload confirmation - plus the narrow validation of the
+and dirty Open/Reload confirmation, and exporting the saved human text to a
+valid MQXLIFF through the document service - plus the narrow validation of the
 document-service segments envelope that the reads share. It is presentation-free: it builds a :class:`RemoteWorkspaceView` and
 queues a notice, but renders nothing (see ``remote_ui``).
 
@@ -21,9 +22,13 @@ from __future__ import annotations
 import os
 import streamlit as st
 
-from memoq_harness import llm, mqxliff
+from memoq_harness import defaults, llm, mqxliff, state
 from harness_remote import RemoteError, RemoteWorkspaceView
 from ui_common import notify, upload_marker, upload_needs_load
+
+# Where exported MQXLIFFs land, mirroring app.py's local export dir. A test can
+# redirect it by patching this module global.
+EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports")
 
 # The one explicit "use the offline stub" option, shown alongside the real
 # presets. It maps to the processing service's "stub" engine, which returns
@@ -43,17 +48,23 @@ def _bootstrap_remote() -> None:
 
     The remote path reads through the cached remote clients; edits are held as
     session drafts and written only by an explicit Save through the workspace
-    service. Processing, applying and exporting are out of scope, so none of the
-    local mutation/session state is created.
+    service, and an export writes the saved human text to a fresh MQXLIFF
+    through the document service. None of the local ProjectState is created.
     """
     ss = st.session_state
     ss.project = None
     ss.document = None
     ss.remote_view = None
+    # The path of the last export this session produced (verified parseable); the
+    # sidebar offers it for download until it is replaced or the session restarts.
+    ss.last_export = ""
     ss.remote_open_marker = None
     ss.remote_batch = 0
     ss.remote_page = 0
     ss.remote_page_size = 0
+    # The operator's working batch size, sent on Open; the server persists it and
+    # is the source of truth thereafter (a re-read/Reload recovers it).
+    ss.remote_batch_size = 100
     ss.remote_tag_source = mqxliff.tagmod.TAG_SOURCE_TARGET
     # Unsaved edits live here, not in the view and not in any widget key (see
     # the "unsaved drafts" section). Keyed by document id, so an edit on one
@@ -107,6 +118,28 @@ def _bootstrap_remote() -> None:
     # ("ok" / "stale" / "unknown"). Cleared on a successful Open or Reload so a
     # restarted workspace is re-checked before the next Process.
     ss._remote_workspace_compat = None
+    # Editorial context sent to the processing service with every Process call.
+    # Mirrors the local sidebar's rule/vibe/directive controls; the values are
+    # held in this browser session only and are never written to state.json.
+    # Defaults match the shipped constants so a fresh session behaves like the
+    # local reference.
+    ss.remote_hard_rules = defaults.DEFAULT_HARD_RULES
+    ss.remote_vibe = defaults.DEFAULT_VIBE
+    ss.remote_directive = ""
+    ss.remote_source_lang = ""
+    ss.remote_target_lang = ""
+    # An optional per-batch stage-template override. When non-empty it is sent
+    # as context.template and replaces the service's own stage template for the
+    # active batch; left blank the service falls back to the same
+    # default_prompt_templates() the local reference seeds, so a blank field is
+    # parity with the local default. Held in this browser session only.
+    ss.remote_template = ""
+    # The operator's termbase, sent as context.termbase: the service re-filters
+    # it to the terms present in the batch with the same relevant_terms() the
+    # local app uses, so an empty list yields no termbase material. A memoQ CSV
+    # collection control is a later, browser-accepted feature; the forwarding
+    # path exists now. Held in this browser session only.
+    ss.remote_termbase = []
 
 
 def get_remote_clients():
@@ -229,6 +262,7 @@ def remote_open(raw: bytes, filename: str) -> None:
     clients.workspace.bind(
         document_id, original_id, source_file=filename, tag_source=tag_source,
         segments=active_segments, present_keys=present_keys,
+        batch_size=ss.get("remote_batch_size", 100),
     )
     snapshot = clients.workspace.get_workspace(document_id)
     # The full canonical list drives the read-only view; the projected active
@@ -483,6 +517,23 @@ def _eligible_records(view, batch_index) -> list:
 def eligible_count(view, batch_index) -> int:
     """How many rows in this batch a Process would send to the model."""
     return len(_eligible_records(view, batch_index))
+
+
+def row_is_process_eligible(view, record) -> bool:
+    """True when a single-row Process would send ``record`` to the model.
+
+    A Process sends only a batch's eligible rows - the translatable rows whose
+    effective 'Your text' (a held draft, including a cleared one, otherwise the
+    saved text) is blank after trimming. This is the per-row view of that rule,
+    used to decide whether a row offers a Process button (a filled row does not).
+    """
+    if record is None or record.key not in view.order:
+        return False
+    if not record.translatable:
+        return False
+    batch_index = min(st.session_state.get("remote_batch", 0),
+                      view.batch_count - 1)
+    return record.key in {r.key for r in _eligible_records(view, batch_index)}
 
 
 def _store_cell(document_id: str, record, text: str, comment: str) -> None:
@@ -782,6 +833,117 @@ def discard_remote_drafts() -> None:
         notify("info", "No unsaved changes to discard.")
 
 
+def export_remote_document(mark_confirmed: bool = False, only_changed: bool = True) -> None:
+    """Export the saved human text to a valid MQXLIFF through the document service.
+
+    Carries ``user_final`` only - never the model proposal: a proposal is not a
+    human decision and must not leave the workspace as a committed target, so
+    this is a deliberate divergence from the local export's ``new_text()`` (which
+    also accepts a proposal as a fallback). Rows whose saved text is blank or,
+    when ``only_changed`` is on, still equal to memoQ's target are omitted, so the
+    service keeps memoQ's own target for them (a blank translation is rejected).
+    Unsaved drafts are warned on but never dropped: they stay in the session until
+    an explicit Save or Discard. The result is re-parsed before it is offered for
+    download, mirroring the local export, so a file memoQ cannot open is caught
+    here rather than on the operator's import.
+    """
+    ss = st.session_state
+    view = ss.get("remote_view")
+    if view is None:
+        notify("error", "Open a document first.")
+        return
+
+    # Unsaved drafts are held, not exported; warn so the operator knows the
+    # export reflects saved work only.
+    if _has_unsaved_drafts(view.document_id):
+        notify("warning", "You have %d unsaved change(s); only your saved "
+               "text is exported." % unsaved_count())
+
+    translations = {}
+    for key in view.order:
+        record = view.record(key)
+        if record is None or not record.translatable:
+            continue
+        text = (record.user_final or "").strip()
+        if not text:
+            continue
+        if only_changed and text == (record.mt_target or "").strip():
+            continue
+        translations[record.key] = record.user_final
+
+    if not translations:
+        notify("info", "Nothing to export - no saved human text to carry.")
+        return
+
+    clients = get_remote_clients()
+    try:
+        meta = clients.document.export(
+            view.original_id, translations,
+            tag_source=view.tag_source, mark_confirmed=mark_confirmed)
+        export_id = str(meta.get("export_id") or "")
+        if not export_id:
+            raise RemoteError(
+                service="document", status=None, code="bad_response",
+                message="The export did not return an export id.")
+        data = clients.document.export_content(export_id)
+    except RemoteError as exc:
+        notify("error", "Export failed: %s" % _remote_error_text(exc))
+        return
+
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    out_path = os.path.join(
+        EXPORT_DIR, mqxliff.export_filename(view.source_file or "document.mqxliff"))
+    with open(out_path, "wb") as handle:
+        handle.write(data)
+
+    # Re-parse what we just wrote: an export memoQ cannot open is worse than no
+    # export, and this catches it here rather than on the operator's import.
+    try:
+        mqxliff.MqxliffDocument(data, "verify").parse_segments()
+    except Exception as exc:  # noqa: BLE001
+        notify("error", "Export written but failed re-parse: %s" % exc)
+        return
+
+    ss.last_export = out_path
+    warnings = meta.get("warnings") or []
+    message = "Exported %d segment(s) to `%s` (verified parseable)." % (
+        len(translations), out_path)
+    if warnings:
+        message += "\n\nTag warnings on %d row(s)." % len(warnings)
+    notify("warning" if warnings else "success", message)
+
+
+def apply_proposal(record) -> None:
+    """Move one row's model proposal into its editable 'Your text' as a draft.
+
+    This is the explicit acceptance action for a proposal: the operator applies
+    the model's ``llm_suggestion`` to their text, reviews it in the 'Your text'
+    cell, and then Saves. It is a draft mutation only - it never writes to the
+    saved workspace and never sets a saved human text, so a model proposal is not
+    auto-accepted as the user's text; only a later explicit Save persists it.
+
+    It keeps the comment the cell currently shows (a held draft when one is, else
+    the saved comment) and re-keys the cell so it then shows the proposal. It is
+    a no-op when the row has no proposal, or the proposal already equals the text
+    the cell shows (so a repeat click neither drafts nor re-keys).
+    """
+    ss = st.session_state
+    view = ss.get("remote_view")
+    if view is None:
+        return
+    proposal = (record.llm_suggestion or "").strip()
+    if not proposal:
+        return
+    current_text, shown_comment = cell_seed(record)
+    if current_text == record.llm_suggestion:
+        return
+    _store_cell(view.document_id, record, record.llm_suggestion, shown_comment)
+    _bump_widgets()
+    notify("info", "Applied the model's proposal to segment %s as an unsaved "
+           "draft - review the 'Your text' cell and click Save to keep it."
+           % record.segment_id)
+
+
 def resolve_conflict(key: str, keep_mine: bool) -> None:
     """Resolve one row's conflict explicitly.
 
@@ -1027,6 +1189,93 @@ def remote_model_list() -> None:
         notify("warning", "Could not list models: unexpected response.")
 
 
+def load_termbase_csv_into_session(ss: Dict[str, Any],
+                                   data: "bytes | str",
+                                   replace: bool = True):
+    """Import a memoQ termbase CSV into the remote session's termbase (E.2).
+
+    The remote session keeps its termbase in plain session state rather than a
+    :class:`ProjectState`, so this reuses the state-free parser the local path
+    shares (:func:`memoq_harness.state.parse_termbase_csv`) and stores the
+    entries in the dict-list shape :func:`_remote_context_block` forwards. No
+    server-side storage and no editor: the upload lands in the current session
+    only. Returns the report so the caller can show what loaded / was skipped.
+    """
+    entries, report = state.parse_termbase_csv(data)
+    parsed = [{"source": e.source, "target": e.target} for e in entries]
+    # A CSV that yields no usable terms must not clobber the termbase the
+    # operator already loaded: leaving the session's termbase in place keeps the
+    # previously active terms, and the caller still surfaces report.summary().
+    if not parsed:
+        return report
+    existing = ss.get("remote_termbase") or []
+    if replace:
+        ss.remote_termbase = parsed
+    else:
+        seen = {t.get("source", "") for t in existing}
+        ss.remote_termbase = existing + [
+            p for p in parsed if p["source"] not in seen]
+    return report
+
+
+def _remote_context_block(ss, view=None, batch_index: int = 0) -> dict:
+    """Build the editorial context block sent to the processing service.
+
+    Mirrors the local sidebar's rule/vibe/directive controls: it forwards each
+    field the remote session carries (``hard_rules_text``, ``vibe``,
+    ``directive``, ``source_lang``, ``target_lang``, ``template``,
+    ``termbase``). The bootstrap seeds ``hard_rules``/``vibe`` with the shipped
+    defaults and the rest with empty values, so a fresh session forwards the
+    defaults and a changed field is sent as the user edits it. A field absent
+    from session state (``is None``) is omitted, and the processing service's
+    ``Context`` dataclass then falls back to its own default for that field.
+
+    ``template`` is a per-batch stage-template override: when non-empty it
+    replaces the service's own stage template for the active batch; left blank
+    it is omitted, so the service falls back to the same
+    ``default_prompt_templates()`` the local reference seeds (a blank field is
+    parity). ``termbase`` is the operator's termbase; when non-empty it is
+    forwarded and the service re-filters it to the terms present in the batch
+    with the same ``relevant_terms()`` the local app uses, so an empty list
+    omits the key and yields no termbase material.
+
+    When a ``view`` is given, the block also carries ``corrections_block``: the
+    feedback the local app assembles with ``feedback_block(upto_batch=
+    batch_index)`` - the human corrections recorded in *earlier* batches, so a
+    later batch's prompt is guided by the operator's edits to the earlier one.
+    A batch cannot correct itself, so only corrections from batches before
+    ``batch_index`` are included; an empty result omits the key (the service's
+    ``Context`` default is ``""``).
+    """
+    block: dict = {}
+    hard_rules = ss.get("remote_hard_rules")
+    if hard_rules is not None:
+        block["hard_rules_text"] = hard_rules
+    vibe = ss.get("remote_vibe")
+    if vibe is not None:
+        block["vibe"] = vibe
+    directive = ss.get("remote_directive")
+    if directive is not None:
+        block["directive"] = directive
+    source_lang = ss.get("remote_source_lang")
+    if source_lang is not None:
+        block["source_lang"] = source_lang
+    target_lang = ss.get("remote_target_lang")
+    if target_lang is not None:
+        block["target_lang"] = target_lang
+    template = ss.get("remote_template")
+    if template:
+        block["template"] = template
+    termbase = ss.get("remote_termbase")
+    if termbase:
+        block["termbase"] = list(termbase)
+    if view is not None:
+        corrections_block = view.corrections_block(upto_batch=batch_index)
+        if corrections_block:
+            block["corrections_block"] = corrections_block
+    return block
+
+
 def _process_target(ss) -> tuple:
     """What the Process call sends to the processing service.
 
@@ -1197,9 +1446,10 @@ def process_remote_batch() -> None:
     # Only the eligible rows of this batch go to the model; each carries its key,
     # source text, original target and saved comment. Eligible rows are judged
     # per row by their effective 'Your text', so a row the operator cleared into
-    # an unsaved draft is processed again rather than skipped, while a filled or
-    # already-proposed row is not re-sent. context is left to the service's
-    # shipped defaults and the stage derived from the batch index.
+    # an unsaved draft is processed again rather than skipped. The operator's
+    # editorial context (hard rules, vibe, batch directive, language) is
+    # forwarded from the sidebar; a field the UI has not set falls back to the
+    # service's shipped default, and the stage is derived from the batch index.
     segment_inputs = [
         {"key": record.key, "source_text": record.source_text,
          "mt_target": record.mt_target, "user_comment": record.user_comment}
@@ -1216,7 +1466,7 @@ def process_remote_batch() -> None:
             engine=engine,
             tag_source=view.tag_source,
             batch={"index": batch_index, "count": view.batch_count},
-            context=None,
+            context=_remote_context_block(ss, view, batch_index),
             config=config,
         )
     except RemoteError as exc:
@@ -1341,3 +1591,637 @@ def process_remote_batch() -> None:
     notify("success", "Stored %d proposal(s) in batch %d of %d - revision %d.%s"
            % (len(updates), batch_index + 1, view.batch_count, fresh.revision,
               missing_note))
+
+
+def rerun_block_reason(view, record) -> str:
+    """The first reason a single-row Rerun is blocked, or "" when it is offered.
+
+    The same guards a batch honors: a conflict on any row, an unresolved
+    uncertain outcome, or a stale workspace verdict each block the model call so
+    a generation is never spent over an out-of-date view. A row that is not
+    translatable, or that is no longer in the project, is not offered at all. The
+    verdicts are cached, so offering a button never probes the workspace.
+    """
+    ss = st.session_state
+    if view is None or view.is_empty:
+        return "Open a document and select a batch to re-run."
+    if record is None or record.key not in view.order:
+        return "That segment is no longer in the project."
+    if not record.translatable:
+        return "This segment is not translatable."
+    if conflicted_keys(view):
+        return "Resolve the conflicts in the Conflicts panel first."
+    if ss.get("remote_process_uncertain"):
+        return ("The last process did not complete cleanly; Reload to reconcile "
+                "the saved state before re-running.")
+    if ss.get("_remote_workspace_compat") == "stale":
+        return ("The workspace service is incompatible; restart it through the "
+                "launcher. Open or Reload to try again.")
+    return ""
+
+
+def rerun_remote_row(record) -> None:
+    """Re-run one segment against the model and store its new proposal.
+
+    The model call goes through the processing service as a one-segment
+    ``operation="rerun"`` (no local fallback, no auto-retry). The proposal is
+    persisted through the workspace's ``record_suggestions`` as the model's
+    ``llm_suggestion`` with a proposal-only write (prefill off): a human's saved
+    text, comment and the original target are left untouched, so a Copy->Save is
+    never erased by a later generation. The operation stays single-segment
+    ("rerun", one segment), but the batch block carries the current batch's
+    index/count - exactly like ``process_remote_row`` and ``process_remote_batch``
+    - so the service stages the re-run with the current batch's stage and framing
+    (``stage_for_batch`` of the current batch, not the single-segment "mt1" /
+    "1 of 1" default), matching the local reference whose ``build_prompt_for``
+    uses ``proj.current_batch``. The context block still carries the operator's
+    editorial context and the corrections_block - the human corrections recorded
+    in *earlier* batches - so a re-run is judged against the same feedback as its
+    batch. The same uncertain-outcome
+    guards as a batch apply: a stale write (409), a transport/5xx/malformed
+    write, a failed confirming read, or a read that no longer names the same
+    original are recorded as ``remote_process_uncertain`` so another Rerun/
+    Process is blocked until a successful Reload or Open reconciles the view.
+    None are rebased, overwritten, rerun or auto-retried.
+    """
+    ss = st.session_state
+    view = ss.get("remote_view")
+    if view is None or view.is_empty:
+        notify("info", "Open a document first.")
+        return
+    if record is None or record.key not in view.order:
+        notify("error", "That segment is no longer in the project.")
+        return
+    if not record.translatable:
+        notify("info", "That segment is not translatable; nothing to re-run.")
+        return
+    if conflicted_keys(view):
+        notify("error", "Resolve the conflicts in the Conflicts panel before "
+               "re-running.")
+        return
+    if ss.get("remote_process_uncertain"):
+        notify("warning", "The last process did not complete cleanly; Reload to "
+               "reconcile the saved state before re-running.")
+        return
+    clients = get_remote_clients()
+    if remote_check_workspace_compat(clients) == "stale":
+        notify("error", "The workspace service is incompatible; restart it through "
+               "the launcher. The re-run was not run.")
+        return
+
+    # A one-segment rerun (operation="rerun", one segment), but it carries the
+    # current batch's index/count in the batch block - exactly like
+    # process_remote_row and process_remote_batch - so the service stages the
+    # re-run with the current batch's stage and framing (stage_for_batch of the
+    # current batch, not the single-segment "mt1" / "1 of 1" default). This
+    # matches the local reference, whose build_prompt_for is shared by the
+    # whole-batch run and the single-row retry and uses proj.current_batch. The
+    # context block still carries the operator's editorial context and the
+    # corrections_block - the human corrections recorded in earlier batches - so
+    # a re-run is judged against the same feedback as its batch. batch_index is
+    # the current batch, like process_remote_row and process_block_reason_for_row.
+    batch_index = min(ss.get("remote_batch", 0), view.batch_count - 1)
+    segment_input = {
+        "key": record.key,
+        "source_text": record.source_text,
+        "mt_target": record.mt_target,
+        "user_comment": record.user_comment,
+    }
+    try:
+        config, engine = _process_target(ss)
+        result = clients.processing.process(
+            segments=[segment_input],
+            operation="rerun",
+            engine=engine,
+            tag_source=view.tag_source,
+            batch={"index": batch_index, "count": view.batch_count},
+            context=_remote_context_block(ss, view, batch_index),
+            config=config,
+        )
+    except RemoteError as exc:
+        notify("error", "Re-run failed: %s" % _remote_error_text(exc))
+        return
+
+    if not isinstance(result, dict):
+        notify("error", "The re-run returned an unreadable result; it was not "
+               "stored.")
+        return
+    suggestions = result.get("suggestions")
+    if not isinstance(suggestions, dict):
+        notify("error", "The re-run returned no suggestions; it was not stored.")
+        return
+
+    sent_keys = {record.key}
+    updates: Dict[str, dict] = {}
+    for key, item in suggestions.items():
+        if key not in sent_keys or not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or text == "":
+            continue
+        entry: Dict[str, object] = {"text": text}
+        report = item.get("tag_report")
+        if isinstance(report, str) and report:
+            entry["tag_report"] = report[:_MAX_TAG_REPORT_CHARS]
+        updates[key] = entry
+
+    if not updates:
+        notify("warning", "The re-run returned no usable text for this segment; its "
+               "previous text is kept.")
+        return
+
+    # The proposal-only write (prefill off) never touches a human's saved text,
+    # comment or the original target, so a Copy->Save survives this generation.
+    try:
+        result = clients.workspace.record_suggestions(
+            view.document_id, view.revision, updates, prefill=False)
+    except RemoteError as exc:
+        # The same no-replay contract as a batch: a stale or transport/5xx/
+        # malformed write is recorded, never retried or overwritten.
+        if exc.code == "stale_revision" or _definitely_not_applied(exc):
+            ss.remote_process_uncertain = True
+            notify("error", "The re-run result could not be saved because the "
+                   "document changed. It was not retried or overwritten; Reload to "
+                   "reconcile the saved state, then re-run.")
+            return
+        notify("error", "The re-run result could not be saved: %s"
+               % _remote_error_text(exc))
+        return
+
+    missing = result.get("missing")
+    if not isinstance(missing, (list, tuple)):
+        missing = []
+    missing = [k for k in missing if isinstance(k, str)]
+    if missing:
+        ss.remote_process_uncertain = True
+        notify("error", "The workspace could not store the re-run result; it was "
+               "not retried. Reload to reconcile the saved state.")
+        return
+
+    # Read back what the workspace now holds, and adopt only if it still names the
+    # same original. The proposal lives in llm_suggestion, so the held draft (a
+    # Copy, not accepted by this generation) is preserved.
+    try:
+        fresh = _read_view(view.document_id, view.original_id, view.tag_source)
+    except RemoteError as exc:
+        ss.remote_process_uncertain = True
+        notify("error", "The re-run result was saved, but the saved state could "
+               "not be read back: %s Reload to reconcile." % _remote_error_text(exc))
+        return
+    if fresh is None:
+        ss.remote_process_uncertain = True
+        notify("error", "The re-run result was saved, but the document now names a "
+               "different original; it was not rebased. Open the document again.")
+        return
+    _adopt_view(fresh)
+    notify("success", "Re-ran '%s' -> '%s' (stored as a proposal)."
+           % (record.source_text[:80], updates[record.key]["text"][:80]))
+
+
+def process_block_reason_for_row(view, record) -> str:
+    """The first reason a single-row Process is blocked, or "" when offered.
+
+    A per-row Process sends one segment, so the only batch-scoped guard it needs
+    is "no eligible row in this batch": the row itself must be translatable and
+    have no effective 'Your text' (a filled saved or drafted text is not sent).
+    A row that is no longer in the project, or that is not translatable, is not
+    offered. The view-level guards (a conflict, an unresolved uncertain outcome,
+    a stale workspace) block the model call the same way they block a batch, so
+    a generation is never spent over an out-of-date view.
+    """
+    ss = st.session_state
+    if view is None or view.is_empty:
+        return "Open a document and select a batch to process."
+    if record is None or record.key not in view.order:
+        return "That segment is no longer in the project."
+    if not record.translatable:
+        return "This segment is not translatable."
+    batch_index = min(ss.get("remote_batch", 0), view.batch_count - 1)
+    if record.key not in {r.key for r in _eligible_records(view, batch_index)}:
+        return "This row already has text; nothing to process."
+    if conflicted_keys(view):
+        return "Resolve the conflicts in the Conflicts panel first."
+    if ss.get("remote_process_uncertain"):
+        return ("The last process did not complete cleanly; Reload to reconcile "
+                "the saved state before processing again.")
+    if ss.get("_remote_workspace_compat") == "stale":
+        return ("The workspace service is incompatible; restart it through the "
+                "launcher. Open or Reload to try again.")
+    return ""
+
+
+def process_remote_row(record) -> None:
+    """Process one segment against the model and store its proposal.
+
+    A one-segment batch process: the model call goes through the processing
+    service as a single-segment request (no local fallback, no auto-retry). The
+    proposal is persisted through the workspace's ``record_suggestions`` as the
+    model's ``llm_suggestion`` with a proposal-only write (prefill off): a
+    human's saved text, comment and the original target are left untouched, so a
+    Copy->Save is never erased by a later generation. The same uncertain-outcome
+    guards as a batch apply: a stale write (409), a transport/5xx/malformed
+    write, a failed confirming read, or a read that no longer names the same
+    original are recorded as ``remote_process_uncertain`` so another
+    Process/Rerun is blocked until a successful Reload or Open reconciles the
+    view. None are rebased, overwritten, rerun or auto-retried.
+    """
+    ss = st.session_state
+    view = ss.get("remote_view")
+    if view is None or view.is_empty:
+        notify("info", "Open a document first.")
+        return
+    if record is None or record.key not in view.order:
+        notify("error", "That segment is no longer in the project.")
+        return
+    if not record.translatable:
+        notify("info", "This segment is not translatable; nothing to process.")
+        return
+    batch_index = min(ss.get("remote_batch", 0), view.batch_count - 1)
+    if record.key not in {r.key for r in _eligible_records(view, batch_index)}:
+        notify("info", "This row already has text; nothing to process.")
+        return
+    if conflicted_keys(view):
+        notify("error", "Resolve the conflicts in the Conflicts panel before "
+               "processing.")
+        return
+    if ss.get("remote_process_uncertain"):
+        notify("warning", "The last process did not complete cleanly; Reload to "
+               "reconcile the saved state before processing again.")
+        return
+    clients = get_remote_clients()
+    if remote_check_workspace_compat(clients) == "stale":
+        notify("error", "The workspace service is incompatible; restart it "
+               "through the launcher. The process was not run.")
+        return
+
+    # A one-segment process: the row carries its key, source text, original
+    # target and saved comment, with the batch block so the service stages it.
+    segment_input = {
+        "key": record.key,
+        "source_text": record.source_text,
+        "mt_target": record.mt_target,
+        "user_comment": record.user_comment,
+    }
+    try:
+        config, engine = _process_target(ss)
+        result = clients.processing.process(
+            segments=[segment_input],
+            engine=engine,
+            tag_source=view.tag_source,
+            batch={"index": batch_index, "count": view.batch_count},
+            context=_remote_context_block(ss, view, batch_index),
+            config=config,
+        )
+    except RemoteError as exc:
+        notify("error", "Processing failed: %s" % _remote_error_text(exc))
+        return
+
+    if not isinstance(result, dict):
+        notify("error", "The process returned an unreadable result; it was not "
+               "stored.")
+        return
+    suggestions = result.get("suggestions")
+    if not isinstance(suggestions, dict):
+        notify("error", "The process returned no suggestions; it was not "
+               "stored.")
+        return
+
+    sent_keys = {record.key}
+    updates: Dict[str, dict] = {}
+    for key, item in suggestions.items():
+        if key not in sent_keys or not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        entry: Dict[str, object] = {"text": text}
+        report = item.get("tag_report")
+        if isinstance(report, str) and report:
+            entry["tag_report"] = report[:_MAX_TAG_REPORT_CHARS]
+        updates[key] = entry
+
+    if not updates:
+        notify("warning", "No proposal was returned for this segment; its "
+               "previous text is kept.")
+        return
+
+    # The proposal-only write (prefill off) never touches a human's saved text,
+    # comment or the original target, so a Copy->Save survives this generation.
+    before = view.revision
+    try:
+        clients.workspace.record_suggestions(
+            view.document_id, view.revision, updates, prefill=False)
+    except RemoteError as exc:
+        if exc.is_conflict and exc.code == "stale_revision":
+            ss.remote_process_uncertain = True
+            notify("error", "The workspace was changed elsewhere since it was "
+                   "read (current revision %d). The proposal may or may not "
+                   "have been stored; Reload to reconcile, then process again."
+                   % (exc.current_revision or before))
+            return
+        if _definitely_not_applied(exc):
+            ss.remote_process_uncertain = True
+            notify("error", "The proposal could not be stored (%s). Reload and "
+                   "process again." % _remote_error_text(exc))
+            return
+        ss.remote_process_uncertain = True
+        notify("error", "The outcome of storing the proposal is uncertain (%s). "
+               "Reload to see the current saved state, then process again."
+               % exc.message)
+        return
+
+    missing = result.get("missing")
+    if not isinstance(missing, (list, tuple)):
+        missing = []
+    missing = [k for k in missing if isinstance(k, str)]
+    if missing:
+        ss.remote_process_uncertain = True
+        notify("error", "The workspace could not store the process result; it "
+               "was not retried. Reload to reconcile the saved state.")
+        return
+
+    # Read back what the workspace now holds, and adopt only if it still names
+    # the same original. The proposal lives in llm_suggestion, so a held draft
+    # (a Copy, not accepted by this generation) is preserved.
+    try:
+        fresh = _read_view(view.document_id, view.original_id, view.tag_source)
+    except RemoteError as exc:
+        ss.remote_process_uncertain = True
+        notify("error", "The process result was saved, but the saved state "
+               "could not be read back: %s Reload to reconcile."
+               % _remote_error_text(exc))
+        return
+    if fresh is None:
+        ss.remote_process_uncertain = True
+        notify("error", "The process result was saved, but the document now "
+               "names a different original; it was not rebased. Open the "
+               "document again.")
+        return
+    _adopt_view(fresh)
+    notify("success", "Stored a proposal for '%s' -> '%s'."
+           % (record.source_text[:80], updates[record.key]["text"][:80]))
+
+
+def apply_remote_corrections(batch_index=None) -> None:
+    """Turn the current batch's human edits into stored corrections.
+
+    The remote analog of the local ``apply_and_diff``: any held drafts are saved
+    first so the workspace holds the human's text (the remote ``capture_grid``),
+    then the workspace turns the saved edits - the human's ``user_final`` against
+    the model's ``llm_suggestion`` or the original target - into correction
+    records and stores them in its snapshot. Because the snapshot carries the
+    corrections, they survive a re-read and, through the view's
+    ``corrections_block``, guide the next batch's prompt. A batch whose edits
+    match its baseline produces no correction (a no-op). The uncertain-outcome
+    guards match the process paths: a stale write or a failed confirming read is
+    recorded as ``remote_process_uncertain`` and is not rebased, overwritten or
+    auto-retried.
+    """
+    ss = st.session_state
+    view = ss.get("remote_view")
+    if view is None or view.is_empty:
+        notify("info", "Open a document first.")
+        return
+    if conflicted_keys(view):
+        notify("error", "Resolve the conflicts in the Conflicts panel before "
+               "applying.")
+        return
+    if ss.get("remote_process_uncertain"):
+        notify("warning", "The last process did not complete cleanly; Reload to "
+               "reconcile the saved state before applying again.")
+        return
+    # The corrections are computed from the *saved* human text, so any held
+    # drafts must reach the workspace first. save_remote_drafts returns True when
+    # nothing is unsaved (a no-op) and re-reads the workspace when it writes.
+    if not save_remote_drafts():
+        return
+    view = ss.get("remote_view")
+    if view is None:
+        return
+    batch_index = (batch_index if batch_index is not None
+                   else min(ss.get("remote_batch", 0), view.batch_count - 1))
+    clients = get_remote_clients()
+    before = view.revision
+    try:
+        result = clients.workspace.apply_corrections(
+            view.document_id, view.revision, batch_index)
+    except RemoteError as exc:
+        if exc.is_conflict and exc.code == "stale_revision":
+            ss.remote_process_uncertain = True
+            notify("error", "The workspace was changed elsewhere since it was "
+                   "read (current revision %d). Apply was not retried; Reload to "
+                   "reconcile, then apply again."
+                   % (exc.current_revision or before))
+            return
+        if _definitely_not_applied(exc):
+            notify("error", "Could not apply changes (%s). No correction was "
+                   "stored." % _remote_error_text(exc))
+            return
+        ss.remote_process_uncertain = True
+        notify("error", "Applying the changes may or may not have stored the "
+               "corrections (%s). Reload to see the current saved state, then "
+               "apply again." % exc.message)
+        return
+
+    # Re-read so the stored corrections feed the next batch's feedback block.
+    try:
+        fresh = _read_view(view.document_id, view.original_id, view.tag_source)
+    except RemoteError as exc:
+        ss.remote_process_uncertain = True
+        notify("error", "The changes were applied, but the saved state could not "
+               "be read back (%s). Reload to reconcile."
+               % _remote_error_text(exc))
+        return
+    if fresh is None:
+        ss.remote_process_uncertain = True
+        notify("error", "The changes were applied, but the document now names a "
+               "different original; it was not rebased. Open the document again.")
+        return
+    _adopt_view(fresh)
+    produced = result.get("produced")
+    notify("success", "Applied batch %d: %d correction(s) will guide the next "
+           "batch." % (batch_index + 1, produced if produced is not None else 0))
+
+
+def run_remote_analysis(batch_index=None) -> None:
+    """Run a corrections critique as a separate, read-only action.
+
+    The remote analog of the local ``run_analysis`` / ``analyze_corrections``:
+    it reads the *stored* corrections from the view (the same records the local
+    path reads from ``proj.corrections``), asks the processing service to
+    compute a critique over them, and persists the result in a separate
+    ``analysis`` slot through the workspace service. It never overwrites the
+    operator's translation (``user_final`` / ``llm_suggestion`` / ``mt_target``
+    / the held draft) - the critique is returned to the operator and stored only
+    in ``analysis``, keyed by batch, exactly as the local ``proj.analysis[str(
+    current_batch)]``.
+
+    Unlike ``apply_remote_corrections``, it does NOT flush held drafts first:
+    the critique runs on the *stored* corrections, matching the local ``run_
+    analysis`` which reads ``proj.corrections`` (a prior apply), not unsaved
+    drafts. A batch whose corrections were just applied is the input; nothing
+    unsaved is required.
+
+    The uncertain-outcome guards match the apply/process paths: an empty view,
+    unresolved conflicts or a pending uncertain write short-circuit before any
+    request. A stale revision or a failed confirming read is recorded as
+    ``remote_process_uncertain`` and is not rebased, overwritten or auto-retried.
+    """
+    ss = st.session_state
+    view = ss.get("remote_view")
+    if view is None or view.is_empty:
+        notify("info", "Open a document first.")
+        return
+    if conflicted_keys(view):
+        notify("error", "Resolve the conflicts in the Conflicts panel before "
+               "analysing.")
+        return
+    if ss.get("remote_process_uncertain"):
+        notify("warning", "The last write did not complete cleanly; Reload to "
+               "reconcile the saved state before analysing again.")
+        return
+    corrections = [dict(c) for c in (view.corrections or [])]
+    if not corrections:
+        notify("info", "No corrections recorded yet - apply a batch first.")
+        return
+    batch_index = (batch_index if batch_index is not None
+                   else min(ss.get("remote_batch", 0), view.batch_count - 1))
+    expected = view.expected_tags()
+    hard_rules = ss.get("remote_hard_rules") or defaults.DEFAULT_HARD_RULES
+    clients = get_remote_clients()
+    # Compute the critique through the processing service (never the local
+    # llm.LLMClient.analyze_corrections): the service selects the engine.
+    try:
+        result = clients.processing.analyze(
+            corrections=corrections, hard_rules_text=hard_rules,
+            expected_tags=expected)
+    except RemoteError as exc:
+        if _definitely_not_applied(exc):
+            notify("error", "Could not run the analysis (%s). No critique was "
+                   "stored." % _remote_error_text(exc))
+            return
+        ss.remote_process_uncertain = True
+        notify("error", "The analysis may or may not have completed (%s). "
+               "Reload to reconcile." % exc.message)
+        return
+    critique = result.get("critique") or ""
+    # Persist the critique in a separate analysis slot through the workspace.
+    before = view.revision
+    try:
+        result = clients.workspace.record_analysis(
+            view.document_id, view.revision, batch_index, critique)
+    except RemoteError as exc:
+        if exc.is_conflict and exc.code == "stale_revision":
+            ss.remote_process_uncertain = True
+            notify("error", "The workspace was changed elsewhere since it was "
+                   "read (current revision %d). The critique was not stored; "
+                   "Reload to reconcile, then analyse again."
+                   % (exc.current_revision or before))
+            return
+        if _definitely_not_applied(exc):
+            notify("error", "Could not store the analysis (%s). No critique was "
+                   "stored." % _remote_error_text(exc))
+            return
+        ss.remote_process_uncertain = True
+        notify("error", "Storing the analysis may or may not have written "
+               "(%s). Reload to see the current saved state, then analyse "
+               "again." % exc.message)
+        return
+    # Re-read so the stored analysis shows in the panel and the revision is
+    # fresh for the next action.
+    try:
+        fresh = _read_view(view.document_id, view.original_id, view.tag_source)
+    except RemoteError as exc:
+        ss.remote_process_uncertain = True
+        notify("error", "The analysis was stored, but the saved state could not "
+               "be read back (%s). Reload to reconcile."
+               % _remote_error_text(exc))
+        return
+    if fresh is None:
+        ss.remote_process_uncertain = True
+        notify("error", "The analysis was stored, but the document now names a "
+               "different original; it was not rebased. Open the document again.")
+        return
+    _adopt_view(fresh)
+    notify("success", "Analysed %d correction(s) for batch %d."
+           % (len(corrections), batch_index + 1))
+
+
+def set_remote_batch_size(batch_size=None) -> None:
+    """Re-batch the live document into a new working layout.
+
+    The remote analog of the local batch-size change: it asks the workspace
+    service to re-slice the document into working batches of the requested size
+    and, when the size actually differs, start a *new layout*. A new layout
+    leaves the stored corrections in history (they keep their original
+    batch_index and the layout they were produced under), so the new layout's
+    feedback never adopts an earlier layout's correction even when the batch
+    indices collide, and a later apply in the new layout cannot erase the old
+    layout's history. A same-size request is a no-op that starts no new layout.
+
+    Unlike ``apply_remote_corrections`` it does NOT flush held drafts first: a
+    re-batch is structural, so the operator's drafts survive by key through
+    ``_adopt_view``. The same uncertain-outcome guards apply: an empty view,
+    unresolved conflicts or a pending uncertain write short-circuit before any
+    request; a stale revision or a failed confirming read is recorded as
+    ``remote_process_uncertain`` and is not rebased, overwritten or auto-retried.
+    """
+    ss = st.session_state
+    view = ss.get("remote_view")
+    if view is None or view.is_empty:
+        notify("info", "Open a document first.")
+        return
+    if conflicted_keys(view):
+        notify("error", "Resolve the conflicts in the Conflicts panel before "
+               "changing the batch size.")
+        return
+    if ss.get("remote_process_uncertain"):
+        notify("warning", "The last write did not complete cleanly; Reload to "
+               "reconcile the saved state before changing the batch size.")
+        return
+    size = int(batch_size) if batch_size is not None else int(ss.get("remote_batch_size", 100))
+    before = view.revision
+    clients = get_remote_clients()
+    try:
+        result = clients.workspace.set_batch_size(
+            view.document_id, view.revision, size)
+    except RemoteError as exc:
+        if exc.is_conflict and exc.code == "stale_revision":
+            ss.remote_process_uncertain = True
+            notify("error", "The workspace was changed elsewhere since it was "
+                   "read (current revision %d). The batch size was not changed; "
+                   "Reload to reconcile, then change it again."
+                   % (exc.current_revision or before))
+            return
+        if _definitely_not_applied(exc):
+            notify("error", "Could not change the batch size (%s). No layout was "
+                   "started." % _remote_error_text(exc))
+            return
+        ss.remote_process_uncertain = True
+        notify("error", "Changing the batch size may or may not have started a "
+               "new layout (%s). Reload to see the current saved state, then "
+               "change it again." % exc.message)
+        return
+    # Re-read so the new layout (resliced batches, new version) becomes the live
+    # view; the operator's drafts survive by key through the rebase.
+    try:
+        fresh = _read_view(view.document_id, view.original_id, view.tag_source)
+    except RemoteError as exc:
+        ss.remote_process_uncertain = True
+        notify("error", "The batch size was changed, but the saved state could "
+               "not be read back (%s). Reload to reconcile."
+               % _remote_error_text(exc))
+        return
+    if fresh is None:
+        ss.remote_process_uncertain = True
+        notify("error", "The batch size was changed, but the document now names a "
+               "different original; it was not rebased. Open the document again.")
+        return
+    _adopt_view(fresh)
+    if result.get("changed"):
+        notify("success", "Re-batched into batches of %d (layout %d). Earlier "
+               "corrections stay in history and no longer guide these batches."
+               % (fresh.batch_size, fresh.layout_version))
+    else:
+        notify("info", "Batches are already %d; no new layout was started."
+               % fresh.batch_size)

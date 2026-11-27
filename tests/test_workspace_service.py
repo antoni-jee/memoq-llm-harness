@@ -47,11 +47,11 @@ SECRET_TEXT = "TOPSECRET-WORKSPACE-TEXT"
 
 
 def bind_body(raw=SAMPLE, original_id=ORIG_1, tag_source="target", seg_filter=None,
-              source_file="sample.mqxliff"):
+              source_file="sample.mqxliff", batch_size=None):
     """What a caller builds from document-service's /segments response."""
     doc = mqxliff.MqxliffDocument.from_bytes(raw, source_file)
     segments = doc.parse_segments(seg_filter, tag_source)
-    return {
+    body = {
         "original_id": original_id,
         "source_file": source_file,
         "tag_source": tag_source,
@@ -60,6 +60,9 @@ def bind_body(raw=SAMPLE, original_id=ORIG_1, tag_source="target", seg_filter=No
                      for s in segments if s.translatable],
         "present_keys": [s.key for s in segments],
     }
+    if batch_size is not None:
+        body["batch_size"] = batch_size
+    return body
 
 
 class FakeRepository:
@@ -194,6 +197,50 @@ class TestBind(WorkspaceTestCase):
         response = self.bind(original_id=ORIG_2)
         self.assertEqual(response.json()["revision"], 2)
         self.assertTrue(response.json()["changed"])
+
+    def test_new_bind_persists_the_chosen_batch_size(self):
+        response = self.bind(body=bind_body(batch_size=10))
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["batch_size"], 10)
+        # The chosen size is what the snapshot persists (the server is the
+        # source of truth the view, Process and Apply read from).
+        self.assertEqual(self.get().json()["batch_size"], 10)
+
+    def test_repeat_bind_preserves_the_persisted_batch_size(self):
+        # A re-open without an explicit size change must not reset the stored
+        # 10 to the default 100 - checked separately from Reload, which is a
+        # read-only re-read.
+        self.assertEqual(self.bind(body=bind_body(batch_size=10)).status_code, 201)
+        before = self.repo.rows[DOC_A]
+        again = self.bind()  # default body: no batch_size sent
+        self.assertEqual(again.status_code, 200)
+        self.assertFalse(again.json()["changed"])
+        self.assertEqual(again.json()["revision"], 1)
+        self.assertEqual(self.repo.writes, 1)
+        self.assertIs(self.repo.rows[DOC_A], before)
+        self.assertEqual(self.get().json()["batch_size"], 10)
+
+    def test_repeat_bind_ignores_the_requested_batch_size(self):
+        # The re-bind recovers the persisted size, never the request's, so a
+        # fresh request carrying a different size cannot silently reshape the
+        # existing workspace (that is the separate set_batch_size operation).
+        self.assertEqual(self.bind(body=bind_body(batch_size=10)).status_code, 201)
+        before = self.repo.rows[DOC_A]
+        again = self.bind(body=bind_body(batch_size=50))
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertFalse(again.json()["changed"])
+        self.assertEqual(self.repo.writes, 1)
+        self.assertIs(self.repo.rows[DOC_A], before)
+        self.assertEqual(self.get().json()["batch_size"], 10)
+
+    def test_batch_size_must_be_a_positive_integer(self):
+        for bad in (0, -1, True, "10", 1.5, None):
+            with self.subTest(batch_size=bad):
+                body = bind_body()
+                body["batch_size"] = bad
+                response = self.bind(body=body)
+                self.assertEqual(response.status_code, 400,
+                                 "%r should be rejected" % (bad,))
 
     def test_narrower_selection_keeps_hidden_work(self):
         relaxed = bind_body(seg_filter=mqxliff.SegmentFilter(skip_confirmed=False))
@@ -735,6 +782,248 @@ class TestConfigAndMigrations(unittest.TestCase):
             self.assertEqual(migrate.main([]), 2)
         self.assertIn("workspace-service migrate: configuration error: "
                       "WORKSPACE_DATABASE_URL is required.", err.getvalue())
+
+
+class TestSetBatchSize(WorkspaceTestCase):
+    """Explicit, revision-checked re-batch of a bound workspace.
+
+    A real size change re-slices the document and starts a new layout
+    (``layout_version`` bumps by one); a same-size request is a no-op that
+    keeps the revision; a stale ``expected_revision`` is rejected with nothing
+    mutated. Corrections keep their original ``batch_index`` and the
+    ``layout_version`` they were produced under, so the new layout's feedback
+    never picks up an earlier layout's correction even when the batch indices
+    collide, and a later apply in the new layout cannot erase the old layout's
+    history.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(self.bind(body=bind_body(batch_size=100)).status_code, 201)
+
+    def _set_batch_size(self, expected_revision, batch_size, document_id=DOC_A):
+        return self.client.post(
+            "/workspaces/%s/set_batch_size" % document_id,
+            json={"expected_revision": expected_revision,
+                  "batch_size": batch_size})
+
+    def _apply(self, batch_index, expected_revision=None, document_id=DOC_A):
+        if expected_revision is None:
+            expected_revision = self.get(document_id).json()["revision"]
+        return self.client.post(
+            "/workspaces/%s/apply" % document_id,
+            json={"expected_revision": expected_revision,
+                  "batch_index": batch_index})
+
+    def test_stale_revision_is_rejected_without_mutation(self):
+        before = self.repo.rows[DOC_A]
+        response = self._set_batch_size(99, 10)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["error"], "stale_revision")
+        self.assert_unchanged(before)
+
+    def test_same_size_is_a_no_op_that_keeps_the_revision(self):
+        rev = self.get().json()["revision"]
+        before = self.repo.rows[DOC_A]
+        response = self._set_batch_size(rev, 100)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["changed"])
+        self.assertEqual(response.json()["layout_version"], 0)
+        self.assertEqual(response.json()["batch_size"], 100)
+        self.assertEqual(self.repo.writes, 1)
+        self.assertIs(self.repo.rows[DOC_A], before)
+
+    def test_real_change_bumps_layout_version_and_revision(self):
+        rev = self.get().json()["revision"]
+        response = self._set_batch_size(rev, 10)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["changed"])
+        self.assertEqual(response.json()["layout_version"], 1)
+        self.assertEqual(response.json()["batch_size"], 10)
+        self.assertEqual(response.json()["revision"], rev + 1)
+        # The re-sliced document has the new batch size.
+        self.assertEqual(self.get().json()["batch_size"], 10)
+        self.assertEqual(self.get().json()["layout_version"], 1)
+
+    def test_corrections_from_earlier_layout_excluded_from_new_layout_feedback(self):
+        # Apply a correction in layout 0 (batch 0), then re-batch to size 10
+        # (layout 1). The new layout's corrections_block for batch 2 must NOT
+        # include the old layout's correction, even though its batch_index is 0
+        # and 0 < 2.
+        rev = self.get().json()["revision"]
+        self.patch({"1#0": {"text": "Eigene Fassung", "comment": "note"}}, rev)
+        rev = self.get().json()["revision"]
+        result = self._apply(0, rev)
+        self.assertTrue(result.json()["changed"])
+        self.assertEqual(len(result.json()["corrections"]), 1)
+        # The correction is tagged with layout 0.
+        self.assertEqual(result.json()["corrections"][0]["layout_version"], 0)
+        # Re-batch to size 10: starts layout 1.
+        rev = self.get().json()["revision"]
+        set_resp = self._set_batch_size(rev, 10)
+        self.assertTrue(set_resp.json()["changed"])
+        self.assertEqual(set_resp.json()["layout_version"], 1)
+        # The snapshot still has the old correction.
+        snap = self.get().json()
+        self.assertEqual(len(snap.get("corrections", [])), 1)
+        self.assertEqual(snap["corrections"][0]["layout_version"], 0)
+        # A new view at layout 1 must NOT include the old correction.
+        from harness_remote.view import RemoteWorkspaceView
+        reread = self.get().json()
+        view = RemoteWorkspaceView.from_remote(
+            [{"key": k, "unit_id": k, "ordinal": i, "source_text": "s",
+              "target_text": "t"} for i, k in enumerate(snap["order"])],
+            reread)
+        self.assertEqual(view.layout_version, 1)
+        # corrections_block for batch 2 must be empty (no layout-1 corrections).
+        self.assertEqual(view.corrections_block(upto_batch=2), "")
+
+    def test_re_applying_in_new_layout_does_not_erase_old_history(self):
+        # Apply in layout 0 (batch 0), re-batch to size 10 (layout 1), then
+        # apply again in layout 1 (batch 0). The old layout's correction must
+        # survive; the new apply only replaces layout 1's batch 0 corrections.
+        rev = self.get().json()["revision"]
+        self.patch({"1#0": {"text": "Layout 0 edit"}}, rev)
+        rev = self.get().json()["revision"]
+        result = self._apply(0, rev)
+        self.assertEqual(len(result.json()["corrections"]), 1)
+        self.assertEqual(result.json()["corrections"][0]["layout_version"], 0)
+        self.assertEqual(result.json()["corrections"][0]["human_final"],
+                         "Layout 0 edit")
+        # Re-batch to size 10: starts layout 1.
+        rev = self.get().json()["revision"]
+        set_resp = self._set_batch_size(rev, 10)
+        self.assertTrue(set_resp.json()["changed"])
+        # Apply in layout 1 (batch 0): a different edit on the same row.
+        rev = self.get().json()["revision"]
+        self.patch({"1#0": {"text": "Layout 1 edit"}}, rev)
+        rev = self.get().json()["revision"]
+        result2 = self._apply(0, rev)
+        self.assertTrue(result2.json()["changed"])
+        # Both corrections survive: old (layout 0) and new (layout 1).
+        corrections = result2.json()["corrections"]
+        self.assertEqual(len(corrections), 2)
+        layout_0 = [c for c in corrections if c["layout_version"] == 0]
+        layout_1 = [c for c in corrections if c["layout_version"] == 1]
+        self.assertEqual(len(layout_0), 1)
+        self.assertEqual(len(layout_1), 1)
+        self.assertEqual(layout_0[0]["human_final"], "Layout 0 edit")
+        self.assertEqual(layout_1[0]["human_final"], "Layout 1 edit")
+
+    def test_return_to_original_size_does_not_reactivate_old_correction(self):
+        # 100→10→100: the old correction from layout 0 does NOT auto-activate
+        # in layout 2 (the re-batch back to 100). A new apply in layout 2
+        # starts fresh.
+        rev = self.get().json()["revision"]
+        self.patch({"1#0": {"text": "Layout 0 edit"}}, rev)
+        rev = self.get().json()["revision"]
+        self._apply(0, rev)
+        # 100→10 (layout 1).
+        rev = self.get().json()["revision"]
+        set_resp = self._set_batch_size(rev, 10)
+        self.assertTrue(set_resp.json()["changed"])
+        self.assertEqual(set_resp.json()["layout_version"], 1)
+        # 10→100 (layout 2): the old correction is NOT auto-activated.
+        rev = self.get().json()["revision"]
+        set_resp2 = self._set_batch_size(rev, 100)
+        self.assertTrue(set_resp2.json()["changed"])
+        self.assertEqual(set_resp2.json()["layout_version"], 2)
+        snap = self.get().json()
+        # The old correction is still in history.
+        self.assertEqual(len(snap.get("corrections", [])), 1)
+        self.assertEqual(snap["corrections"][0]["layout_version"], 0)
+        # But it does NOT appear in layout 2's feedback.
+        from harness_remote.view import RemoteWorkspaceView
+        view = RemoteWorkspaceView.from_remote(
+            [{"key": k, "unit_id": k, "ordinal": i, "source_text": "s",
+              "target_text": "t"} for i, k in enumerate(snap["order"])],
+            snap)
+        self.assertEqual(view.layout_version, 2)
+        self.assertEqual(view.corrections_block(upto_batch=2), "")
+
+    def test_stale_revision_does_not_mutate_drafts_or_corrections(self):
+        rev = self.get().json()["revision"]
+        self.patch({"1#0": {"text": "Draft text"}}, rev)
+        rev = self.get().json()["revision"]
+        before = self.repo.rows[DOC_A]
+        stale = self._set_batch_size(99, 10)
+        self.assertEqual(stale.status_code, 409)
+        self.assert_unchanged(before)
+
+    def test_drafts_survive_rebatch_by_key(self):
+        rev = self.get().json()["revision"]
+        self.patch({"1#0": {"text": "Held draft"}}, rev)
+        rev = self.get().json()["revision"]
+        set_resp = self._set_batch_size(rev, 10)
+        self.assertTrue(set_resp.json()["changed"])
+        # The draft survived: the re-slice re-anchors by key.
+        record = self.record("1#0")
+        self.assertEqual(record["user_final"], "Held draft")
+        self.assertTrue(record["edited_by_human"])
+
+    def test_unknown_workspace_is_404(self):
+        rev = self.get().json()["revision"]
+        response = self._set_batch_size(rev, 10, document_id="b" * 64)
+        self.assertEqual(response.status_code, 404)
+
+    def test_bad_request_rejects_invalid_batch_size(self):
+        rev = self.get().json()["revision"]
+        for bad in (0, -1, True, "10", 1.5, None):
+            with self.subTest(batch_size=bad):
+                before = self.repo.rows[DOC_A]
+                response = self._set_batch_size(rev, bad)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assert_unchanged(before)
+
+    def test_bad_request_rejects_unknown_fields(self):
+        rev = self.get().json()["revision"]
+        before = self.repo.rows[DOC_A]
+        response = self.client.post(
+            "/workspaces/%s/set_batch_size" % DOC_A,
+            json={"expected_revision": rev, "batch_size": 10, "extra": 1})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assert_unchanged(before)
+
+    def test_bad_request_rejects_bad_expected_revision(self):
+        before = self.repo.rows[DOC_A]
+        for bad in (0, -1, True, "1", None):
+            with self.subTest(expected_revision=bad):
+                response = self.client.post(
+                    "/workspaces/%s/set_batch_size" % DOC_A,
+                    json={"expected_revision": bad, "batch_size": 10})
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assert_unchanged(before)
+
+    def test_old_snapshot_defaults_to_layout_zero(self):
+        # A snapshot written before layout versioning has no layout_version key.
+        # The service must default to 0, and a pre-rebatch correction must
+        # still feed feedback.
+        rev = self.get().json()["revision"]
+        self.patch({"1#0": {"text": "Pre-versioning edit"}}, rev)
+        rev = self.get().json()["revision"]
+        result = self._apply(0, rev)
+        self.assertTrue(result.json()["changed"])
+        # Simulate an old snapshot: remove layout_version from the stored row.
+        row = self.repo.rows[DOC_A]
+        old_snapshot = dict(row.snapshot)
+        old_snapshot.pop("layout_version", None)
+        old_snapshot["corrections"] = row.snapshot.get("corrections", [])
+        new_row = WorkspaceRow(
+            document_id=row.document_id, snapshot=old_snapshot,
+            state_version=row.state_version, revision=row.revision,
+            tag_source=row.tag_source, bound_original_id=row.bound_original_id)
+        self.repo.rows[DOC_A] = new_row
+        # A set_batch_size on the old snapshot should work (defaults to 0).
+        rev2 = self.get().json()["revision"]
+        set_resp = self._set_batch_size(rev2, 10)
+        self.assertEqual(set_resp.status_code, 200, set_resp.text)
+        self.assertTrue(set_resp.json()["changed"])
+        self.assertEqual(set_resp.json()["layout_version"], 1)
+        # The pre-versioning correction (layout 0) is still in history.
+        snap = self.get().json()
+        self.assertEqual(len(snap.get("corrections", [])), 1)
+        self.assertEqual(snap["corrections"][0]["human_final"],
+                         "Pre-versioning edit")
 
 
 if __name__ == "__main__":

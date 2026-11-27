@@ -44,12 +44,23 @@ FIXED_BATCH_SIZE = state_mod.DEFAULT_BATCH_SIZE
 """Global setting in state.json; fixed until the global-settings slice."""
 
 TAG_SOURCES = ("target", "source")
-BIND_FIELDS = ("original_id", "source_file", "tag_source", "segments", "present_keys")
+BIND_FIELDS = ("original_id", "source_file", "tag_source", "segments",
+               "present_keys", "batch_size")
 SEGMENT_FIELDS = ("key", "unit_id", "source_text", "target_text")
 PATCH_FIELDS = ("expected_revision", "segments")
 UPDATE_FIELDS = ("text", "comment")
 SUGGESTION_FIELDS = ("expected_revision", "suggestions", "prefill")
 SUGGESTION_ITEM_FIELDS = ("text", "tag_report")
+APPLY_FIELDS = ("expected_revision", "batch_index")
+# A corrections critique (the remote "Analyse my corrections") is a separate
+# slot from the corrections it was computed over; it never overwrites the
+# operator's saved text, the model's proposal or the original target.
+ANALYSIS_FIELDS = ("expected_revision", "batch_index", "critique")
+# An explicit re-batch (the remote "Change batch size") is a revision-checked
+# mutation of a bound workspace's working batch size. It is distinct from the
+# size a fresh bind carries: this one re-slices an existing document and starts
+# a new layout (a layout_version bump) only when the size actually changes.
+SET_BATCH_SIZE_FIELDS = ("expected_revision", "batch_size")
 MAX_TAG_REPORT_CHARS = 1000
 MAX_LISTED = 20
 MAX_SOURCE_FILE_CHARS = 255
@@ -139,6 +150,7 @@ class BindRequest:
     tag_source: str
     segments: Tuple[BindSegment, ...]
     present_keys: Tuple[str, ...]
+    batch_size: int = FIXED_BATCH_SIZE
 
 
 @dataclass(frozen=True)
@@ -162,12 +174,56 @@ class _MemoryState(state_mod.ProjectState):
     def save(self) -> str:  # pragma: no cover - guarded by tests
         raise RuntimeError("workspace-service stores workspaces in PostgreSQL only")
 
+    def document_snapshot(self) -> dict:
+        """The local snapshot plus ``batch_size`` and ``layout_version``.
 
-def _new_state(document_id: str, tag_source: str, entry: dict) -> _MemoryState:
+        ``batch_size`` and ``layout_version`` are ``ProjectState`` globals, not
+        document fields, so the local ``document_snapshot`` omits them. The
+        workspace service is the source of truth for both, so they are injected
+        into the persisted snapshot. On a re-read they are recovered from the
+        snapshot (via ``_state_from_row``), so the operator's chosen size and the
+        current layout version survive a Reload. ``layout_version`` defaults to 0
+        on a read, which is the version of every snapshot written before layout
+        versioning, so a pre-rebatch correction's feedback never disappears.
+        """
+        snap = super().document_snapshot()
+        snap["batch_size"] = self.batch_size
+        snap["layout_version"] = self.layout_version
+        return snap
+
+
+def _coerce_batch_size(value: object) -> int:
+    """A positive int, or the fixed default for anything else.
+
+    A corrupt row or a JSON boolean must not pin the size to 0 or 1, so non-int,
+    bool and non-positive values fall back to ``FIXED_BATCH_SIZE``.
+    """
+    if isinstance(value, bool):
+        return FIXED_BATCH_SIZE
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return FIXED_BATCH_SIZE
+    return size if size > 0 else FIXED_BATCH_SIZE
+
+
+def _new_state(document_id: str, tag_source: str, entry: dict,
+               batch_size: Optional[int] = None) -> _MemoryState:
     # Context first: bind_segments reads batch_size, and placeholder text
     # depends on tag_source, so both are set before any state operation.
     state = _MemoryState(_NO_FILE)
-    state.batch_size = FIXED_BATCH_SIZE
+    if "batch_size" in entry:
+        # A re-read recovers the operator's persisted size from the snapshot.
+        state.batch_size = _coerce_batch_size(entry["batch_size"])
+    elif batch_size is not None:
+        # A fresh bind takes the size the request chose.
+        state.batch_size = batch_size
+    else:
+        state.batch_size = FIXED_BATCH_SIZE
+    # The layout version is recovered from the persisted snapshot. A snapshot
+    # written before layout versioning carries no such key; the default 0 is the
+    # version of every pre-rebatch correction, so its feedback survives.
+    state.layout_version = int(entry.get("layout_version", 0) or 0)
     state.tag_source = tag_source
     state.open_document_snapshot(document_id, entry)
     return state
@@ -265,9 +321,18 @@ def parse_bind_request(body: object) -> BindRequest:
     if missing:
         raise BadRequest("Segment keys missing from present_keys.", {"keys": _listed(missing)})
 
+    # batch_size is optional (defaults to the fixed size on a fresh bind); when
+    # present it must be a positive int, never a JSON boolean.
+    raw_batch_size = body.get("batch_size", FIXED_BATCH_SIZE)
+    if isinstance(raw_batch_size, bool) or not isinstance(raw_batch_size, int):
+        raise BadRequest("'batch_size' must be a positive integer.")
+    if raw_batch_size <= 0:
+        raise BadRequest("'batch_size' must be a positive integer.")
+
     return BindRequest(original_id=original_id, source_file=source_file,
                        tag_source=tag_source, segments=tuple(segments),
-                       present_keys=tuple(present))
+                       present_keys=tuple(present),
+                       batch_size=raw_batch_size)
 
 
 @dataclass(frozen=True)
@@ -281,6 +346,41 @@ class SuggestionRequest:
     expected_revision: int
     suggestions: Dict[str, Suggestion]
     prefill: bool = True
+
+
+@dataclass(frozen=True)
+class ApplyRequest:
+    expected_revision: int
+    batch_index: int
+
+
+@dataclass(frozen=True)
+class AnalysisRequest:
+    """A corrections critique to persist in the separate ``analysis`` slot.
+
+    The remote port of the local ``run_analysis``: the critique is stored keyed
+    by the batch string (``str(batch_index)``), exactly like
+    ``proj.analysis[str(current_batch)]``, and survives a re-read. It is a
+    separate slot from the corrections, so it never overwrites the operator's
+    saved text.
+    """
+    expected_revision: int
+    batch_index: int
+    critique: str
+
+
+@dataclass(frozen=True)
+class SetBatchSizeRequest:
+    """An explicit, revision-checked re-batch of a bound workspace.
+
+    The remote port of the local batch-size change: it names the size the
+    operator wants and the revision the view was read at. When the size differs
+    from the persisted one the service re-slices the document and starts a new
+    layout (a ``layout_version`` bump); a same-size or stale request is a no-op
+    that keeps the revision and leaves every stored correction untouched.
+    """
+    expected_revision: int
+    batch_size: int
 
 
 def _expected_revision(body: dict) -> int:
@@ -358,6 +458,69 @@ def parse_patch_request(body: object) -> PatchRequest:
     )
 
 
+def parse_apply_request(body: object) -> ApplyRequest:
+    """Validate an apply-corrects request completely before anything is touched.
+
+    ``batch_index`` names the batch whose human edits become corrections; it is a
+    non-negative integer (a batch index, never a revision, so it may be 0).
+    """
+    if not isinstance(body, dict):
+        raise BadRequest("The request body must be a JSON object.")
+    unknown = set(body) - set(APPLY_FIELDS)
+    if unknown:
+        raise BadRequest("Unknown request field(s).", {"fields": _listed(unknown)})
+    expected = _expected_revision(body)
+    batch_index = body.get("batch_index")
+    if not isinstance(batch_index, int) or isinstance(batch_index, bool) or batch_index < 0:
+        raise BadRequest("'batch_index' must be a non-negative integer.")
+    return ApplyRequest(expected_revision=expected, batch_index=batch_index)
+
+
+def parse_analysis_request(body: object) -> AnalysisRequest:
+    """Validate a record-analysis request completely before anything is touched.
+
+    ``batch_index`` names the batch the critique was computed over (a non-negative
+    integer, so it may be 0); it is stored as the key ``str(batch_index)``. The
+    ``critique`` is stored exactly as sent (no trimming), like the other writes.
+    """
+    if not isinstance(body, dict):
+        raise BadRequest("The request body must be a JSON object.")
+    unknown = set(body) - set(ANALYSIS_FIELDS)
+    if unknown:
+        raise BadRequest("Unknown request field(s).", {"fields": _listed(unknown)})
+    expected = _expected_revision(body)
+    batch_index = body.get("batch_index")
+    if not isinstance(batch_index, int) or isinstance(batch_index, bool) or batch_index < 0:
+        raise BadRequest("'batch_index' must be a non-negative integer.")
+    critique = body.get("critique")
+    if not isinstance(critique, str):
+        raise BadRequest("'critique' must be a string.")
+    return AnalysisRequest(expected_revision=expected, batch_index=batch_index,
+                           critique=critique)
+
+
+def parse_set_batch_size_request(body: object) -> SetBatchSizeRequest:
+    """Validate a re-batch request completely before anything is touched.
+
+    ``batch_size`` is a positive integer (the same rule a bind applies), never a
+    JSON boolean; ``expected_revision`` is checked like every other mutation.
+    The request only names the size and the revision - the service re-slices and
+    starts a new layout itself.
+    """
+    if not isinstance(body, dict):
+        raise BadRequest("The request body must be a JSON object.")
+    unknown = set(body) - set(SET_BATCH_SIZE_FIELDS)
+    if unknown:
+        raise BadRequest("Unknown request field(s).", {"fields": _listed(unknown)})
+    expected = _expected_revision(body)
+    raw_batch_size = body.get("batch_size")
+    if isinstance(raw_batch_size, bool) or not isinstance(raw_batch_size, int):
+        raise BadRequest("'batch_size' must be a positive integer.")
+    if raw_batch_size <= 0:
+        raise BadRequest("'batch_size' must be a positive integer.")
+    return SetBatchSizeRequest(expected_revision=expected, batch_size=raw_batch_size)
+
+
 # ------------------------------------------------------------------ output
 
 
@@ -373,10 +536,17 @@ def workspace_to_dict(row: WorkspaceRow, state: state_mod.ProjectState) -> Dict[
         "bound_original_id": row.bound_original_id,
         "tag_source": row.tag_source,
         "batch_size": state.batch_size,
+        "layout_version": state.layout_version,
         "source_file": state.source_file,
         "current_batch": state.current_batch,
         "order": list(state.order),
         "segments": {key: asdict(record) for key, record in state.segments.items()},
+        "corrections": [asdict(c) for c in state.corrections],
+        # The per-batch corrections critique, a separate slot that never
+        # overwrites the operator's saved text. It mirrors the local
+        # ``proj.analysis`` (keyed by the batch string), so the remote
+        # "Analyse my corrections" action persists the same way.
+        "analysis": dict(state.analysis),
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
     }
@@ -421,7 +591,10 @@ class WorkspaceService:
 
         def decide(current: Optional[WorkspaceRow]) -> Decision:
             if current is None:
-                state = _new_state(document_id, request.tag_source, {})
+                # A fresh bind takes the size the request chose; a re-read
+                # (else branch) recovers the persisted size via _state_from_row.
+                state = _new_state(document_id, request.tag_source, {},
+                                   batch_size=request.batch_size)
                 before = None
             else:
                 if current.tag_source != request.tag_source:
@@ -585,6 +758,173 @@ class WorkspaceService:
                  len(payload["recorded_keys"]), len(payload["prefilled_keys"]),
                  len(payload["protected_keys"]), "changed" if wrote else "no change")
         result = {"document_id": document_id, "revision": stored.revision, "changed": wrote}
+        result.update(payload)
+        return result
+
+    # ----------------------------------------------------------- apply corrections
+
+    def apply_corrections(self, document_id: str,
+                          request: ApplyRequest) -> Dict[str, object]:
+        """Turn one batch's human edits into stored corrections.
+
+        The remote port of the local "Apply Changes & Calculate Diffs": it
+        rebuilds the document's state and runs the existing ``calculate_diffs``
+        logic, which reads each row's saved ``user_final`` against the model's
+        ``llm_suggestion`` (or memoQ's MT when that is empty) and the saved
+        comment. A row that differs, or carries a comment, becomes a
+        :class:`~memoq_harness.state.Correction`; a row the human left untouched
+        is implicit approval and carries no signal. The produced corrections are
+        stored in the document's snapshot, so they survive a re-read and feed the
+        next batch's feedback. Re-applying a batch replaces its earlier
+        corrections rather than duplicating them.
+
+        Revision semantics mirror the other mutations: the revision is checked
+        first, so a stale or replayed apply is rejected with nothing stored; an
+        effective change increments the revision, and an apply that changes
+        nothing is a no-op that keeps it.
+        """
+        require_id(document_id)
+
+        def decide(current: Optional[WorkspaceRow]) -> Decision:
+            if current is None:
+                raise NotFound("Unknown workspace; bind the document first.")
+            state = _state_from_row(current)
+            if current.revision != request.expected_revision:
+                raise StaleRevision(
+                    "The workspace changed since it was read; reload and retry.",
+                    {"expected_revision": request.expected_revision,
+                     "current_revision": current.revision})
+            produced = state.calculate_diffs(request.batch_index)
+            corrections = [asdict(c) for c in state.corrections]
+            if _comparable(state.document_snapshot()) == _comparable(current.snapshot):
+                return None, {"changed": False, "produced": len(produced),
+                              "corrections": corrections}
+            state.updated_at = _now()
+            row = WorkspaceRow(
+                document_id=document_id, snapshot=state.document_snapshot(),
+                state_version=SUPPORTED_STATE_VERSION, revision=current.revision + 1,
+                tag_source=current.tag_source, bound_original_id=current.bound_original_id)
+            return row, {"changed": True, "produced": len(produced),
+                         "corrections": corrections}
+
+        stored, payload, wrote = self._transact(document_id, decide)
+        log.info("apply: document %s revision %d (%d produced, %s)",
+                 document_id[:12], stored.revision, payload["produced"],
+                 "changed" if wrote else "no change")
+        result = {"document_id": document_id, "revision": stored.revision}
+        result.update(payload)
+        return result
+
+    def record_analysis(self, document_id: str,
+                        request: AnalysisRequest) -> Dict[str, object]:
+        """Persist a corrections critique in the separate ``analysis`` slot.
+
+        The remote port of the local "Analyse my corrections": the critique the
+        processing service computed over the operator's stored corrections is
+        stored keyed by the batch string (``str(batch_index)``), exactly like the
+        local ``proj.analysis[str(current_batch)]``, so it survives a re-read and
+        shows in the read-only UI. It is a separate slot from the corrections,
+        the saved text, the model's proposal and the original target, so it never
+        overwrites any of them; re-analysing a batch replaces its earlier
+        critique rather than duplicating it.
+
+        Revision semantics mirror the other mutations: the revision is checked
+        first, so a stale or replayed write is rejected with nothing stored; an
+        effective change increments the revision, and a critique identical to the
+        one already stored is a no-op that keeps it.
+        """
+        require_id(document_id)
+
+        def decide(current: Optional[WorkspaceRow]) -> Decision:
+            if current is None:
+                raise NotFound("Unknown workspace; bind the document first.")
+            state = _state_from_row(current)
+            if current.revision != request.expected_revision:
+                raise StaleRevision(
+                    "The workspace changed since it was read; reload and retry.",
+                    {"expected_revision": request.expected_revision,
+                     "current_revision": current.revision})
+            state.analysis[str(request.batch_index)] = request.critique
+            if _comparable(state.document_snapshot()) == _comparable(current.snapshot):
+                return None, {"changed": False,
+                              "analysis": dict(state.analysis)}
+            state.updated_at = _now()
+            row = WorkspaceRow(
+                document_id=document_id, snapshot=state.document_snapshot(),
+                state_version=SUPPORTED_STATE_VERSION, revision=current.revision + 1,
+                tag_source=current.tag_source, bound_original_id=current.bound_original_id)
+            return row, {"changed": True, "analysis": dict(state.analysis)}
+
+        stored, payload, wrote = self._transact(document_id, decide)
+        log.info("analysis: document %s revision %d (%s)",
+                 document_id[:12], stored.revision,
+                 "changed" if wrote else "no change")
+        result = {"document_id": document_id, "revision": stored.revision}
+        result.update(payload)
+        return result
+
+    def set_batch_size(self, document_id: str,
+                       request: "SetBatchSizeRequest") -> Dict[str, object]:
+        """Re-batch a bound workspace into a new working layout.
+
+        The remote port of the local batch-size change. When the requested size
+        differs from the persisted one, the document is re-sliced and a *new
+        layout* starts: ``layout_version`` is bumped by one, the segments get
+        their new ``batch_index``, and ``current_batch`` is clamped into range.
+        The stored corrections are left untouched - they keep the original
+        ``batch_index`` and the ``layout_version`` they were produced under - so
+        the new layout's feedback never picks up an earlier layout's correction
+        even when the batch indices collide, and a later apply in the new layout
+        cannot erase the old layout's history.
+
+        A same-size request is a no-op: it neither re-slices nor bumps the
+        version (so a reload, a repeat bind or a same-size change never starts a
+        new layout), keeping the revision. A stale ``expected_revision`` is
+        rejected with nothing mutated.
+        """
+        require_id(document_id)
+
+        def decide(current: Optional[WorkspaceRow]) -> Decision:
+            if current is None:
+                raise NotFound("Unknown workspace; bind the document first.")
+            if current.revision != request.expected_revision:
+                raise StaleRevision(
+                    "The workspace changed since it was read; reload and retry.",
+                    {"expected_revision": request.expected_revision,
+                     "current_revision": current.revision})
+            # A same-size request reshapes nothing: no re-slice, no new layout,
+            # no revision change, and every correction stays as it is.
+            current_batch_size = int(current.snapshot.get("batch_size",
+                                                          FIXED_BATCH_SIZE) or 0)
+            if request.batch_size == current_batch_size:
+                return None, {
+                    "changed": False,
+                    "layout_version": int(current.snapshot.get("layout_version", 0) or 0),
+                    "batch_size": request.batch_size,
+                }
+            state = _state_from_row(current)
+            before = _comparable(state.document_snapshot())
+            state.rebatch(request.batch_size)
+            # The size actually changed: start a new layout. The corrections keep
+            # their original batch_index and the layout_version they were produced
+            # under, so the new layout's feedback never adopts the old one's.
+            state.layout_version += 1
+            if _comparable(state.document_snapshot()) == before:
+                return None, {"changed": False, "layout_version": state.layout_version,
+                              "batch_size": request.batch_size}
+            state.updated_at = _now()
+            row = WorkspaceRow(
+                document_id=document_id, snapshot=state.document_snapshot(),
+                state_version=SUPPORTED_STATE_VERSION, revision=current.revision + 1,
+                tag_source=current.tag_source, bound_original_id=current.bound_original_id)
+            return row, {"changed": True, "layout_version": state.layout_version,
+                         "batch_size": request.batch_size}
+
+        stored, payload, wrote = self._transact(document_id, decide)
+        log.info("set_batch_size: document %s revision %d (size %d, layout %d, %s)",
+                 document_id[:12], stored.revision, payload["batch_size"],
+                 payload["layout_version"], "changed" if wrote else "no change")
+        result = {"document_id": document_id, "revision": stored.revision}
         result.update(payload)
         return result
 

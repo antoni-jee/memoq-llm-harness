@@ -146,6 +146,32 @@ class ProcessRequest:
     config: Optional[ModelConfig] = None
 
 
+# ------------------------------------------------------------------ analyze
+
+# The analyze endpoint is a separate, read-only critique action (the local
+# ``analyze_corrections``): it computes a critique over the operator's stored
+# corrections and returns it in a ``critique`` field. It is NOT a new entry in
+# ``OPERATIONS`` (which drives the segment-producing ``process`` path) - that
+# keeps ``process`` / ``parse_process_request`` untouched.
+CORRECTION_REQUIRED = ("segment_id", "source", "llm_suggestion", "human_final")
+CORRECTION_OPTIONAL = ("comment", "batch_index", "layout_version")
+ANALYZE_FIELDS = ("corrections", "hard_rules_text", "expected_tags",
+                  "engine", "config")
+MAX_ANALYZE_CORRECTIONS = 40
+"""Mirrors the local ``analyze_corrections`` limit: only the most recent
+corrections are sent to the model, so a corpus of corrections cannot blow the
+prompt budget."""
+
+
+@dataclass(frozen=True)
+class AnalyzeRequest:
+    corrections: Tuple[Dict[str, object], ...]
+    hard_rules_text: str = ""
+    expected_tags: Dict[str, Tuple[int, ...]] = field(default_factory=dict)
+    engine: Optional[str] = None
+    config: Optional[ModelConfig] = None
+
+
 def _listed(items) -> List[str]:
     return sorted(items)[:MAX_LISTED]
 
@@ -331,6 +357,99 @@ def parse_process_request(body: object, max_segments: int) -> ProcessRequest:
     return ProcessRequest(operation=operation, engine=engine, tag_source=tag_source,
                           batch_index=index, batch_count=count, context=context,
                           segments=tuple(segments), config=config)
+
+
+def parse_analyze_request(body: object, max_corrections: int = MAX_ANALYZE_CORRECTIONS
+                          ) -> AnalyzeRequest:
+    """Validate a whole analyze request before any work is done.
+
+    The analyze endpoint is a separate, read-only critique action: it computes a
+    critique over the operator's stored corrections and returns it in a
+    ``critique`` field, never touching the operator's translation. Each
+    correction is a JSON-shaped dict with the :class:`state_mod.Correction`
+    fields - required ``segment_id`` / ``source`` / ``llm_suggestion`` /
+    ``human_final`` and an optional string ``comment`` and integer
+    ``batch_index``. An empty ``corrections`` list is accepted: the critique of
+    nothing is the empty string, exactly the local ``analyze_corrections``
+    contract. ``expected_tags`` maps a segment id to the inline-tag numbers that
+    row is expected to contain; ``hard_rules_text`` is the editorial rules in
+    force. A per-request model config or an engine selects the backend, exactly
+    as the process path does (mutually exclusive), and an explicit config never
+    falls back to the service's environment or the stub.
+    """
+    if not isinstance(body, dict):
+        raise BadRequest("The request body must be a JSON object.")
+    unknown = set(body) - set(ANALYZE_FIELDS)
+    if unknown:
+        raise BadRequest("Unknown request field(s).", {"fields": _listed(unknown)})
+
+    engine = body.get("engine")
+    if engine is not None and (not isinstance(engine, str) or not engine):
+        raise BadRequest("'engine' must be a non-empty string when given.")
+    config = _parse_config(body.get("config"))
+    if engine is not None and config is not None:
+        raise BadRequest("Provide either a model config or an engine, not both.")
+
+    hard_rules_text = body.get("hard_rules_text", "")
+    if not isinstance(hard_rules_text, str):
+        raise BadRequest("'hard_rules_text' must be a string.")
+
+    raw_tags = body.get("expected_tags", {})
+    if not isinstance(raw_tags, dict):
+        raise BadRequest("'expected_tags' must be an object mapping segment ids "
+                         "to a list of integers.")
+    expected_tags: Dict[str, Tuple[int, ...]] = {}
+    for segment_id, numbers in raw_tags.items():
+        if (not isinstance(segment_id, str) or not isinstance(numbers, list)
+                or any(not isinstance(n, int) or isinstance(n, bool) for n in numbers)):
+            raise BadRequest("Each 'expected_tags' value must be a list of integers.")
+        expected_tags[segment_id] = tuple(numbers)
+
+    raw_corrections = body.get("corrections", [])
+    if not isinstance(raw_corrections, list):
+        raise BadRequest("'corrections' must be a list.")
+    if len(raw_corrections) > max_corrections:
+        raise BadRequest("At most %d corrections per request." % max_corrections)
+    corrections: List[Dict[str, object]] = []
+    bad = []
+    for position, item in enumerate(raw_corrections):
+        if (not isinstance(item, dict) or not set(CORRECTION_REQUIRED) <= set(item)
+                or set(item) - set(CORRECTION_REQUIRED + CORRECTION_OPTIONAL)):
+            bad.append(position)
+            continue
+        # Required fields are strings; the optional comment is a string and the
+        # optional batch_index a non-negative integer.
+        for name in CORRECTION_REQUIRED:
+            if not isinstance(item[name], str):
+                bad.append(position)
+                break
+        else:
+            comment = item.get("comment", "")
+            batch_index = item.get("batch_index", 0)
+            layout_version = item.get("layout_version", 0)
+            if not isinstance(comment, str):
+                bad.append(position)
+            elif not isinstance(batch_index, int) or isinstance(batch_index, bool) \
+                    or batch_index < 0:
+                bad.append(position)
+            elif not isinstance(layout_version, int) or isinstance(layout_version, bool) \
+                    or layout_version < 0:
+                bad.append(position)
+            elif not item["segment_id"]:
+                bad.append(position)
+            else:
+                corrections.append(item)
+    if bad:
+        raise BadRequest(
+            "Each correction needs string 'segment_id' (non-empty), 'source', "
+            "'llm_suggestion', 'human_final', and an optional string 'comment' "
+            "and non-negative integer 'batch_index'.",
+            {"items": _listed(sorted(bad))})
+
+    return AnalyzeRequest(corrections=tuple(corrections),
+                          hard_rules_text=hard_rules_text,
+                          expected_tags=expected_tags, engine=engine,
+                          config=config)
 
 
 # ------------------------------------------------------------------ helpers
@@ -519,3 +638,50 @@ class ProcessingService:
         except llm.LLMError:
             raise EngineFailed("Could not list models.") from None
         return {"models": list(models)}
+
+    def _resolve_analyze_client(self, request: AnalyzeRequest):
+        """Client + reported engine for an analysis request.
+
+        Mirrors :meth:`_resolve_client` minus the tag source the analysis path
+        does not use: an explicit model config always wins; otherwise a named
+        engine, else the service's configured engine.
+        """
+        if request.config is not None:
+            return self._real_client_from_config(request.config), request.config.backend
+        engine = request.engine or self.configured_engine
+        if engine not in self.available_engines():
+            raise BadRequest("Unknown engine.", {"available": self.available_engines()})
+        return self._client(engine, ""), engine
+
+    def analyze_corrections(self, request: AnalyzeRequest) -> Dict[str, object]:
+        """Build a warning-aware critique of the operator's stored corrections.
+
+        A separate action from processing: it reads the corrections the client
+        already applied and returns a brief the UI splits into warnings plus a
+        translation brief, without touching any translation slot. Mirrors the
+        real client's ``analyze_corrections`` contract so the stub and a
+        configured model share the response shape.
+        """
+        start = time.time()
+        client, engine = self._resolve_analyze_client(request)
+        corrections = [
+            state_mod.Correction(
+                segment_id=c["segment_id"], source=c["source"],
+                llm_suggestion=c["llm_suggestion"], human_final=c["human_final"],
+                comment=c.get("comment", ""),
+                batch_index=c.get("batch_index", 0),
+                layout_version=c.get("layout_version", 0))
+            for c in request.corrections
+        ]
+        try:
+            critique = client.analyze_corrections(
+                corrections, request.hard_rules_text, request.expected_tags)
+        except llm.LLMError:
+            raise EngineFailed("The engine request failed.") from None
+        return {
+            "operation": "analyze",
+            "engine": engine,
+            "corrections_analyzed": len(corrections),
+            "critique": critique,
+            "elapsed_ms": int((time.time() - start) * 1000),
+        }

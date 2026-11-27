@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<xliff version="1.2" xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:mq="http://www.memoq.com/memoq/xliff">
+  <file original="handbook.docx" source-language="en-US" target-language="de-DE" datatype="x-docx">
+    <header>
+      <mq:hiddentexts />
+    </header>
+    <body>
+      <trans-unit id="1" mq:status="NotStarted" mq:locked="false">
+        <source>Click <bpt id="1">&lt;b&gt;</bpt>Save<ept id="1">&lt;/b&gt;</ept> to continue.</source>
+        <target>Klicken Sie <bpt id="1">&lt;b&gt;</bpt>Speichern<ept id="1">&lt;/b&gt;</ept>, um fortzufahren.</target>
+      </trans-unit>
+      <trans-unit id="2" mq:status="NotStarted" mq:locked="false">
+        <source>The dashboard shows <ph id="2">{count}</ph> sessions.</source>
+        <target>Das Dashboard zeigt <ph id="2">{count}</ph> Sitzungen.</target>
+      </trans-unit>
+      <trans-unit id="3" mq:confirmed="true" mq:locked="false">
+        <source>This row is already confirmed.</source>
+        <target>Diese Zeile ist bereits bestaetigt.</target>
+      </trans-unit>
+      <trans-unit id="4" mq:status="NotStarted" mq:locked="true">
+        <source>This row is locked.</source>
+        <target>Diese Zeile ist gesperrt.</target>
+      </trans-unit>
+      <trans-unit id="5" mq:status="Confirmed" mq:locked="false">
+        <source>Confirmed via the status attribute.</source>
+        <target>Ueber das Statusattribut bestaetigt.</target>
+      </trans-unit>
+      <trans-unit id="6" mq:status="NotStarted" mq:locked="false">
+        <source>Signed off via the target state.</source>
+        <target state="final">Ueber den Zielstatus freigegeben.</target>
+      </trans-unit>
+      <trans-unit id="7" mq:status="NotStarted" mq:locked="false">
+        <source>Use the placeholder {1} literally in this sentence.</source>
+        <target>Verwenden Sie den Platzhalter {1} woertlich in diesem Satz.</target>
+      </trans-unit>
+      <trans-unit id="8" mq:status="NotStarted" mq:locked="false">
+        <source>Tom &amp; Jerry &lt;tags&gt; and a non-breaking&#160;space.</source>
+        <target>Tom &amp; Jerry &lt;tags&gt; und ein geschuetztes&#160;Leerzeichen.</target>
+      </trans-unit>
+      <trans-unit id="9" mq:status="NotStarted" mq:locked="false">
+        <source>This segment has no target element yet.</source>
+      </trans-unit>
+      <trans-unit id="10" mq:status="NotStarted" mq:locked="false">
+        <source></source>
+        <target></target>
+      </trans-unit>
+      <trans-unit id="11" mq:status="NotStarted" mq:locked="false">
+        <source><g id="3">Nested <bpt id="4">&lt;i&gt;</bpt>formatting<ept id="4">&lt;/i&gt;</ept> here</g> plus <x id="5"/> a break.</source>
+        <target><g id="3">Verschachtelte <bpt id="4">&lt;i&gt;</bpt>Formatierung<ept id="4">&lt;/i&gt;</ept> hier</g> plus <x id="5"/> ein Umbruch.</target>
+      </trans-unit>
+      <trans-unit id="12" mq:status="NotStarted" mq:locked="false">
+        <source>Export the report to PDF.</source>
+        <target>Exportieren Sie den Bericht nach PDF.</target>
+      </trans-unit>
+    </body>
+  </file>
+</xliff>

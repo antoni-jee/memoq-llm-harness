@@ -184,6 +184,7 @@ class _FakeWorkspace:
         self.get_calls = []
         self.save_calls = []
         self.record_calls = []
+        self.record_analysis_calls = []
         # The non-mutating compatibility probe writes to a workspace nothing is
         # bound to, so a fresh service accepts the prefill field and 404s
         # "unknown workspace" while a stale one predates the contract and 400s
@@ -194,13 +195,14 @@ class _FakeWorkspace:
         self._compat_probe_status = 404
 
     def bind(self, document_id, original_id, *, source_file="", tag_source="target",
-             segments=None, present_keys=None):
+             segments=None, present_keys=None, batch_size=100):
         self.bind_calls.append({
             "document_id": document_id,
             "original_id": original_id,
             "source_file": source_file,
             "tag_source": tag_source,
             "present_keys": list(present_keys or []),
+            "batch_size": batch_size,
             # Record the full items bind was handed (shallow-copied), not just
             # their keys, so a test can feed the app's actual payload back to the
             # real parse_bind_request and confirm the projection: the active
@@ -416,10 +418,54 @@ class _FakeWorkspace:
                 raise response
         return response if response is not None else {}
 
+    def record_analysis(self, document_id, expected_revision, batch_index,
+                        critique):
+        """Mirror the workspace analysis-write contract for the critique persist.
+
+        With a live server it behaves like service.record_analysis: a revision
+        mismatch is a 409 stale_revision, a match writes the critique into the
+        snapshot's separate ``analysis`` slot keyed by batch (never touching the
+        operator's text, proposal or target), and a request that changes nothing
+        is a no-op that keeps the revision. The response names the stored
+        analysis. Without a server a single empty response stands in.
+        """
+        self.record_analysis_calls.append({
+            "document_id": document_id,
+            "expected_revision": expected_revision,
+            "batch_index": batch_index,
+            "critique": critique,
+        })
+        if self._server is not None:
+            snap = self._server[document_id]
+            if snap["revision"] != expected_revision:
+                raise RemoteError(
+                    service="workspace", status=409, code="stale_revision",
+                    current_revision=snap["revision"],
+                    message="The document changed since it was read; reload and "
+                            "retry.")
+            analysis = snap.setdefault("analysis", {})
+            if analysis.get(str(batch_index)) == critique:
+                return {
+                    "document_id": document_id,
+                    "revision": snap["revision"],
+                    "changed": False,
+                    "analysis": dict(analysis),
+                }
+            analysis[str(batch_index)] = critique
+            snap["revision"] += 1
+            snap["updated_at"] = "2026-01-03T00:00:00"
+            return {
+                "document_id": document_id,
+                "revision": snap["revision"],
+                "changed": True,
+                "analysis": dict(analysis),
+            }
+        return {}
+
 
 class _FakeProcessing:
     def __init__(self, *, process_resp=None, ready_resp=None,
-                 probe_resp=None, list_resp=None):
+                 probe_resp=None, list_resp=None, analyze_resp=None):
         # process_resp, when set, is the configured /process 2xx body (a dict the
         # app reads for "suggestions"/"missing"), an exception (a 502/503/400 the
         # real client maps to a RemoteError) or a callable(segments=...,
@@ -432,6 +478,11 @@ class _FakeProcessing:
         # probe_resp is the /probe body a "Test model" click reads (default a
         # ready probe); list_resp is the /models body a "List models" click reads
         # (default an empty list). Neither is called unless its button is clicked.
+        # analyze_resp, when set, is the /analyze 2xx body (a dict the app reads
+        # for "critique") or a callable(corrections=..., hard_rules_text=...,
+        # expected_tags=..., engine=..., config=...). Without it analyze returns
+        # an empty body (no critique), so a test that never clicks Analyse keeps
+        # the read-only behaviour unchanged.
         self._process = process_resp
         self._ready = ready_resp if ready_resp is not None else {
             "status": "ready", "engine": "stub",
@@ -439,10 +490,12 @@ class _FakeProcessing:
         }
         self._probe = probe_resp
         self._list = list_resp
+        self._analyze = analyze_resp
         self.process_calls = []
         self.ready_calls = []
         self.probe_calls = []
         self.list_calls = []
+        self.analyze_calls = []
 
     def ready(self):
         self.ready_calls.append(None)
@@ -478,6 +531,17 @@ class _FakeProcessing:
     def process(self, **kwargs):
         self.process_calls.append(kwargs)
         response = self._process
+        if response is None:
+            return {}
+        if callable(response):
+            response = response(**kwargs)
+        if isinstance(response, BaseException):
+            raise response
+        return response if response is not None else {}
+
+    def analyze(self, **kwargs):
+        self.analyze_calls.append(kwargs)
+        response = self._analyze
         if response is None:
             return {}
         if callable(response):
@@ -534,7 +598,7 @@ class RemoteAppTestCase(unittest.TestCase):
     def _install_fakes(self, *, upload_resp, segments_resp,
                        bind_resp=None, get_resp=None, server=None, save_resp=None,
                        process_resp=None, ready_resp=None, record_resp=None,
-                       probe_resp=None, list_resp=None):
+                       probe_resp=None, list_resp=None, analyze_resp=None):
         document = _FakeDocument(upload_resp, segments_resp)
         workspace = _FakeWorkspace(bind_resp if bind_resp is not None else {},
                                    get_resp if get_resp is not None else {},
@@ -543,7 +607,8 @@ class RemoteAppTestCase(unittest.TestCase):
         processing = _FakeProcessing(process_resp=process_resp,
                                      ready_resp=ready_resp,
                                      probe_resp=probe_resp,
-                                     list_resp=list_resp)
+                                     list_resp=list_resp,
+                                     analyze_resp=analyze_resp)
         self.fake = _FakeClients(document, workspace, processing)
 
         # get_remote_clients does `from harness_remote import build_clients` at
@@ -578,6 +643,16 @@ class RemoteAppTestCase(unittest.TestCase):
         labels = [b.label for b in app.button]
         labels.extend(b.label for b in app.sidebar.button)
         return labels
+
+    def your_text_areas(self, app):
+        """The per-row 'Your text' areas only.
+
+        This Streamlit version lists the sidebar's Editorial controls (Hard
+        Rules / Vibe / Batch Directive) in ``app.text_area`` too; the per-row
+        areas are the only ones keyed ``remote_edit_``, so count by key.
+        """
+        return [ta for ta in app.text_area
+                if ta.key and ta.key.startswith("remote_edit_")]
 
     def _open(self, app, fake, filename="sample.mqxliff", content=b"<x/>"):
         """Drive a first Open (upload + bind + read) and let the grid render."""
@@ -756,15 +831,36 @@ class RemoteAppTestCase(unittest.TestCase):
         # - they hold an unsaved draft in session state and write only through
         # Save. The model section adds two more text inputs (Base URL + the
         # session-only key) for the per-request config.
-        self.assertEqual(len(app.text_area), 2)
+        self.assertEqual(len(self.your_text_areas(app)), 2)
         self.assertEqual(len(app.text_input), 4)
 
-        # The finished-mutation controls must be absent from every scope.
+        # The finished-mutation controls that remain local-only must be absent
+        # from every scope. "Apply Changes & Calculate Diffs" is NOT among them
+        # anymore: it now routes through the workspace service
+        # (apply_remote_corrections), so it is offered here and asserted present
+        # below, like Export and the per-row Rerun. "Analyse my corrections"
+        # (the analyze-corrections action) is ALSO offered now: it routes through
+        # the processing service (compute) and the workspace service
+        # (record_analysis), so it is asserted present below, like Apply. The
+        # local orchestration ban (no translate_batch / analyze_corrections /
+        # save through the local llm.LLMClient) still lives in
+        # test_local_mutation_entry_points_not_invoked.
         labels = self._button_labels(app)
-        for forbidden in ("Apply Changes & Calculate Diffs",
-                          "Rerun", "Analyse my corrections",
-                          "Export Valid MQXLIFF", "Reset active document"):
+        for forbidden in ("Reset active document",):
             self.assertNotIn(forbidden, labels)
+        # The finished controls now offered in remote mode: Export (writes only
+        # through the document service), the per-row Rerun (a one-segment model
+        # call through the processing service, stored as a proposal), the
+        # batch-level "Apply Changes & Calculate Diffs" (routes through the
+        # workspace service to persist the batch's corrections) and the
+        # "Analyse my corrections" button (routes through the processing service
+        # to compute a critique and through the workspace service to persist it
+        # in a separate analysis slot, never overwriting the operator's
+        # translation).
+        self.assertIn("Export Valid MQXLIFF", labels)
+        self.assertIn("Rerun", labels)
+        self.assertIn("Apply Changes & Calculate Diffs", labels)
+        self.assertIn("Analyse my corrections", labels)
 
         # The one gated mutation is offered, but disabled: every translatable
         # row already has human text (k1 saved, k2 saved), so no row is eligible
@@ -828,6 +924,98 @@ class RemoteAppTestCase(unittest.TestCase):
         self.assertFalse(analyze_mock.called,
                          "analyze_corrections was reached in remote mode")
 
+    # ----- 7a. "Analyse my corrections" persists a critique in its own slot
+
+    def test_analyze_button_persists_critique_in_analysis_slot(self):
+        # The operator's "Analyse my corrections" button (a separate, read-only
+        # action, distinct from "Apply Changes & Calculate Diffs" and "Copy
+        # proposal") drives run_remote_analysis: it reads the *stored*
+        # corrections a prior apply made, asks the processing service for a
+        # critique, and persists it through the workspace service in a separate
+        # analysis slot - never overwriting the operator's saved text, proposal
+        # or target. The whole path is driven through the app's own client seam
+        # (the fakes); no service method is called directly.
+        doc_segments = [
+            doc_segment("k1", "u1", 0, "The cat.", "Le chat."),
+        ]
+        snap = snapshot("doc-1", "orig-1", "target", 1,
+                        order=["k1"],
+                        segments={"k1": ws_record("k1",
+                                                  llm_suggestion="Le chat (LLM).",
+                                                  user_final="Le chat humain.",
+                                                  status="applied",
+                                                  edited_by_human=True)})
+        snap["corrections"] = [{
+            "segment_id": "u1", "source": "The cat.",
+            "llm_suggestion": "Le chat (LLM).", "human_final": "Le chat humain.",
+            "comment": "tone", "batch_index": 0,
+        }]
+        server = {"doc-1": copy.deepcopy(snap)}
+        critique = "TRANSLATION BRIEF\nUse the formal register."
+        fake = self._install_fakes(
+            upload_resp={"document_id": "doc-1", "original_id": "orig-1"},
+            segments_resp=doc_segments,
+            get_resp=snap,
+            server=server,
+            analyze_resp={"operation": "analyze", "engine": "stub",
+                          "corrections_analyzed": 1, "critique": critique},
+        )
+        app = self.run_app()
+        self._open(app, fake)
+
+        # The button is enabled: a stored correction exists.
+        self.assertFalse(self._button(app, "Analyse my corrections").disabled)
+
+        # Click it: the critique is computed by the processing service and
+        # persisted through the workspace service.
+        self._button(app, "Analyse my corrections").click()
+        self._run(app)
+
+        self.assertEqual(len(fake.processing.analyze_calls), 1,
+                         "the critique must be computed by the processing service")
+        self.assertEqual(len(fake.workspace.record_analysis_calls), 1,
+                         "the critique must be persisted through the workspace "
+                         "service")
+        call = fake.workspace.record_analysis_calls[0]
+        self.assertEqual(call["batch_index"], 0)
+        self.assertEqual(call["critique"], critique)
+
+        # It lives in the separate analysis slot; the operator's text, proposal
+        # and target are untouched.
+        stored = server["doc-1"]
+        self.assertEqual(stored["analysis"]["0"], critique)
+        self.assertEqual(stored["segments"]["k1"]["user_final"], "Le chat humain.")
+        self.assertEqual(stored["segments"]["k1"]["llm_suggestion"],
+                         "Le chat (LLM).")
+        # The re-read view now carries the stored critique.
+        self.assertEqual(app.session_state.remote_view.analysis["0"], critique)
+
+    def test_analyze_button_disabled_without_stored_corrections(self):
+        # With no stored corrections the button is disabled: run_remote_analysis
+        # has nothing to critique, so a click can never compute or persist a
+        # critique. A document with saved text but no corrections exercises the
+        # disabled state without needing an apply.
+        doc_segments = [
+            doc_segment("k1", "u1", 0, "The cat.", "Le chat."),
+        ]
+        snap = snapshot("doc-1", "orig-1", "target", 1,
+                        order=["k1"],
+                        segments={"k1": ws_record("k1",
+                                                  user_final="Le chat.",
+                                                  status="applied",
+                                                  edited_by_human=True)})
+        server = {"doc-1": copy.deepcopy(snap)}
+        fake = self._install_fakes(
+            upload_resp={"document_id": "doc-1", "original_id": "orig-1"},
+            segments_resp=doc_segments,
+            get_resp=snap,
+            server=server,
+        )
+        app = self.run_app()
+        self._open(app, fake)
+
+        self.assertTrue(self._button(app, "Analyse my corrections").disabled)
+
     # ------------------------------------------- 8. empty workspace renders clean
 
     def test_empty_workspace_renders_no_segments(self):
@@ -843,7 +1031,7 @@ class RemoteAppTestCase(unittest.TestCase):
         self.assertTrue(view.is_empty)
         # No rows, so neither editable cell renders; the model section still
         # offers its per-request config inputs (Base URL + session-only key).
-        self.assertEqual(len(app.text_area), 0)
+        self.assertEqual(len(self.your_text_areas(app)), 0)
         self.assertEqual(len(app.text_input), 2)
         self.assertNotIn("Process Current Batch", self._button_labels(app))
 

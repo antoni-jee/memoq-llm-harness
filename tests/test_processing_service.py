@@ -28,8 +28,10 @@ from services.document_service.service import DocumentService  # noqa: E402
 from services.document_service.storage import FileStorage  # noqa: E402
 from services.processing_service import config, engines  # noqa: E402
 from services.processing_service.app import create_app  # noqa: E402
-from services.processing_service.service import (ModelConfig,  # noqa: E402
-                                                 ProcessingService)
+from services.processing_service.service import (AnalyzeRequest,  # noqa: E402
+                                                 ModelConfig,
+                                                 ProcessingService,
+                                                 parse_analyze_request)
 from tests.test_document_service import SAMPLE, FakeRepository  # noqa: E402
 
 SECRET_TEXT = "TOPSECRET-PROCESSING-TEXT"
@@ -84,6 +86,9 @@ class ProcessingTestCase(unittest.TestCase):
         body.setdefault("segments", segments_from())
         return self.client.post("/process", json=body)
 
+    def analyze(self, **body):
+        return self.client.post("/analyze", json=body)
+
 
 class TestStub(ProcessingTestCase):
     def test_stub_is_the_default_and_deterministic(self):
@@ -137,6 +142,63 @@ class TestStub(ProcessingTestCase):
                         "/originals/%s/tag-reports" % original["original_id"],
                         json={"tag_source": tag_source, "texts": texts}).json()["reports"]
                     self.assertEqual(reports, {k: "" for k in texts}, reports)
+
+
+class TestAnalyze(ProcessingTestCase):
+    """The separate read-only ``/analyze`` critique action.
+
+    The analyze endpoint computes a critique over the operator's stored
+    corrections and returns it in a ``critique`` field; it is not a ``process``
+    operation and never produces segment text. The stub engine is offline, so a
+    non-empty critique is a deterministic brief whose heading the UI splits on.
+    """
+
+    def _correction(self, segment_id="u1", human_final="Le chat humain."):
+        return {"segment_id": segment_id, "source": "The cat.",
+                "llm_suggestion": "Le chat (LLM).", "human_final": human_final,
+                "comment": "tone", "batch_index": 0}
+
+    def test_empty_corrections_yield_an_empty_critique(self):
+        # The critique of nothing is the empty string, mirroring the local
+        # analyze_corrections contract; the response still carries the shape.
+        body = self.analyze(corrections=[]).json()
+        self.assertEqual((body["operation"], body["critique"]), ("analyze", ""))
+        self.assertEqual(body["corrections_analyzed"], 0)
+
+    def test_nonempty_corrections_return_a_brief(self):
+        body = self.analyze(corrections=[self._correction()]).json()
+        self.assertEqual((body["operation"], body["engine"]), ("analyze", "stub"))
+        self.assertEqual(body["corrections_analyzed"], 1)
+        self.assertIn("TRANSLATION BRIEF", body["critique"],
+                      "the stub returns a brief whose heading the UI splits on")
+
+    def test_bad_correction_shape_is_rejected_whole(self):
+        # A missing or empty ``corrections`` is accepted as "critique of
+        # nothing" (covered by the empty-corrections test), so the bad cases
+        # all carry a corrections value that is malformed.
+        cases = [
+            {"corrections": "x"},
+            {"corrections": {}},
+            {"corrections": [{"source": "The cat."}]},
+            {"corrections": [{"segment_id": "", "source": "x",
+                              "llm_suggestion": "y", "human_final": "z"}]},
+            {"corrections": [{"segment_id": "u1", "source": 1,
+                              "llm_suggestion": "y", "human_final": "z"}]},
+            {"corrections": [self._correction()], "extra": 1},
+            {"corrections": [self._correction()], "expected_tags": {"u1": [1, "two"]}},
+        ]
+        for body in cases:
+            with self.subTest(body=repr(body)[:70]):
+                response = self.analyze(**body)
+                self.assertEqual(response.status_code, 400, response.text)
+
+    def test_engine_and_config_are_mutually_exclusive(self):
+        # A per-request config and a named engine both select the backend, so
+        # sending both is rejected, mirroring the process path.
+        response = self.analyze(
+            corrections=[self._correction()], engine="openai",
+            config={"preset": "OpenAI API"})
+        self.assertEqual(response.status_code, 400, response.text)
 
 
 class TestOperations(ProcessingTestCase):
@@ -495,6 +557,41 @@ class TestPerRequestConfig(ProcessingTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertNotIn(FAKE_KEY, response.text)
         self.assertNotIn(FAKE_KEY, "\n".join(logs.output))
+
+    def test_non_default_temperature_and_max_tokens_reach_the_client_call(self):
+        # E.3 (b): a non-default temperature and max_tokens that reach the
+        # per-request config block are (1) built into the client config the
+        # service produces and (2) sent in the supported client's call
+        # arguments. The OpenAI-compatible backend carries both; Anthropic's
+        # call omits temperature (see
+        # test_temperature_is_never_sent_to_anthropic), so the OpenAI backend
+        # is where both values can be asserted together. The lower SDK call is
+        # mocked, so no model or network is reached.
+        model_config = ModelConfig(
+            preset="Local Engine (Ollama)", backend=llm.BACKEND_OPENAI,
+            base_url="http://127.0.0.1:11434", api_key="", model="test-model",
+            temperature=0.35, max_tokens=1234)
+        # (1) the service builds the non-default values into the client config
+        client_config = self.service._client_config_from_block(model_config)
+        self.assertEqual(client_config.temperature, 0.35)
+        self.assertEqual(client_config.max_tokens, 1234)
+        # (2) the supported client sends them in its call arguments
+        captured: dict = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return type("R", (), {"choices": [type("C", (), {
+                    "message": type("M", (), {"content": "ok"})()})()]})()
+
+        client = llm.LLMClient.__new__(llm.LLMClient)
+        client.config = client_config
+        client._supports_json_mode = None
+        client._client = type("C", (), {
+            "chat": type("Ch", (), {"completions": FakeCompletions()})()})()
+        client._chat([{"role": "user", "content": "hi"}], force_json=False)
+        self.assertEqual(captured["temperature"], 0.35)
+        self.assertEqual(captured["max_tokens"], 1234)
 
 
 class TestHealthLogsConfig(ProcessingTestCase):

@@ -20,7 +20,7 @@ between the app and the services.
 
 from __future__ import annotations
 
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import requests
 
@@ -315,13 +315,18 @@ class WorkspaceClient(BaseClient):
 
     def bind(self, document_id: str, original_id: str, *,
              source_file: str = "", tag_source: str = "target",
-             segments=None, present_keys=None):
+             segments=None, present_keys=None, batch_size: int = 100):
+        # 100 mirrors harness_remote.view.DEFAULT_BATCH_SIZE; the transport layer
+        # stays free of memoq_harness, so the default is a literal. The operator's
+        # chosen size is supplied by the caller; a re-read recovers it from the
+        # persisted snapshot, so the server is the source of truth.
         body = {
             "original_id": original_id,
             "source_file": source_file,
             "tag_source": tag_source,
             "segments": list(segments or []),
             "present_keys": list(present_keys or []),
+            "batch_size": batch_size,
         }
         return self.post_json("/workspaces/%s/bind" % document_id, body)
 
@@ -339,6 +344,35 @@ class WorkspaceClient(BaseClient):
         body = {"expected_revision": expected_revision, "suggestions": dict(suggestions),
                 "prefill": prefill}
         return self.post_json("/workspaces/%s/suggestions" % document_id, body)
+
+    def apply_corrections(self, document_id: str, expected_revision: int,
+                          batch_index: int):
+        """Apply one batch's human edits as stored corrections (the remote
+        "Apply Changes & Calculate Diffs"). The service stores the produced
+        corrections in the document snapshot so they survive a re-read and feed
+        the next batch's feedback."""
+        body = {"expected_revision": expected_revision, "batch_index": batch_index}
+        return self.post_json("/workspaces/%s/apply" % document_id, body)
+
+    def record_analysis(self, document_id: str, expected_revision: int,
+                        batch_index: int, critique: str):
+        """Persist a corrections critique in a separate ``analysis`` slot (the
+        remote "Analyse my corrections"). The critique is stored keyed by batch
+        and survives a re-read; it never overwrites the operator's saved text,
+        the model's proposal or the original target."""
+        body = {"expected_revision": expected_revision, "batch_index": batch_index,
+                "critique": critique}
+        return self.post_json("/workspaces/%s/analysis" % document_id, body)
+
+    def set_batch_size(self, document_id: str, expected_revision: int,
+                       batch_size: int):
+        """Re-batch a bound workspace into a new working layout (the remote
+        "Change batch size"). The service re-slices the document and starts a
+        new layout only when the size differs from the persisted one; a same-size
+        or stale request is a no-op. The operator's held drafts survive by key;
+        stored corrections keep their original batch_index and layout version."""
+        body = {"expected_revision": expected_revision, "batch_size": batch_size}
+        return self.post_json("/workspaces/%s/set_batch_size" % document_id, body)
 
 
 class ProcessingClient(BaseClient):
@@ -374,6 +408,29 @@ class ProcessingClient(BaseClient):
             body["config"] = dict(config)
         # Processing is slow: a long read, but the connect phase stays short.
         return self.post_json("/process", body, timeout=self.process_timeout)
+
+    def analyze(self, *, corrections, hard_rules_text: str = "",
+                expected_tags: Optional[Mapping[str, Sequence[int]]] = None,
+                engine: Optional[str] = None,
+                config: Optional[Mapping[str, object]] = None):
+        """One corrections critique over the operator's stored corrections.
+
+        The remote analog of the local ``analyze_corrections``: the service
+        computes a critique (warnings + a translation brief) and returns it in a
+        separate ``critique`` field, never touching the operator's translation.
+        ``corrections`` are the stored records; ``expected_tags`` maps a
+        segment id to its expected tags. A per-request model config or engine
+        selects the backend, exactly as :meth:`process` does."""
+        body: Dict[str, object] = {"corrections": list(corrections)}
+        if hard_rules_text:
+            body["hard_rules_text"] = hard_rules_text
+        if expected_tags is not None:
+            body["expected_tags"] = {k: list(v) for k, v in expected_tags.items()}
+        if engine is not None:
+            body["engine"] = engine
+        if config is not None:
+            body["config"] = dict(config)
+        return self.post_json("/analyze", body, timeout=self.process_timeout)
 
     def probe(self, config: Mapping[str, object]):
         """One bounded, user-initiated model probe for a config block."""

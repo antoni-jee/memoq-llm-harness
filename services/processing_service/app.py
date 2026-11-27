@@ -5,6 +5,7 @@ Endpoints
 ``GET  /healthz``  liveness; no dependency checks
 ``GET  /readyz``   readiness; the configured engine is usable (never calls a model)
 ``POST /process``  build the prompt and return suggestions for explicit segments
+``POST /analyze``  a warning-aware critique of the operator's stored corrections
 ``POST /probe``    one bounded model probe for a per-request config (no suggestions)
 ``POST /models``   model ids the per-request config's endpoint advertises
 
@@ -28,7 +29,8 @@ from starlette.routing import Route
 
 from . import SERVICE_NAME
 from .service import (BadRequest, ProcessingService, ServiceError, TooLarge,
-                      parse_config_request, parse_process_request)
+                      parse_analyze_request, parse_config_request,
+                      parse_process_request)
 
 log = logging.getLogger(SERVICE_NAME)
 
@@ -80,6 +82,10 @@ def create_app(service: ProcessingService) -> Starlette:
                                      service.max_segments)
         return JSONResponse(await run_in_threadpool(service.process, body))
 
+    async def analyze(request: Request) -> Response:
+        body = parse_analyze_request(await _read_json(request, service.max_body_bytes))
+        return JSONResponse(await run_in_threadpool(service.analyze_corrections, body))
+
     async def probe(request: Request) -> Response:
         config = parse_config_request(await _read_json(request, service.max_body_bytes))
         return JSONResponse(await run_in_threadpool(service.probe, config))
@@ -109,6 +115,7 @@ def create_app(service: ProcessingService) -> Starlette:
         Route("/healthz", healthz, methods=["GET"]),
         Route("/readyz", readyz, methods=["GET"]),
         Route("/process", process, methods=["POST"]),
+        Route("/analyze", analyze, methods=["POST"]),
         Route("/probe", probe, methods=["POST"]),
         Route("/models", models, methods=["POST"]),
     ]

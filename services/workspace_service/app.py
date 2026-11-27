@@ -8,6 +8,9 @@ Endpoints
 ``GET   /workspaces/{document_id}``         the saved workspace
 ``PATCH /workspaces/{document_id}/segments`` save manual text and/or comments
 ``POST  /workspaces/{document_id}/suggestions`` record suggestions (prefill off stores the proposal only)
+``POST  /workspaces/{document_id}/apply``      apply a batch's edits as stored corrections
+``POST  /workspaces/{document_id}/analysis``   store a corrections critique in a separate slot
+``POST  /workspaces/{document_id}/set_batch_size`` re-batch into a new working layout
 
 Errors are JSON ``{"error": <code>, "message": <safe text>}`` plus, where
 useful, ``"details"`` with identifiers only.
@@ -28,8 +31,10 @@ from starlette.routing import Route
 
 from . import SERVICE_NAME
 from .service import (
-    BadRequest, ServiceError, TooLarge, WorkspaceService, parse_bind_request,
-    parse_patch_request, parse_suggestions_request,
+    BadRequest, ServiceError, TooLarge, WorkspaceService,
+    parse_analysis_request, parse_apply_request,
+    parse_bind_request, parse_patch_request, parse_set_batch_size_request,
+    parse_suggestions_request,
 )
 
 log = logging.getLogger(SERVICE_NAME)
@@ -100,6 +105,24 @@ def create_app(service: WorkspaceService) -> Starlette:
             service.record_suggestions, request.path_params["document_id"], body)
         return JSONResponse(result)
 
+    async def apply(request: Request) -> Response:
+        body = parse_apply_request(await _read_json(request, service.max_body_bytes))
+        result = await run_in_threadpool(
+            service.apply_corrections, request.path_params["document_id"], body)
+        return JSONResponse(result, status_code=200)
+
+    async def record_analysis(request: Request) -> Response:
+        body = parse_analysis_request(await _read_json(request, service.max_body_bytes))
+        result = await run_in_threadpool(
+            service.record_analysis, request.path_params["document_id"], body)
+        return JSONResponse(result, status_code=200)
+
+    async def set_batch_size(request: Request) -> Response:
+        body = parse_set_batch_size_request(await _read_json(request, service.max_body_bytes))
+        result = await run_in_threadpool(
+            service.set_batch_size, request.path_params["document_id"], body)
+        return JSONResponse(result, status_code=200)
+
     async def service_error(request: Request, exc: ServiceError) -> Response:
         if exc.status >= 500:
             log.warning("%s %s -> %d %s", request.method, request.url.path, exc.status, exc.code)
@@ -124,6 +147,10 @@ def create_app(service: WorkspaceService) -> Starlette:
         Route("/workspaces/{document_id}", get_workspace, methods=["GET"]),
         Route("/workspaces/{document_id}/segments", save_segments, methods=["PATCH"]),
         Route("/workspaces/{document_id}/suggestions", record_suggestions, methods=["POST"]),
+        Route("/workspaces/{document_id}/apply", apply, methods=["POST"]),
+        Route("/workspaces/{document_id}/analysis", record_analysis, methods=["POST"]),
+        Route("/workspaces/{document_id}/set_batch_size", set_batch_size,
+              methods=["POST"]),
     ]
     handlers: Dict[object, object] = {
         ServiceError: service_error,

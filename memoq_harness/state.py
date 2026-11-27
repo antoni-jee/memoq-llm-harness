@@ -170,6 +170,65 @@ def _squash(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def parse_termbase_csv(
+    data: "bytes | str",
+    source_col: int = MEMOQ_SOURCE_COL,
+    target_col: int = MEMOQ_TARGET_COL,
+    skip_rows: int = 1,
+) -> "tuple[list[TermEntry], TermbaseLoadReport]":
+    """Parse a memoQ termbase CSV export into entries + a report, state-free.
+
+    The parsing half of :meth:`ProjectState.load_termbase_csv`, factored out so
+    a remote session - which keeps its termbase in plain session state rather
+    than a :class:`ProjectState` - can import the very same memoQ columns and
+    the same robustness (encoding sniff, delimiter sniff, the csv reader that
+    keeps quoted commas and embedded line breaks intact) without constructing a
+    project. Returns the parsed entries and the report so the caller can apply
+    them to its own store or surface what was skipped.
+    """
+    text, encoding = _decode_csv(data)
+    # newline="" lets csv handle embedded line breaks inside quoted fields.
+    handle = io.StringIO(text, newline="")
+    delimiter = _sniff_delimiter(text)
+
+    report = TermbaseLoadReport(encoding=encoding, delimiter=delimiter)
+    parsed: List[TermEntry] = []
+    seen: Dict[str, int] = {}
+
+    for index, row in enumerate(csv.reader(handle, delimiter=delimiter)):
+        if index < skip_rows:
+            report.header_rows += 1
+            continue
+        report.data_rows += 1
+        if not any(cell.strip() for cell in row):
+            report.blank_rows += 1
+            continue
+
+        source = row[source_col].strip() if source_col < len(row) else ""
+        target = row[target_col].strip() if target_col < len(row) else ""
+        if not source or not target:
+            report.incomplete_rows += 1
+            continue
+
+        # Collapse internal whitespace/newlines so a term stays one line in
+        # the prompt even if the export wrapped it.
+        source, target = _squash(source), _squash(target)
+        # Dedup on the exact source, NOT case-folded. Real memoQ termbases
+        # distinguish by case on purpose - "Connect to an Account" is a UI
+        # heading ("Подключение к счету") while "connect to an account" is
+        # a verb phrase ("подключиться к счету"). Folding case would throw
+        # one of them away. Lookup stays case-insensitive, so both are
+        # offered and the model picks by context.
+        if source in seen:
+            report.duplicate_rows += 1
+            continue
+        seen[source] = len(parsed)
+        parsed.append(TermEntry(source=source, target=target))
+
+    report.loaded = len(parsed)
+    return parsed, report
+
+
 @functools.lru_cache(maxsize=8192)
 def _term_pattern(term: str) -> re.Pattern:
     """Whole-word matcher for a termbase source term.
@@ -201,6 +260,13 @@ class Correction:
     human_final: str
     comment: str = ""
     batch_index: int = 0
+    # The layout this correction was produced under. A re-batch (an explicit,
+    # revision-checked change of the batch size) starts a new layout, so an old
+    # correction keeps its original batch_index but is tagged with its own
+    # layout; feedback for the current layout never picks up an earlier
+    # layout's correction even when the batch indices collide. Defaults to 0,
+    # which is the layout of every snapshot written before layout versioning.
+    layout_version: int = 0
 
     def render(self, detailed: bool = True) -> str:
         """Render as the feedback block injected into the next system prompt."""
@@ -270,6 +336,13 @@ class ProjectState:
         self.created_at: str = _now()
         self.updated_at: str = _now()
         self.batch_size: int = DEFAULT_BATCH_SIZE
+        # The working layout's version. A re-batch (an explicit, revision-checked
+        # change of the batch size) bumps it; reload, a repeat bind and a same-size
+        # change leave it untouched. Corrections carry the layout they were
+        # produced under, so feedback for the current layout never picks up an
+        # earlier layout's correction. 0 is the version of every snapshot written
+        # before layout versioning, so pre-rebatch feedback never disappears.
+        self.layout_version: int = 0
         self.current_batch: int = 0
         # The editorial rulebook: free-form prose, injected verbatim. Distinct
         # from the termbase, which is a filtered table of term pairs.
@@ -818,14 +891,24 @@ class ProjectState:
             record.user_final = text
             record.user_comment = comments.get(key, record.user_comment)
 
-    def calculate_diffs(self, batch_index: int) -> List[Correction]:
+    def calculate_diffs(self, batch_index: int,
+                        layout_version: Optional[int] = None) -> List[Correction]:
         """Turn this batch's human edits into correction records.
 
         A row counts as human-edited when the final text differs from what the
         model proposed - that difference is exactly the learning signal.  Rows
         the human left alone are implicit approval and carry no signal, so they
         are not injected into the next prompt.
+
+        The produced corrections are tagged with the layout version the edits
+        were applied under (``self.layout_version`` when not given), and the
+        replace-previous step is scoped to that same ``(batch_index,
+        layout_version)``: re-applying a batch updates its own layout's
+        corrections without erasing an earlier layout's correction that merely
+        shares the batch index. A re-batch starts a new layout, so a later
+        apply in it never clobbers the history of the layout it replaced.
         """
+        lv = self.layout_version if layout_version is None else layout_version
         produced: List[Correction] = []
         for record in self.batch_records(batch_index):
             final = (record.user_final or "").strip()
@@ -845,13 +928,18 @@ class ProjectState:
                         human_final=final,
                         comment=record.user_comment.strip(),
                         batch_index=batch_index,
+                        layout_version=lv,
                     )
                 )
             record.status = "applied"
 
-        # Replace any earlier corrections from this batch so re-applying a
-        # batch updates rather than duplicates its feedback.
-        self.corrections = [c for c in self.corrections if c.batch_index != batch_index]
+        # Replace any earlier corrections from this batch *and layout* so
+        # re-applying a batch updates rather than duplicates its feedback, but
+        # an earlier layout's correction at the same batch index survives.
+        self.corrections = [
+            c for c in self.corrections
+            if (c.batch_index, c.layout_version) != (batch_index, lv)
+        ]
         self.corrections.extend(produced)
         return produced
 
@@ -1058,47 +1146,14 @@ class ProjectState:
 
         Returns a :class:`TermbaseLoadReport` so the UI can show what was
         skipped rather than quietly losing entries.
+
+        The parsing itself is the state-free :func:`parse_termbase_csv`,
+        shared with the remote path; this method only applies the result to
+        ``self.termbase``.
         """
-        text, encoding = _decode_csv(data)
-        # newline="" lets csv handle embedded line breaks inside quoted fields.
-        handle = io.StringIO(text, newline="")
-        delimiter = _sniff_delimiter(text)
-
-        report = TermbaseLoadReport(encoding=encoding, delimiter=delimiter)
-        parsed: List[TermEntry] = []
-        seen: Dict[str, int] = {}
-
-        for index, row in enumerate(csv.reader(handle, delimiter=delimiter)):
-            if index < skip_rows:
-                report.header_rows += 1
-                continue
-            report.data_rows += 1
-            if not any(cell.strip() for cell in row):
-                report.blank_rows += 1
-                continue
-
-            source = row[source_col].strip() if source_col < len(row) else ""
-            target = row[target_col].strip() if target_col < len(row) else ""
-            if not source or not target:
-                report.incomplete_rows += 1
-                continue
-
-            # Collapse internal whitespace/newlines so a term stays one line in
-            # the prompt even if the export wrapped it.
-            source, target = _squash(source), _squash(target)
-            # Dedup on the exact source, NOT case-folded. Real memoQ termbases
-            # distinguish by case on purpose - "Connect to an Account" is a UI
-            # heading ("Подключение к счету") while "connect to an account" is
-            # a verb phrase ("подключиться к счету"). Folding case would throw
-            # one of them away. Lookup stays case-insensitive, so both are
-            # offered and the model picks by context.
-            if source in seen:
-                report.duplicate_rows += 1
-                continue
-            seen[source] = len(parsed)
-            parsed.append(TermEntry(source=source, target=target))
-
-        report.loaded = len(parsed)
+        parsed, report = parse_termbase_csv(
+            data, source_col=source_col, target_col=target_col,
+            skip_rows=skip_rows)
         if replace:
             self.termbase = parsed
         else:

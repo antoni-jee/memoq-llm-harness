@@ -68,6 +68,26 @@ class StubClient:
         prompts.build_user_payload([record])
         return (self.text_for(record) or None), ""
 
+    def analyze_corrections(self, corrections, hard_rules_text: str = "",
+                            expected_tags=None) -> str:
+        """Deterministic offline critique for the stub engine.
+
+        Mirrors the real ``llm.LLMClient.analyze_corrections`` contract: an
+        empty string when there are no corrections, otherwise a critique. It
+        builds the same payload the real path does (so prompt assembly is
+        exercised offline), but, being the offline stub, it never runs a model:
+        it returns a minimal translation brief whose heading lets the UI split
+        it into ``(warnings, brief)`` with no warnings. The stub asserts no
+        style rule, so it cannot harden a defect into one.
+        """
+        recent = list(corrections)
+        if not recent:
+            return ""
+        prompts.build_analysis_payload(recent, hard_rules_text, expected_tags)
+        return ("TRANSLATION BRIEF\n"
+                "Stub analysis of %d correction(s): no consistent style "
+                "pattern is asserted offline." % len(recent))
+
 
 def sdk_available(settings: EngineSettings) -> bool:
     if settings.kind == ENGINE_STUB:
